@@ -184,10 +184,12 @@ class TcpServer:
         dispatcher: Dispatcher,
         ssl_context: ssl.SSLContext | None = None,
         max_payload: int = MAX_PAYLOAD_DEFAULT,
+        name: str = "server",
     ) -> None:
         self._dispatcher = dispatcher
         self._ssl_context = ssl_context
         self._max_payload = max_payload
+        self._name = name
         self._server: asyncio.Server | None = None
 
     async def start(self, host: str, port: int) -> None:
@@ -198,7 +200,7 @@ class TcpServer:
             port,
             ssl=self._ssl_context,
         )
-        logger.info("server listening", extra={"host": host, "port": port})
+        logger.info("%s server listening on %s:%d.", self._name, host, port)
 
     async def stop(self) -> None:
         """Stop accepting connections and close the server socket."""
@@ -206,7 +208,7 @@ class TcpServer:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
-            logger.info("server stopped")
+            logger.info("%s server stopped.", self._name)
 
     async def _handle_connection(
         self,

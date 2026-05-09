@@ -2,6 +2,7 @@
 db/
 .certs/
 .config/
+.data/
 __pycache__/
 *.py[cod]
 *$py.class

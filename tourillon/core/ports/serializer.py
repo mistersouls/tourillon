@@ -19,9 +19,9 @@ and future codecs (e.g. a JSON debug adapter) can be swapped per connection
 without modifying any business logic.
 """
 
-from __future__ import annotations
+from __future__ import annotations  # pragma: no cover
 
-from typing import Any, Protocol
+from typing import Any, Protocol  # pragma: no cover
 
 
 class SerializerPort(Protocol):  # pragma: no cover

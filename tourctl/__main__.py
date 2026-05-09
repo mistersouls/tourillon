@@ -15,4 +15,4 @@
 
 from tourctl.bootstrap.main import app
 
-app()
+app()  # pragma: no cover

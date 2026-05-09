@@ -11,16 +11,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""tourillon CLI root — assembles node, pki, and config subcommand groups."""
-
-import typer
-
-from tourillon.infra.cli.config import config_app
-from tourillon.infra.cli.node import node_app
-from tourillon.infra.cli.pki import pki_app
-
-app = typer.Typer(name="tourillon", add_completion=False, no_args_is_help=True)
-
-app.add_typer(node_app, name="node")
-app.add_typer(pki_app, name="pki")
-app.add_typer(config_app, name="config")
+"""Consistent-hashing ring layer — HashSpace, VNode, Ring, Partitioner, Placement."""

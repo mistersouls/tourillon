@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 from unittest.mock import patch
@@ -56,11 +57,16 @@ def test_pki_ca_success(tmp_path: Path) -> None:
 
 
 @pytest.mark.bootstrap
-def test_pki_ca_pkierror_exits_1(tmp_path: Path) -> None:
-    """tourillon pki ca prints error and exits 1 when PkiError is raised."""
-    with patch(
-        "tourillon.infra.cli.main.CryptographyCaAdapter.generate_ca",
-        side_effect=PkiError("cannot write"),
+def test_pki_ca_pkierror_exits_1(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """tourillon pki ca logs error and exits 1 when PkiError is raised."""
+    with (
+        patch(
+            "tourillon.infra.cli.pki.CryptographyCaAdapter.generate_ca",
+            side_effect=PkiError("cannot write"),
+        ),
+        caplog.at_level(logging.ERROR),
     ):
         result = _runner.invoke(
             tourillon_app,
@@ -74,7 +80,7 @@ def test_pki_ca_pkierror_exits_1(tmp_path: Path) -> None:
             ],
         )
     assert result.exit_code == 1
-    assert "cannot write" in result.output
+    assert "cannot write" in caplog.text
 
 
 @pytest.mark.bootstrap
@@ -101,37 +107,45 @@ def test_config_generate_missing_node_id_exits_nonzero(tmp_path: Path) -> None:
 
 
 @pytest.mark.bootstrap
-def test_config_generate_invalid_size_exits_1(tmp_path: Path) -> None:
+def test_config_generate_invalid_size_exits_1(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """config generate with invalid --size value exits 1."""
     ca = tmp_path / "ca.crt"
     ca.write_bytes(b"dummy")
-    result = _runner.invoke(
-        tourillon_app,
-        [
-            "config",
-            "generate",
-            "--ca-cert",
-            str(ca),
-            "--ca-key",
-            str(ca),
-            "--node-id",
-            "n1",
-            "--size",
-            "HUGE",
-        ],
-    )
+    with caplog.at_level(logging.ERROR):
+        result = _runner.invoke(
+            tourillon_app,
+            [
+                "config",
+                "generate",
+                "--ca-cert",
+                str(ca),
+                "--ca-key",
+                str(ca),
+                "--node-id",
+                "n1",
+                "--size",
+                "HUGE",
+            ],
+        )
     assert result.exit_code == 1
-    assert "HUGE" in result.output
+    assert "HUGE" in caplog.text
 
 
 @pytest.mark.bootstrap
-def test_config_generate_pkierror_exits_1(tmp_path: Path) -> None:
-    """config generate prints error and exits 1 when issue_cert raises PkiError."""
+def test_config_generate_pkierror_exits_1(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """config generate logs error and exits 1 when issue_cert raises PkiError."""
     ca = tmp_path / "ca.crt"
     ca.write_bytes(b"dummy")
-    with patch(
-        "tourillon.infra.cli.main.CryptographyCertIssuerAdapter.issue_cert",
-        side_effect=PkiError("cert error"),
+    with (
+        patch(
+            "tourillon.infra.cli.config.CryptographyCertIssuerAdapter.issue_cert",
+            side_effect=PkiError("cert error"),
+        ),
+        caplog.at_level(logging.ERROR),
     ):
         result = _runner.invoke(
             tourillon_app,
@@ -149,12 +163,14 @@ def test_config_generate_pkierror_exits_1(tmp_path: Path) -> None:
             ],
         )
     assert result.exit_code == 1
-    assert "cert error" in result.output
+    assert "cert error" in caplog.text
 
 
 @pytest.mark.bootstrap
-def test_config_generate_oserror_exits_1(tmp_path: Path) -> None:
-    """config generate prints error and exits 1 when writing the config file fails."""
+def test_config_generate_oserror_exits_1(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """config generate logs error and exits 1 when writing the config file fails."""
     ca = tmp_path / "ca.crt"
     ca.write_bytes(b"dummy")
 
@@ -168,10 +184,11 @@ def test_config_generate_oserror_exits_1(tmp_path: Path) -> None:
 
     with (
         patch(
-            "tourillon.infra.cli.main.CryptographyCertIssuerAdapter.issue_cert",
+            "tourillon.infra.cli.config.CryptographyCertIssuerAdapter.issue_cert",
             side_effect=_fake_issue,
         ),
         patch.object(Path, "write_bytes", side_effect=OSError(13, "permission denied")),
+        caplog.at_level(logging.ERROR),
     ):
         result = _runner.invoke(
             tourillon_app,
@@ -189,7 +206,7 @@ def test_config_generate_oserror_exits_1(tmp_path: Path) -> None:
             ],
         )
     assert result.exit_code == 1
-    assert "permission denied" in result.output
+    assert "permission denied" in caplog.text
 
 
 @pytest.mark.bootstrap
@@ -226,13 +243,18 @@ def test_tourillon_generate_context_no_endpoint_exits_1(tmp_path: Path) -> None:
 
 
 @pytest.mark.bootstrap
-def test_config_generate_context_pkierror_exits_1(tmp_path: Path) -> None:
+def test_config_generate_context_pkierror_exits_1(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """config generate-context exits 1 when issue_cert raises PkiError."""
     ca = tmp_path / "ca.crt"
     ca.write_bytes(b"dummy")
-    with patch(
-        "tourillon.infra.cli.main.CryptographyCertIssuerAdapter.issue_cert",
-        side_effect=PkiError("client cert error"),
+    with (
+        patch(
+            "tourillon.infra.cli.config.CryptographyCertIssuerAdapter.issue_cert",
+            side_effect=PkiError("client cert error"),
+        ),
+        caplog.at_level(logging.ERROR),
     ):
         result = _runner.invoke(
             tourillon_app,
@@ -251,11 +273,13 @@ def test_config_generate_context_pkierror_exits_1(tmp_path: Path) -> None:
             ],
         )
     assert result.exit_code == 1
-    assert "client cert error" in result.output
+    assert "client cert error" in caplog.text
 
 
 @pytest.mark.bootstrap
-def test_config_generate_context_oserror_exits_1(tmp_path: Path) -> None:
+def test_config_generate_context_oserror_exits_1(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """config generate-context exits 1 when saving contexts.toml raises OSError."""
     ca = tmp_path / "ca.crt"
     ca.write_bytes(b"dummy")
@@ -266,13 +290,14 @@ def test_config_generate_context_oserror_exits_1(tmp_path: Path) -> None:
 
     with (
         patch(
-            "tourillon.infra.cli.main.CryptographyCertIssuerAdapter.issue_cert",
+            "tourillon.infra.cli.config.CryptographyCertIssuerAdapter.issue_cert",
             side_effect=_fake_issue,
         ),
         patch(
-            "tourillon.infra.cli.main.save_contexts",
+            "tourillon.infra.cli.config.save_contexts",
             side_effect=OSError(13, "permission denied"),
         ),
+        caplog.at_level(logging.ERROR),
     ):
         result = _runner.invoke(
             tourillon_app,
@@ -291,7 +316,7 @@ def test_config_generate_context_oserror_exits_1(tmp_path: Path) -> None:
             ],
         )
     assert result.exit_code == 1
-    assert "permission denied" in result.output
+    assert "permission denied" in caplog.text
 
 
 @pytest.mark.bootstrap

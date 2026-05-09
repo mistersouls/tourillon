@@ -245,6 +245,38 @@ def test_load_contexts_empty_when_file_missing(tmp_path: Path) -> None:
 
 
 @pytest.mark.bootstrap
+def test_load_contexts_raises_on_invalid_toml(tmp_path: Path) -> None:
+    """load_contexts raises ContextsError when the file contains invalid TOML."""
+    from tourillon.infra.contexts import ContextsError, load_contexts
+
+    bad_file = tmp_path / "contexts.toml"
+    bad_file.write_text("not valid [[[ toml !!!", encoding="utf-8")
+
+    with pytest.raises(ContextsError):
+        load_contexts(bad_file)
+
+
+@pytest.mark.bootstrap
+def test_save_contexts_cleanup_on_write_failure(tmp_path: Path) -> None:
+    """save_contexts cleans up the tmp file and re-raises when os.write fails."""
+    from unittest.mock import patch
+
+    from tourillon.core.structure.contexts import ContextsFile
+    from tourillon.infra.contexts import save_contexts
+
+    path = tmp_path / "contexts.toml"
+    with (
+        patch("tourillon.infra.contexts.os.write", side_effect=OSError("disk full")),
+        patch("tourillon.infra.contexts.os.close"),
+        patch("tourillon.infra.contexts.os.chmod"),
+        patch("tourillon.infra.contexts.os.replace"),
+        patch("tourillon.infra.contexts.os.unlink"),
+        pytest.raises(OSError, match="disk full"),
+    ):
+        save_contexts(path, ContextsFile())
+
+
+@pytest.mark.bootstrap
 def test_contexts_upsert_replaces_existing(tmp_path: Path) -> None:
     """ContextsFile.upsert() replaces a context with the same name."""
     from tourctl.core.structure.contexts import (

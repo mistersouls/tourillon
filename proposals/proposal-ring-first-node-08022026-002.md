@@ -57,9 +57,13 @@ and the process exits with code 1 before binding any socket.
 Python `logging` subsystem. Every line the operator sees (progress, errors,
 ready signal, shutdown) is a structured `logging` record routed through the
 root logger. `setup_logging()` (`tourillon/bootstrap/log.py`) is the first call
-in every Typer command and configures the root logger with the format below:
+in every Typer command and configures the root logger with a level-aware format:
 
 ```
+# INFO and above (operator view — module only, no internal function names)
+%(asctime)s %(levelname)-8s [%(name)s] %(message)s
+
+# DEBUG (developer view — includes the emitting function for tracing)
 %(asctime)s %(levelname)-8s [%(name)s:%(funcName)s] %(message)s
 ```
 
@@ -68,7 +72,16 @@ be overridden via `--log-level DEBUG|INFO|WARNING|ERROR`.
 
 `Console.print()` and `print()` are forbidden everywhere in `tourillon/`.
 
+Log messages use **narrative, concise sentences** (e.g. `"Node 'node-1' is ready
+(epoch 1, generation 1)."`) rather than machine-readable key-value tokens. This
+makes the output immediately legible to an operator without special tooling.
+
 #### Accepted phases and their startup behaviour
+
+`data_dir` (the `[node].data_dir` value from `config.toml`) **must already
+exist** when `tourillon node start` is called. The daemon never creates it. If
+the directory is absent the process logs an error with the resolved absolute
+path and exits with code 1 before acquiring any lock or binding any socket.
 
 | Persisted phase | Startup action |
 |-----------------|----------------|
@@ -80,40 +93,41 @@ be overridden via `--log-level DEBUG|INFO|WARNING|ERROR`.
 
 ```
 $ tourillon node start --config config.toml
-2026-05-09T14:23:45 INFO     [tourillon.infra.cli.main:node_start] node_starting node_id=node-1 phase=idle
-2026-05-09T14:23:45 INFO     [tourillon.core.lifecycle.bootstrap:run_first_node_bootstrap] bootstrap_single_node node_id=node-1 partitions=1024 token_count=4
-2026-05-09T14:23:45 INFO     [tourillon.infra.store.state:save] state_saved node_id=node-1 phase=ready epoch=1 generation=1
-2026-05-09T14:23:45 INFO     [tourillon.core.ring.topology:apply_member] topology_applied node_id=node-1 ring_size=4 epoch=1
-2026-05-09T14:23:45 INFO     [tourillon.core.transport.server:start] server_listening host=0.0.0.0 port=7701
-2026-05-09T14:23:45 INFO     [tourillon.core.transport.server:start] server_listening host=0.0.0.0 port=7700
-2026-05-09T14:23:45 INFO     [tourillon.infra.cli.main:node_start] node_ready node_id=node-1 epoch=1 generation=1 partitions=1024
+2026-05-10T14:23:45 INFO     [tourillon.infra.cli.node] Using data directory: /srv/node-1.
+2026-05-10T14:23:45 INFO     [tourillon.core.lifecycle.bootstrap] Node 'node-1' starting from phase 'idle'.
+2026-05-10T14:23:45 INFO     [tourillon.core.lifecycle.bootstrap] Node 'node-1' bootstrapped as first node: 1024 partitions, 4 vnode(s).
+2026-05-10T14:23:45 INFO     [tourillon.infra.store.state] State persisted to disk (phase: ready, epoch: 1, generation: 1).
+2026-05-10T14:23:45 INFO     [tourillon.core.transport.server] Peer server listening on 0.0.0.0:7701.
+2026-05-10T14:23:45 INFO     [tourillon.core.transport.server] KV server listening on 0.0.0.0:7700.
+2026-05-10T14:23:45 INFO     [tourillon.infra.cli.node] Node 'node-1' is ready (epoch 1, generation 1).
 ```
 
 #### READY restart (crash-recovery)
 
 ```
 $ tourillon node start --config config.toml
-2026-05-09T14:23:45 INFO     [tourillon.infra.cli.main:node_start] node_starting node_id=node-1 phase=ready epoch=1 generation=1
-2026-05-09T14:23:45 INFO     [tourillon.core.ring.topology:apply_member] topology_rebuilt node_id=node-1 ring_size=4 epoch=1
-2026-05-09T14:23:45 INFO     [tourillon.core.transport.server:start] server_listening host=0.0.0.0 port=7701
-2026-05-09T14:23:45 INFO     [tourillon.core.transport.server:start] server_listening host=0.0.0.0 port=7700
-2026-05-09T14:23:45 INFO     [tourillon.infra.cli.main:node_start] node_ready node_id=node-1 epoch=1 generation=1 partitions=1024
+2026-05-10T14:23:45 INFO     [tourillon.infra.cli.node] Using data directory: /srv/node-1.
+2026-05-10T14:23:45 INFO     [tourillon.core.lifecycle.bootstrap] Node 'node-1' starting from phase 'ready'.
+2026-05-10T14:23:45 INFO     [tourillon.core.lifecycle.bootstrap] Topology rebuilt for node 'node-1': 4 vnode(s), epoch 1.
+2026-05-10T14:23:45 INFO     [tourillon.core.transport.server] Peer server listening on 0.0.0.0:7701.
+2026-05-10T14:23:45 INFO     [tourillon.core.transport.server] KV server listening on 0.0.0.0:7700.
+2026-05-10T14:23:45 INFO     [tourillon.infra.cli.node] Node 'node-1' is ready (epoch 1, generation 1).
 ```
 
 #### Graceful shutdown (Ctrl-C / SIGTERM)
 
 ```
-2026-05-09T14:23:50 INFO     [tourillon.infra.cli.main:node_start] shutdown_requested node_id=node-1 signal=SIGINT
-2026-05-09T14:23:50 INFO     [tourillon.core.transport.server:stop] server_stopped port=7701
-2026-05-09T14:23:50 INFO     [tourillon.core.transport.server:stop] server_stopped port=7700
-2026-05-09T14:23:50 INFO     [tourillon.infra.cli.main:node_start] node_stopped node_id=node-1
+2026-05-10T14:23:50 INFO     [tourillon.infra.cli.node] Shutdown signal received; stopping node 'node-1'.
+2026-05-10T14:23:50 INFO     [tourillon.core.transport.server] Peer server stopped.
+2026-05-10T14:23:50 INFO     [tourillon.core.transport.server] KV server stopped.
+2026-05-10T14:23:50 INFO     [tourillon.infra.cli.node] Node 'node-1' stopped cleanly.
 ```
 
 #### Seeds configured (out of scope for this proposal)
 
 ```
 $ tourillon node start --config config.toml   # seeds set
-2026-05-09T14:23:45 ERROR    [tourillon.infra.cli.main:node_start] seeds_configured_error node_id=node-1
+2026-05-10T14:23:45 ERROR    [tourillon.infra.cli.node] Node 'node-1' has seeds configured; seeded join is not yet supported by this command.
 ```
 
 Exit code 1. `setup_logging()` is called before config validation so every
@@ -486,6 +500,10 @@ scratch.
   the start of the join transition. Never on crash-restart or retry.
 - The node state file is **always written before any socket is opened** for any
   phase transition. The peer `TcpServer` is bound only after `StatePort.save()`
+  returns successfully.
+- **`data_dir` must be created by the operator** before starting the node. The
+  daemon never creates it. If the directory is absent the process logs an error
+  with the absolute path and exits with code 1 before acquiring any lock.
   returns successfully.
 
 ---
@@ -1104,7 +1122,7 @@ class FailureDetector:
 ```
 tourillon/
   bootstrap/
-    log.py          # setup_logging() — configures root logger; called first in every Typer command
+    log.py          # setup_logging(), _LevelAwareFormatter — level-aware log format
   core/
     lifecycle/
       member.py       # MemberPhase StrEnum, Member dataclass
@@ -1127,7 +1145,10 @@ tourillon/
     store/
       state.py        # FileStateAdapter — StatePort impl; temp-file + os.replace() + fsync
     cli/
-      main.py         # tourillon node start command
+      main.py         # Root Typer app — assembles node, pki, and config sub-apps
+      node.py         # tourillon node start command + async serve loop
+      pki.py          # tourillon pki ca command
+      config.py       # tourillon config generate and generate-context commands
 ```
 
 No `tourctl` code is added in this proposal. `tourctl node join` will be defined
@@ -1146,12 +1167,12 @@ All scenarios run with in-memory adapters unless marked `[e2e]`.
 | 3 | `Partitioner(bits=8, ps=4)`, 3 independent ring instances with same state | `placement_for_token` for 100 tokens | All 3 return identical `PartitionPlacement` for every token |
 | 4 | `bits=8` | `Partitioner(hs, 8)` | Raises `ValueError` (partition_shift must be < bits) |
 | 5 | 5-node topology: A=READY, B=JOINING, C=READY, D=DRAINING, E=PAUSED; all reachable; `rf=3` | `preference_list` | A, C, D readable; E present in PL with `readable=False`; B absent |
-| 6 | Same topology; probe marks C as SUSPECT | `preference_list` | A and D readable; one `PreferenceEntry(handoff="C")` emitted; C marked suspect; no node_id appears more than once across the full list |
+| 6 | Same topology; probe marks C as SUSPECT | `preference_list` | A and D readable; one `PreferenceEntry(handoff="C")` emitted; C marked suspect; no node_id appears more than once across the full list; SUSPECT nodes excluded from handoff candidates |
 | 7 | `TopologyManager`, node B JOINING | `apply_member(member_b_ready)` | Returns `True`; snapshot ring includes B's vnodes; `epoch` advanced by 1 |
 | 8 | `TopologyManager`, node B READY | `apply_member(member_b_ready)` again (same record) | Returns `False`; snapshot unchanged |
 | 9 | In-memory node, `IDLE`, no seeds | `run_first_node_bootstrap()` | Phase transitions directly to `READY` (no intermediate `JOINING`); `epoch==1`; `generation==1`; all partitions assigned; peer `TcpServer` started |
-| 10 | In-memory node, `READY` | `run_first_node_bootstrap()` | Raises `BootstrapError(exit_code=1)`; error "node is already READY — nothing to do"; generation and epoch unchanged |
-| 11 | In-memory node, `JOINING` | `run_first_node_bootstrap()` | Raises `BootstrapError(exit_code=1)`; error "unexpected phase JOINING — use seeded-join recovery" |
+| 10 | In-memory node, `READY` | `run_first_node_bootstrap()` | Returns `NodeState(phase=READY)` unchanged; topology rebuilt from persisted state; `StatePort.save()` not called; generation and epoch unchanged |
+| 11 | In-memory node, `JOINING` | `run_first_node_bootstrap()` | Raises `BootstrapError(exit_code=1)`; error "unexpected phase joining — cannot start from this state" |
 | 12 | (Hypothesis) arbitrary `add_vnodes` + `drop_nodes` on `bits=8` | Any sequence | `ring.successor(t)` always returns a vnode present in the ring; `len(ring)` = total surviving vnodes |
 | 13 | `MemberRegistry.snapshot()` | Mutate original registry after taking snapshot | Snapshot is unaffected |
 | 14 | `MemberRegistry` with A=READY, B=DRAINING | `members_in_phase(READY, DRAINING)` | Returns `{"A": member_a, "B": member_b}`; JOINING/IDLE/FAILED members absent |
@@ -1161,6 +1182,8 @@ All scenarios run with in-memory adapters unless marked `[e2e]`.
 | 18 | `FileStateAdapter` | `save(NodeState(...))` then `load()` | Round-trip: loaded state equals saved state |
 | 19 | In-memory `StatePort` stub | `save()` called from bootstrap sequence | Stub records exactly **one** `save()` call: with `phase=READY`, `epoch=1`, `generation=1` |
 | 20 | `FileStateAdapter`, simulate crash mid-write (temp file exists, `os.replace()` not called) | Open adapter fresh and call `load()` | Old state returned; temp file is ignored; no StateError |
+| 21 | `PidLock`, `data_dir` does not exist | `acquire()` | Raises `PidLockError` |
+| 22 | `PidLock`, `data_dir` exists | `acquire()` + `release()` | Lock file created and released; double `release()` is a no-op |
 
 ---
 

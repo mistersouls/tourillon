@@ -114,12 +114,11 @@ class PidLock:
         await asyncio.to_thread(self._acquire_sync)
 
     def _acquire_sync(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
         fd = _open_lock_file(self._path)
         _acquire_fd_lock(fd, self._path)
         _write_pid_info(fd)
         self._fd = fd
-        logger.debug("pid.lock acquired", extra={"path": str(self._path)})
+        logger.debug("Process lock acquired on %s.", self._path)
 
     async def release(self) -> None:
         """Release the lock; idempotent."""
@@ -137,7 +136,7 @@ class PidLock:
         with contextlib.suppress(OSError):
             os.close(self._fd)
         self._fd = None
-        logger.debug("pid.lock released", extra={"path": str(self._path)})
+        logger.debug("Process lock released on %s.", self._path)
 
     async def __aenter__(self) -> PidLock:
         await self.acquire()

@@ -11,16 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""tourillon CLI root — assembles node, pki, and config subcommand groups."""
+"""VNode — virtual-node token on the consistent-hash ring."""
 
-import typer
+from __future__ import annotations
 
-from tourillon.infra.cli.config import config_app
-from tourillon.infra.cli.node import node_app
-from tourillon.infra.cli.pki import pki_app
+from dataclasses import dataclass
 
-app = typer.Typer(name="tourillon", add_completion=False, no_args_is_help=True)
 
-app.add_typer(node_app, name="node")
-app.add_typer(pki_app, name="pki")
-app.add_typer(config_app, name="config")
+@dataclass(frozen=True)
+class VNode:
+    """One virtual-node token owned by a physical node.
+
+    A physical node contributes node_size.token_count VNode instances to the
+    ring. Tokens are chosen randomly at the start of the join transition and
+    never change. The token value is always in [0, 2**bits).
+    """
+
+    node_id: str
+    token: int  # ∈ [0, 2**bits)

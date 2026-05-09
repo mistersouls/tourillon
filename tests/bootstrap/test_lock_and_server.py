@@ -67,11 +67,21 @@ async def test_pid_lock_release_idempotent(tmp_path: Path) -> None:
 
 
 @pytest.mark.bootstrap
-async def test_pid_lock_creates_data_dir(tmp_path: Path) -> None:
-    """PidLock creates the data_dir hierarchy if it does not exist."""
-    nested = tmp_path / "a" / "b" / "c"
-    async with PidLock(nested):
-        assert nested.exists()
+async def test_pid_lock_fails_if_data_dir_missing(tmp_path: Path) -> None:
+    """PidLock raises PidLockError when the data_dir does not exist."""
+    missing = tmp_path / "a" / "b" / "c"
+    with pytest.raises(PidLockError):
+        async with PidLock(missing):
+            pass  # pragma: no cover
+
+
+@pytest.mark.bootstrap
+async def test_pid_lock_succeeds_when_data_dir_exists(tmp_path: Path) -> None:
+    """PidLock acquires successfully when the data_dir already exists."""
+    data_dir = tmp_path / "node-data"
+    data_dir.mkdir()
+    async with PidLock(data_dir):
+        assert (data_dir / "pid.lock").exists()
 
 
 @pytest.mark.bootstrap

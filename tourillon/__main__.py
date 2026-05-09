@@ -15,4 +15,4 @@
 
 from tourillon.infra.cli.main import app
 
-app()
+app()  # pragma: no cover
