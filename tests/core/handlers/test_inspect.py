@@ -38,7 +38,6 @@ from tourillon.core.lifecycle.state import NodeState
 from tourillon.core.ports.transport import (
     MAX_PAYLOAD_DEFAULT,
     ResponseTimeoutError,
-    TcpClientPort,
 )
 from tourillon.core.ring.hashspace import HashSpace
 from tourillon.core.ring.partitioner import Partitioner
@@ -46,6 +45,7 @@ from tourillon.core.ring.ring import Ring
 from tourillon.core.ring.topology import TopologyManager
 from tourillon.core.ring.vnode import VNode
 from tourillon.core.structure.envelope import Envelope
+from tourillon.core.transport.client import TcpClient
 from tourillon.infra.serializer.msgpack import MsgpackSerializerAdapter
 
 pytestmark = pytest.mark.inspect
@@ -134,12 +134,12 @@ async def _call_handler(
 
 
 # ---------------------------------------------------------------------------
-# Stub TcpClientPort for forwarding tests
+# Stub clients for forwarding tests (duck-typed to match TcpClient API)
 # ---------------------------------------------------------------------------
 
 
 class _StubClient:
-    """Stub TcpClientPort that returns a pre-built response envelope."""
+    """Stub client that returns a pre-built response envelope."""
 
     def __init__(self, response: Envelope) -> None:
         self._response = response
@@ -173,7 +173,7 @@ class _StubClient:
 
 
 class _FailingClient:
-    """Stub TcpClientPort that raises OSError on request."""
+    """Stub client that raises OSError on request."""
 
     async def request(self, env: Envelope, timeout: float = 30.0) -> Envelope:
         raise OSError("connection refused")
@@ -187,7 +187,7 @@ class _FailingClient:
 
 
 class _TimeoutClient:
-    """Stub TcpClientPort that raises ResponseTimeoutError on request."""
+    """Stub client that raises ResponseTimeoutError on request."""
 
     async def request(self, env: Envelope, timeout: float = 30.0) -> Envelope:
         raise ResponseTimeoutError(f"timed out after {timeout}s")
@@ -294,7 +294,7 @@ async def test_2_forwarded_inspect_sets_forwarded_by() -> None:
     )
     stub = _StubClient(stub_env)
 
-    async def factory(addr: str) -> TcpClientPort:  # type: ignore[return]
+    async def factory(addr: str) -> TcpClient:  # type: ignore[return]
         return stub  # type: ignore[return-value]
 
     handler = _make_inspect_handler(
@@ -324,7 +324,7 @@ async def test_3_self_inspect_no_forwarding() -> None:
 
     calls: list[str] = []
 
-    async def factory(addr: str) -> TcpClientPort:
+    async def factory(addr: str) -> TcpClient:
         calls.append(addr)
         raise OSError("should not be called")
 
@@ -351,7 +351,7 @@ async def test_4_unknown_target_returns_node_not_found() -> None:
     """node-1 returns error.node_not_found; no TcpClient connection attempt."""
     calls: list[str] = []
 
-    async def factory(addr: str) -> TcpClientPort:
+    async def factory(addr: str) -> TcpClient:
         calls.append(addr)
         raise OSError
 
@@ -375,7 +375,7 @@ async def test_5_unreachable_target_returns_node_unreachable() -> None:
 
     connection_attempted: list[str] = []
 
-    async def factory(addr: str) -> TcpClientPort:
+    async def factory(addr: str) -> TcpClient:
         connection_attempted.append(addr)
         raise OSError("connection refused")
 
@@ -558,7 +558,7 @@ async def test_11_forwarding_timeout_returns_node_unreachable() -> None:
     member2 = _make_member("node-2")
     tm = await _make_topology([_make_member("node-1"), member2])
 
-    async def factory(addr: str) -> TcpClientPort:  # type: ignore[return]
+    async def factory(addr: str) -> TcpClient:  # type: ignore[return]
         return _TimeoutClient()  # type: ignore[return-value]
 
     handler = _make_inspect_handler(
@@ -706,7 +706,7 @@ async def test_13_cli_collapses_ranges_above_threshold_without_flag() -> None:
     }
 
     class _AlwaysRespond:
-        """Stub TcpClientPort that always returns the inspect response."""
+        """Stub client that always returns the inspect response."""
 
         async def request(self, env: Envelope, timeout: float = 30.0) -> Envelope:
             return Envelope(
@@ -863,7 +863,7 @@ async def test_15_target_returns_forwarded_by_none_contact_sets_it() -> None:
         payload=SERIALIZER.encode(target_resp_dict),
     )
 
-    async def factory(addr: str) -> TcpClientPort:  # type: ignore[return]
+    async def factory(addr: str) -> TcpClient:  # type: ignore[return]
         return _StubClient(stub_env)  # type: ignore[return-value]
 
     handler = _make_inspect_handler(
@@ -899,7 +899,7 @@ async def test_16_empty_peer_address_returns_node_not_found() -> None:
 
     calls: list[str] = []
 
-    async def factory(addr: str) -> TcpClientPort:
+    async def factory(addr: str) -> TcpClient:
         calls.append(addr)
         raise OSError
 
@@ -1684,7 +1684,7 @@ async def test_s11_inspect_handler_connection_closed_error_returns_unreachable()
         def is_connected(self) -> bool:
             return False
 
-    async def factory(addr: str) -> TcpClientPort:  # type: ignore[return]
+    async def factory(addr: str) -> TcpClient:  # type: ignore[return]
         return _ClosedClient()  # type: ignore[return-value]
 
     handler = _make_inspect_handler(
@@ -1809,7 +1809,7 @@ async def test_s15_relay_response_decode_failure_returns_unreachable() -> None:
         correlation_id=uuid.uuid4(),
     )
 
-    async def factory(addr: str) -> TcpClientPort:  # type: ignore[return]
+    async def factory(addr: str) -> TcpClient:  # type: ignore[return]
         return _StubClient(garbled)  # type: ignore[return-value]
 
     handler = _make_inspect_handler(

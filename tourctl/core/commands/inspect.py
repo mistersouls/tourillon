@@ -21,11 +21,11 @@ from typing import TYPE_CHECKING, Any
 from tourctl.core.ports.console import ConsolePort
 from tourillon.core.ports.transport import RESPONSE_TIMEOUT, ResponseTimeoutError
 from tourillon.core.structure.envelope import Envelope
+from tourillon.core.transport.client import TcpClient
 
 if TYPE_CHECKING:
 
     from tourillon.core.ports.serializer import SerializerPort
-    from tourillon.core.ports.transport import TcpClientPort
 
 PARTITION_DISPLAY_THRESHOLD: int = 64
 
@@ -52,7 +52,7 @@ class InspectCommand:
 
     def __init__(
         self,
-        client: TcpClientPort,
+        client: TcpClient,
         serializer: SerializerPort,
         console: ConsolePort,
         err_console: ConsolePort,

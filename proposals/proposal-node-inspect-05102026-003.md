@@ -1,7 +1,7 @@
 # Proposal: Node Inspect (`tourctl node inspect`)
 
 **Author**: Souleymane BA <soulsmister@gmail.com>
-**Status:** Draft
+**Status:** Accepted
 **Date:** 2026-05-10
 **Sequence:** 003
 **Schema version:** 1

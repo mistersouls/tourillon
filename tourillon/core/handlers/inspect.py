@@ -32,7 +32,6 @@ from tourillon.core.ports.transport import (
     RESPONSE_TIMEOUT,
     ConnectionClosedError,
     ResponseTimeoutError,
-    TcpClientPort,
 )
 from tourillon.core.ring.partitioner import Partitioner
 from tourillon.core.ring.ring import Ring
@@ -53,14 +52,14 @@ INSPECT_MEMBER_LIMIT: int = 10_000
 # Type alias for node-state accessor callable.
 type NodeStateService = Callable[[], NodeState]
 
-# Type alias for the factory that creates and connects a TcpClientPort.
-type TcpClientFactory = Callable[[str], Awaitable[TcpClientPort]]
+# Type alias for the factory that creates and connects a TcpClient.
+type TcpClientFactory = Callable[[str], Awaitable[TcpClient]]
 
 
 async def _default_client_factory(
     addr: str,
     tls_ctx: ssl.SSLContext | None,
-) -> TcpClientPort:
+) -> TcpClient:
     """Create and connect a TcpClient to *addr* using *tls_ctx*."""
     client = TcpClient()
     await client.connect(addr, tls_ctx)
@@ -351,7 +350,7 @@ class NodeInspectHandler:
         peer_addr: str,
         correlation_id: uuid.UUID,
         send: SendEnvelope,
-    ) -> TcpClientPort | None:
+    ) -> TcpClient | None:
         """Connect a TcpClient to *peer_addr*; send error and return None on failure."""
         factory = self._client_factory
         try:

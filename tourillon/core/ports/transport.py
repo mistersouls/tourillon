@@ -20,7 +20,7 @@ reference them without importing ssl, asyncio, or any third-party library.
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 from tourillon.core.structure.envelope import Envelope
@@ -100,48 +100,3 @@ class ConnectionHandler(Protocol):
     ) -> None:
         """Process one request and emit response Envelope(s)."""
         ...
-
-
-class TcpClientPort(Protocol):
-    """Multiplexed mTLS client for all outgoing Envelope traffic.
-
-    A single instance wraps one TLS connection and a background read loop
-    that delivers incoming envelopes to the correct caller by correlation_id.
-
-    Use request() when exactly one response Envelope is expected.
-    Use stream() when the server sends N progress envelopes followed by a
-    terminal envelope (e.g. node.join, rebalance.transfer.init). Both methods
-    apply RESPONSE_TIMEOUT per individual envelope received.
-    """
-
-    async def request(
-        self,
-        env: Envelope,
-        timeout: float = RESPONSE_TIMEOUT,
-    ) -> Envelope:
-        """Send *env* and return the single matching response Envelope.
-
-        Raise ResponseTimeoutError if no response arrives within *timeout*
-        seconds. The connection remains open. Raise ConnectionClosedError if
-        the connection is lost before the response arrives.
-        """
-
-    def stream(
-        self,
-        env: Envelope,
-        timeout: float = RESPONSE_TIMEOUT,
-    ) -> AsyncIterator[Envelope]:
-        """Send *env* and yield every response Envelope sharing its correlation_id.
-
-        *timeout* applies to each individual envelope in the sequence. The
-        caller detects the terminal envelope (e.g. a kind ending in '.done')
-        and breaks out of the iteration. Raise ResponseTimeoutError or
-        ConnectionClosedError on failure.
-        """
-
-    async def close(self) -> None:
-        """Close the connection; pending callers receive ConnectionClosedError."""
-
-    @property
-    def is_connected(self) -> bool:
-        """Return True while the underlying TCP connection is established."""
