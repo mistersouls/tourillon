@@ -1,10 +1,10 @@
 # Proposal: Gossip Engine & Seeded Node Join
 
 **Author**: Souleymane BA <soulsmister@gmail.com>
-**Status:** Draft — Incomplete (rebalance pending, see notice below)
+**Status:** Accepted — Incomplete (rebalance pending, see notice below)
 **Date:** 2026-05-10
 **Sequence:** 004
-**Schema version:** 1
+**Schema version:** 2
 
 ---
 
@@ -193,20 +193,14 @@ $ tourillon node start --config config.toml   # phase=failed
 ### `tourctl node join` — seeded join command
 
 ```
-tourctl node join <node-id> [--seeds ADDRESS ...]
+tourctl node join <peer-address> [--seeds ADDRESS ...]
 ```
 
-`tourctl node join` connects to the **contact** peer endpoint from the active
-context (typically a load-balancer address or any known live peer), sends a
-`node.join` envelope with `target_node_id = <node-id>`, and waits for the
-acknowledgement.
-
-Because the contact can be any node, the contact node checks whether
-`target_node_id == self.node_id`. If not, it looks up the target's
-`peer_address` in its `MemberRegistry`, opens a connection to the target, and
-forwards the `node.join` envelope verbatim (same `correlation_id`). The target
-responds directly; the contact relays the response to `tourctl`. This is the
-same single-hop forwarding model used by `node.inspect` (proposal 003).
+`tourctl node join` connects **directly** to the target node's peer server at
+`<peer-address>` (e.g. `10.0.0.2:7701`), sends a `node.join` envelope, and
+waits for the acknowledgement. There is no forwarding: the operator always
+specifies the exact bind address of the node to join. TLS credentials are taken
+from the active context.
 
 The `--seeds` flag overrides the seeds embedded in the target node's
 `config.toml` for this join attempt. If `--seeds` is omitted, the daemon uses
@@ -215,11 +209,11 @@ the seeds from its own `config.toml`.
 The command returns immediately after the target acknowledges the join request
 (`node.join.ok`). The target executes the `IDLE → JOINING` transition and
 gossip bootstrap asynchronously. The operator monitors progress via
-`tourctl node inspect <node-id>`.
+`tourctl node inspect <node-id>` (the node-id is shown in the command output).
 
 ```
-$ tourctl node join node-2 --seeds 10.0.0.1:7701 10.0.0.2:7701
-Joining node-2 (via node-1) …
+$ tourctl node join 10.0.0.2:7701 --seeds 10.0.0.1:7701
+Connecting to 10.0.0.2:7701 …
 
 Seeded join initiated for node 'node-2'.
 Phase → joining.
@@ -230,16 +224,16 @@ Error cases:
 
 ```
 # Target is not IDLE
-$ tourctl node join node-2
+$ tourctl node join 10.0.0.2:7701
 Error: node 'node-2' is in phase 'joining'; already joining.
 
 # No seeds in config and no --seeds provided
-$ tourctl node join node-2
+$ tourctl node join 10.0.0.2:7701
 Error: no seeds available; provide --seeds or configure [cluster].seeds.
 
-# Contact node cannot resolve target
-$ tourctl node join node-99
-Error: node-1 has no gossip record for 'node-99'; cannot forward.
+# Cannot reach the target
+$ tourctl node join 10.0.0.99:7701
+✗ Cannot connect to 10.0.0.99:7701: Connection refused
 ```
 
 ---
@@ -357,32 +351,15 @@ Precondition: persisted phase is `IDLE`; at least one seed address is available
 (from `config.toml` or the `--seeds` flag of `tourctl node join`). The peer
 server is already bound and serving.
 
-#### Forwarding
-
-The contact node (the peer address in the active context) may not be the target
-node. On receiving `node.join`, the handler checks `target_node_id`:
-
-```
-if envelope.payload["target_node_id"] == self.node_id:
-    handle locally   # steps below
-else:
-    peer_address = topology_manager.registry.get(target_node_id)?.peer_address
-    if peer_address is None:
-        respond node.join.error code: target_not_found
-    else:
-        forward envelope verbatim (same correlation_id) to peer_address
-        relay response back to tourctl
-        close
-```
-
-Forwarding is **single-hop**: the forwarding node never re-forwards. If the
-target is also unreachable, the forwarding node returns
-`node.join.error code: target_unreachable`.
+`tourctl` connects **directly** to the target node's bind address. There is
+no forwarding — the operator always specifies the exact peer address of the
+node to join. The handler always handles the request on the node that received
+it.
 
 #### Local handling
 
 ```
-1. Guard: target_node_id == self.node_id and phase == IDLE.
+1. Guard: phase == IDLE.
    If phase != IDLE → respond node.join.error code: wrong_phase.
 2. Resolve seeds: envelope.seeds if non-empty, else config.seeds.
    If empty → respond node.join.error code: no_seeds.
@@ -709,15 +686,13 @@ the TLS context, and releases `pid.lock` — then logs an ERROR and calls
 
 ```json
 {
-  "target_node_id": "node-2",
   "seeds": ["10.0.0.1:7701", "10.0.0.2:7701"]
 }
 ```
 
-`target_node_id` is mandatory. `seeds` is optional: an absent or empty list
-means "use seeds from the target's `config.toml`". At least one seed must be
-available from either source, or the handler replies
-`node.join.error code: no_seeds`.
+`seeds` is optional: an absent or empty list means "use seeds from the target's
+`config.toml`". At least one seed must be available from either source, or the
+handler replies `node.join.error code: no_seeds`.
 
 ##### `node.join.ok`
 
@@ -736,10 +711,8 @@ available from either source, or the handler replies
 
 | `code` | Trigger |
 |---|---|
-| `wrong_phase` | Phase is not `IDLE` when `node.join` is received by the target. |
+| `wrong_phase` | Phase is not `IDLE` when `node.join` is received. |
 | `no_seeds` | No seeds provided in the envelope and none configured in `config.toml`. |
-| `target_not_found` | `target_node_id` not found in the contact's `MemberRegistry`; cannot forward. |
-| `target_unreachable` | Contact found the target's address but the connection failed during forwarding. |
 | `internal_error` | Unexpected error during state persistence. |
 
 #### Gossip domain — 7 kinds
@@ -1020,8 +993,6 @@ convergence across concurrent rebalance tasks.
 | `partition_shift` mismatch detected **during bootstrap** (Members received in seed's `gossip.delta`) | Raises `BootstrapPartitionShiftError`; connection closed via `finally`; ERROR logged with both values; no registry write; never retried; daemon performs clean shutdown and calls `sys.exit(1)`. |
 | `gossip.error code: partition_shift_mismatch` **received** (in response to an emitted `gossip.push`) | The local node's data was rejected — local `partition_shift` is wrong. Applies write-before-announce → `announce(failed_member)` → `stop()` (drains `hot_queue`, then cancels both loops). All subsequent incoming gossip records are silently ignored (FAILED is inert). |
 | `node.join` received with wrong phase | Responds `node.join.error code: wrong_phase`; connection closed normally; no state change. |
-| `node.join` target not in contact's registry | Responds `node.join.error code: target_not_found`; no state change. |
-| `node.join` target unreachable during forwarding | Responds `node.join.error code: target_unreachable`; no state change. |
 | `node.join` received with no seeds | Responds `node.join.error code: no_seeds`; no state change. |
 | Seed unreachable during bootstrap attempt | Logged as WARNING; other seeds tried in the same attempt. |
 | All seeds fail in one attempt → `BootstrapAttemptError` | Retry with exponential backoff. |
@@ -1045,25 +1016,26 @@ convergence across concurrent rebalance tasks.
 
 **Chosen because:** auto-join is dangerous in a leaderless cluster. A daemon
 restarting after a crash or misconfiguration should never automatically mutate
-cluster membership without operator intent. The `tourctl node join <node-id>`
+cluster membership without operator intent. The `tourctl node join <peer-address>`
 command makes the join an explicit, auditable operator action with a clear paper
 trail in the log. It also separates "daemon is running and ready to receive
 commands" from "operator has decided to join this node to the cluster", making
 the lifecycle observable and controllable at every step.
 
-### Decision: `node.join` carries `target_node_id` and is single-hop forwarded
+### Decision: `tourctl node join` connects directly to the target — no forwarding
 
-**Alternatives considered:** require `tourctl` to resolve the target's
-`peer_address` from a side-channel before connecting; always connect directly to
-the target.
+**Alternatives considered:** tourctl connects to any known live peer (contact),
+which then forwards the `node.join` to the actual target using a registry
+lookup (single-hop forwarding).
 
-**Chosen because:** `tourctl` connects to a single well-known peer endpoint
-(typically a load balancer or any live node from `contexts.toml`). It cannot
-always know or have firewall access to every individual node's peer address.
-Single-hop forwarding — identical to the model used by `node.inspect`
-(proposal 003) — lets the contact resolve the address from its `MemberRegistry`
-and relay the request without requiring `tourctl` to discover the topology
-itself.
+**Chosen because:** forwarding requires the contact to already have a gossip
+record for the target. A brand-new node that has never joined the cluster has
+no record in any peer's registry, making forwarding impossible for the primary
+use case. Requiring the operator to specify the target's peer address directly
+is explicit, unambiguous, and always works regardless of the node's history. The
+operator deploying a new node always knows its bind address. The TLS credentials
+for the mTLS connection are still drawn from the active context, keeping
+credential management centralised.
 
 ### Decision: Peer server bound for every phase, KV server phase-guarded
 
@@ -1291,21 +1263,19 @@ class GossipBootstrapper:
 class NodeJoinHandler:
     """Peer-server handler for the node.join envelope kind.
 
-    Implements single-hop forwarding: if target_node_id != self.node_id, the
-    handler resolves the target's peer_address from MemberRegistry and forwards
-    the envelope (same correlation_id). It never re-forwards a forwarded request.
+    tourctl connects directly to the target node's peer server address;
+    there is no forwarding or registry lookup. The handler always handles
+    the request on the node that received it.
 
-    If target_node_id == self.node_id, the handler guards that phase == IDLE,
-    executes the IDLE → JOINING transition atomically (StatePort.save() before
-    responding), then enqueues gossip bootstrap as a background task.
-    Responds node.join.ok on success; node.join.error otherwise. Never mutates
-    state if any guard fails.
+    Guards that phase == IDLE, executes the IDLE → JOINING transition
+    atomically (StatePort.save() before responding), then enqueues gossip
+    bootstrap as a background task. Responds node.join.ok on success;
+    node.join.error otherwise. Never mutates state if any guard fails.
     """
 
     async def handle(
         self,
         envelope: Envelope,
-        target_node_id: str,
         seeds_override: list[str],
     ) -> None: ...
 
@@ -1476,9 +1446,9 @@ All scenarios run with in-memory adapters (fake `TcpClient`, fake
 | # | Fixture | Action | Expected |
 |---|---------|--------|----------|
 | 1 | node-2 IDLE, seeds configured | `tourillon node start` | Peer server bound on 7701; KV server **not** bound; log "waiting for tourctl node join" |
-| 2 | `tourctl` contacts node-1 (contact); node-2 IDLE (target) | `tourctl node join node-2 --seeds 10.0.0.1:7701` | node-1 looks up node-2's `peer_address` in registry; forwards `node.join`; `node.join.ok` relayed; `StatePort.save()` on node-2 with `phase=joining`, `generation=1` |
-| 3 | `tourctl` contacts node-2 directly (contact == target) | `tourctl node join node-2 --seeds 10.0.0.1:7701` | No forwarding; node-2 handles locally; same outcome as scenario 2 |
-| 4 | `tourctl` contacts node-1; `target_node_id="node-99"` not in registry | `tourctl node join node-99` | node-1 responds `node.join.error code: target_not_found`; no state change; no forwarding attempt |
+| 2 | `tourctl` connects directly to node-2 at `10.0.0.2:7701`; node-2 IDLE | `tourctl node join 10.0.0.2:7701 --seeds 10.0.0.1:7701` | node-2 handles locally; `StatePort.save()` with `phase=joining`, `generation=1`; `node.join.ok` returned |
+| 3 | node-2 JOINING; `node.join` received | `tourctl node join 10.0.0.2:7701` | `node.join.error code: wrong_phase`; no state change |
+| 4 | node-2 IDLE; no seeds in config, no `--seeds` | `tourctl node join 10.0.0.2:7701` | `node.join.error code: no_seeds`; no state change |
 | 5 | node-2 JOINING (crash-restart) | `tourillon node start` | Peer server bound; KV server **not** bound; gossip bootstrap starts immediately; generation **not** re-incremented; tokens unchanged |
 | 6 | node-2 READY (crash-restart) | `tourillon node start` | Peer server + KV server bound; topology rebuilt from state; no `StatePort.save()`; `GossipEngine` started |
 | 7 | node-2 DRAINING (crash-restart) | `tourillon node start` | Peer server + KV server bound; gossip bootstrap starts; phase remains `draining` |
@@ -1527,12 +1497,11 @@ All scenarios run with in-memory adapters (fake `TcpClient`, fake
 
 ## Exit criteria
 
-- [ ] All 47 test scenarios pass.
+- [ ] All test scenarios pass.
 - [ ] `uv run pytest -m gossip --cov-fail-under=90` passes.
 - [ ] `uv run pre-commit run --all-files` passes.
-- [ ] `tourctl node join <node-id>` sends `node.join` with `target_node_id`; contact forwards if needed; target persists `phase=joining`; gossip bootstrap runs asynchronously.
-- [ ] Single-hop forwarding: contact correctly resolves `peer_address` from registry and relays response; never re-forwards.
-- [ ] `node.join.error code: target_not_found` returned when `target_node_id` is absent from contact's registry.
+- [ ] `tourctl node join <peer-address>` sends `node.join` directly to the target node's peer server; target persists `phase=joining`; gossip bootstrap runs asynchronously.
+- [ ] No forwarding logic exists anywhere in the codebase for `node.join`.
 - [ ] `tourillon node start` with seeds and `phase=IDLE` binds **only** the peer server and logs the waiting message.
 - [ ] `tourillon node start` with `phase=JOINING` runs gossip bootstrap immediately without waiting for `tourctl`.
 - [ ] `tourillon node start` with `phase=DRAINING` binds peer server + KV server and runs gossip bootstrap.
