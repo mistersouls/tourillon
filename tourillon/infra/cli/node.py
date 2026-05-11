@@ -546,6 +546,94 @@ async def _await_engine_start_or_stop(
         tg.create_task(engine.start(), name="gossip.engine")
 
 
+def _peer_address(cfg: TourillonConfig) -> str:
+    """Return the advertised peer address, falling back to the bind address."""
+    return cfg.peer_server.advertise or cfg.peer_server.bind
+
+
+async def _startup_idle(
+    cfg: TourillonConfig,
+    state_port: FileStateAdapter,
+    topology_mgr: TopologyManager,
+    state_ref: list[NodeState],
+) -> bool:
+    """Handle IDLE phase startup; return True if the engine should be started."""
+    if cfg.seeds:
+        logger.info(
+            "Node %r is idle; issue 'tourctl node join' to begin seeded join.",
+            cfg.node_id,
+        )
+        return False
+    new_state = await _bootstrap_first_node(cfg, state_port, topology_mgr)
+    state_ref[0] = new_state
+    logger.info(
+        "Node %r is ready (epoch %d, generation %d).",
+        cfg.node_id,
+        new_state.epoch,
+        new_state.generation,
+    )
+    return True
+
+
+async def _startup_ready(
+    cfg: TourillonConfig,
+    state: NodeState,
+    topology_mgr: TopologyManager,
+) -> bool:
+    """Handle READY phase startup; return True (engine always started)."""
+    member = Member(
+        node_id=cfg.node_id,
+        peer_address=_peer_address(cfg),
+        generation=state.generation,
+        seq=state.seq,
+        phase=MemberPhase.READY,
+        tokens=state.tokens,
+        partition_shift=cfg.partition_shift,
+    )
+    await topology_mgr.apply_member(member)
+    logger.info(
+        "Node %r is ready (epoch %d, generation %d).",
+        cfg.node_id,
+        state.epoch,
+        state.generation,
+    )
+    return True
+
+
+async def _startup_bootstrap_phase(
+    cfg: TourillonConfig,
+    state: NodeState,
+    phase: MemberPhase,
+    topology_mgr: TopologyManager,
+    gossip_config: GossipConfig,
+    client_ssl_ctx: object,
+    serializer: object,
+    engine: GossipEngine,
+) -> bool:
+    """Handle JOINING/DRAINING phase startup; return True (engine always started).
+
+    Self-registers before bootstrap so the local fingerprint includes this node.
+    Without this, AE ping/pong returns same=True and peers never learn about
+    the joining node. The member is also announced onto the hot-queue so that
+    gossip.push is sent to peers immediately on engine start.
+    """
+    own_member = Member(
+        node_id=cfg.node_id,
+        peer_address=_peer_address(cfg),
+        generation=state.generation,
+        seq=state.seq,
+        phase=phase,
+        tokens=state.tokens,
+        partition_shift=cfg.partition_shift,
+    )
+    await topology_mgr.apply_member(own_member)
+    await _run_seeded_bootstrap(
+        cfg, topology_mgr, gossip_config, client_ssl_ctx, serializer
+    )
+    await engine.announce(own_member)
+    return True
+
+
 async def _startup_phase_logic(
     cfg: TourillonConfig,
     phase: MemberPhase,
@@ -558,75 +646,28 @@ async def _startup_phase_logic(
     gossip_config: GossipConfig,
     engine: GossipEngine,
 ) -> bool:
-    """Execute phase-specific startup; return True if engine should be started."""
-    if phase == MemberPhase.IDLE and not cfg.seeds:
-        new_state = await _bootstrap_first_node(cfg, state_port, topology_mgr)
-        state_ref[0] = new_state
-        logger.info(
-            "Node %r is ready (epoch %d, generation %d).",
-            cfg.node_id,
-            new_state.epoch,
-            new_state.generation,
-        )
-        return True
-
-    if phase == MemberPhase.IDLE and cfg.seeds:
-        logger.info(
-            "Node %r is idle; issue 'tourctl node join' to begin seeded join.",
-            cfg.node_id,
-        )
-        return False
-
+    """Dispatch to the phase-specific startup helper; return True if engine should start."""
+    if phase == MemberPhase.IDLE:
+        return await _startup_idle(cfg, state_port, topology_mgr, state_ref)
     if phase == MemberPhase.READY:
-        peer_address = cfg.peer_server.advertise or cfg.peer_server.bind
-        member = Member(
-            node_id=cfg.node_id,
-            peer_address=peer_address,
-            generation=state.generation,
-            seq=state.seq,
-            phase=MemberPhase.READY,
-            tokens=state.tokens,
-            partition_shift=cfg.partition_shift,
-        )
-        await topology_mgr.apply_member(member)
-        logger.info(
-            "Node %r is ready (epoch %d, generation %d).",
-            cfg.node_id,
-            state.epoch,
-            state.generation,
-        )
-        return True
-
+        return await _startup_ready(cfg, state, topology_mgr)
     if phase in _BOOTSTRAP_PHASES:
-        peer_address = cfg.peer_server.advertise or cfg.peer_server.bind
-        # Self-register before bootstrap so our fingerprint includes ourselves.
-        # Without this, the fingerprint equals the seed's fingerprint and AE
-        # ping/pong returns same=True, leaving peers unaware of this node.
-        own_member = Member(
-            node_id=cfg.node_id,
-            peer_address=peer_address,
-            generation=state.generation,
-            seq=state.seq,
-            phase=phase,
-            tokens=state.tokens,
-            partition_shift=cfg.partition_shift,
+        return await _startup_bootstrap_phase(
+            cfg,
+            state,
+            phase,
+            topology_mgr,
+            gossip_config,
+            client_ssl_ctx,
+            serializer,
+            engine,
         )
-        await topology_mgr.apply_member(own_member)
-        await _run_seeded_bootstrap(
-            cfg, topology_mgr, gossip_config, client_ssl_ctx, serializer
-        )
-        # Pre-populate hot_queue: _hot_loop will send gossip.push to peers
-        # immediately on engine start, propagating our JOINING/DRAINING record.
-        await engine.announce(own_member)
-        return True
-
     if phase == MemberPhase.PAUSED:
         logger.info(
             "Node %r is paused; resume behaviour is not covered by this proposal.",
             cfg.node_id,
         )
         return False
-
     if phase == MemberPhase.FAILED:
         logger.warning(
             "Node %r is in phase 'failed'; recovery behaviour is not covered by this proposal.",
