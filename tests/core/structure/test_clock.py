@@ -18,6 +18,8 @@ from __future__ import annotations
 import pytest
 
 from tourillon.core.structure.clock import HLCClock, HLCTimestamp
+from tourillon.core.structure.record import StoreKey, Version
+from tourillon.core.testing.mem_storage import InMemoryStorage
 
 
 @pytest.mark.rebalance
@@ -108,3 +110,75 @@ def test_hlcclock_update_local_wall_ahead() -> None:
     result = clk.update(old_remote)
     assert result.wall_ms == 10**18
     assert result.counter == 3  # local_counter + 1
+
+
+@pytest.mark.rebalance
+def test_hlcclock_snapshot_returns_wall_and_counter() -> None:
+    """snapshot() returns (wall_ms, counter) matching internal state."""
+    clk = HLCClock("node-1")
+    clk._wall_ms = 12345
+    clk._counter = 7
+    assert clk.snapshot() == (12345, 7)
+
+
+@pytest.mark.rebalance
+def test_hlcclock_restore_sets_wall_and_counter() -> None:
+    """restore() with a higher wall_ms replaces both wall_ms and counter."""
+    clk = HLCClock("node-1")
+    clk.restore(9999, 42)
+    assert clk.snapshot() == (9999, 42)
+
+
+@pytest.mark.rebalance
+def test_hlcclock_restore_ignores_lower_wall_ms() -> None:
+    """restore() does not regress when persisted wall_ms is below current."""
+    clk = HLCClock("node-1")
+    clk._wall_ms = 10**18
+    clk._counter = 3
+    clk.restore(100, 99)  # stale checkpoint — must be ignored
+    assert clk._wall_ms == 10**18
+    assert clk._counter == 3
+
+
+@pytest.mark.rebalance
+def test_hlcclock_restore_raises_counter_on_equal_wall_ms() -> None:
+    """restore() raises counter when persisted wall_ms equals current."""
+    clk = HLCClock("node-1")
+    clk._wall_ms = 5000
+    clk._counter = 2
+    clk.restore(5000, 10)  # same wall, higher counter
+    assert clk._wall_ms == 5000
+    assert clk._counter == 10
+
+
+@pytest.mark.rebalance
+def test_hlcclock_tick_after_restore_is_strictly_greater() -> None:
+    """tick() after restore() never reuses a timestamp below the checkpoint."""
+    clk = HLCClock("node-1")
+    clk.restore(10**18, 999)  # Far-future checkpoint; real clock is lower.
+    ts = clk.tick()
+    assert ts.wall_ms == 10**18
+    assert ts.counter == 1000  # counter + 1
+
+
+@pytest.mark.kv
+async def test_partition_store_max_hlc_empty_returns_none() -> None:
+    """max_hlc() returns None when the partition has no records."""
+    store = InMemoryStorage().open_partition(0)
+    assert await store.max_hlc() is None
+
+
+@pytest.mark.kv
+async def test_partition_store_max_hlc_returns_greatest_timestamp() -> None:
+    """max_hlc() returns the timestamp of the highest-HLC committed record."""
+    storage = InMemoryStorage()
+    store = storage.open_partition(0)
+    ks = b"default"
+    low = HLCTimestamp(wall_ms=1000, counter=0, node_id="n1")
+    high = HLCTimestamp(wall_ms=2000, counter=5, node_id="n1")
+    store.add_record(Version(address=StoreKey(ks, b"k1"), metadata=low, value=b"a"))
+    store.add_record(Version(address=StoreKey(ks, b"k2"), metadata=high, value=b"b"))
+    result = await store.max_hlc()
+    assert result is not None
+    assert result.wall_ms == 2000
+    assert result.counter == 5

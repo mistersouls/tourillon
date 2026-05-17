@@ -453,7 +453,7 @@ class RebalanceApplicator:
 
         store = self._storage.open_partition(pid)
         staging = store.staging(epoch)
-        resume_from = await staging.last_staged_index_key()
+        resume_from = await staging.last_staged_log_key()
         resume_encoded = base64.b64encode(resume_from).decode() if resume_from else None
 
         addr = self._peer_addresses.get(src, "")

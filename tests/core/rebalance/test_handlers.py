@@ -104,7 +104,7 @@ async def test_21_plan_handler_epoch_mismatch() -> None:
     ser = _ser()
     handler = RebalancePlanHandler(
         node_id="src",
-        epoch=3,
+        get_epoch=lambda: 3,
         storage=storage,
         serializer=ser,
     )
@@ -139,7 +139,7 @@ async def test_22_plan_handler_src_mismatch() -> None:
     ser = _ser()
     handler = RebalancePlanHandler(
         node_id="src",
-        epoch=1,
+        get_epoch=lambda: 1,
         storage=storage,
         serializer=ser,
     )
@@ -177,7 +177,7 @@ async def test_23_transfer_handler_full_stream() -> None:
     ser = _ser()
     handler = RebalanceTransferHandler(
         node_id="dst",
-        epoch=1,
+        get_epoch=lambda: 1,
         storage=storage,
         state_port=state_port,
         serializer=ser,
@@ -343,7 +343,7 @@ async def test_plan_handler_malformed_payload_ignored() -> None:
     storage = InMemoryStorage()
     ser = _ser()
     handler = RebalancePlanHandler(
-        node_id="src", epoch=1, storage=storage, serializer=ser
+        node_id="src", get_epoch=lambda: 1, storage=storage, serializer=ser
     )
 
     req = Envelope(kind="rebalance.plan", payload=b"not valid json or msgpack")
@@ -365,7 +365,7 @@ async def test_plan_handler_malformed_transfers_rejected() -> None:
     storage = InMemoryStorage()
     ser = _ser()
     handler = RebalancePlanHandler(
-        node_id="src", epoch=1, storage=storage, serializer=ser
+        node_id="src", get_epoch=lambda: 1, storage=storage, serializer=ser
     )
 
     plan_payload = ser.encode(
@@ -416,7 +416,7 @@ async def test_plan_handler_source_role_streams_then_commit_ok() -> None:
     storage.open_partition(pid).add_record(rec)
 
     handler = RebalancePlanHandler(
-        node_id="src", epoch=1, storage=storage, serializer=ser
+        node_id="src", get_epoch=lambda: 1, storage=storage, serializer=ser
     )
 
     plan_payload = ser.encode(
@@ -467,7 +467,7 @@ async def test_plan_handler_source_role_digest_mismatch_sends_reject() -> None:
     storage.open_partition(pid).add_record(rec)
 
     handler = RebalancePlanHandler(
-        node_id="src", epoch=1, storage=storage, serializer=ser
+        node_id="src", get_epoch=lambda: 1, storage=storage, serializer=ser
     )
 
     plan_payload = ser.encode(
@@ -507,7 +507,7 @@ async def test_plan_handler_drain_dst_sends_plan_ok_with_resume() -> None:
     ser = _ser()
     pid = 20
     handler = RebalancePlanHandler(
-        node_id="dst", epoch=1, storage=storage, serializer=ser
+        node_id="dst", get_epoch=lambda: 1, storage=storage, serializer=ser
     )
 
     plan_payload = ser.encode(
@@ -544,7 +544,11 @@ async def test_transfer_handler_epoch_mismatch_ignored() -> None:
     state_port = _MockStatePort()
     ser = _ser()
     handler = RebalanceTransferHandler(
-        node_id="dst", epoch=2, storage=storage, state_port=state_port, serializer=ser
+        node_id="dst",
+        get_epoch=lambda: 2,
+        storage=storage,
+        state_port=state_port,
+        serializer=ser,
     )
 
     chunk = Envelope(
@@ -580,7 +584,11 @@ async def test_transfer_handler_commit_reject_cleans_up_staging() -> None:
     ser = _ser()
     pid = 99
     handler = RebalanceTransferHandler(
-        node_id="dst", epoch=1, storage=storage, state_port=state_port, serializer=ser
+        node_id="dst",
+        get_epoch=lambda: 1,
+        storage=storage,
+        state_port=state_port,
+        serializer=ser,
     )
 
     chunk1 = Envelope(
@@ -614,7 +622,7 @@ async def test_plan_handler_source_empty_partition_sends_last_chunk() -> None:
     pid = 30
 
     handler = RebalancePlanHandler(
-        node_id="src", epoch=1, storage=storage, serializer=ser
+        node_id="src", get_epoch=lambda: 1, storage=storage, serializer=ser
     )
 
     from tourillon.core.rebalance.digest import compute_transfer_digest

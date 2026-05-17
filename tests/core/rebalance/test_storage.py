@@ -89,7 +89,7 @@ async def test_33_scan_resume_from_cursor_yields_only_after() -> None:
     # Stage the 3rd record to obtain a cursor pointing to it.
     staging = store.staging(epoch)
     await staging.stage(recs[2])
-    cursor = await staging.last_staged_index_key()
+    cursor = await staging.last_staged_log_key()
     assert cursor is not None
 
     # scan strictly after the cursor → only records 4 and 5
@@ -119,7 +119,7 @@ async def test_34_delta_digest_on_resume_matches_source() -> None:
 
     staging = store.staging(epoch)
     await staging.stage(recs[2])
-    cursor = await staging.last_staged_index_key()
+    cursor = await staging.last_staged_log_key()
 
     # Source scans delta and computes digest.
     delta_source = [r async for r in store.scan(resume_from=cursor)]
@@ -149,7 +149,7 @@ async def test_35_scan_cursor_boundary_record_not_resent() -> None:
 
     staging = store.staging(epoch)
     await staging.stage(recs[2])  # cursor → recs[2] (wall=300)
-    cursor = await staging.last_staged_index_key()
+    cursor = await staging.last_staged_log_key()
     assert cursor is not None
 
     after = [r async for r in store.scan(resume_from=cursor)]

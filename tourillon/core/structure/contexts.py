@@ -48,6 +48,14 @@ class CredentialsConfig:
 
 
 @dataclass(frozen=True)
+class KvConfig:
+    """KV quorum defaults from contexts.toml → [contexts.kv]."""
+
+    quorum_write: int = 1
+    quorum_read: int = 1
+
+
+@dataclass(frozen=True)
 class ContextEntry:
     """One named operator context stored in contexts.toml."""
 
@@ -55,6 +63,7 @@ class ContextEntry:
     cluster: ClusterRef
     endpoints: EndpointsConfig
     credentials: CredentialsConfig
+    kv: KvConfig = KvConfig()
 
 
 @dataclass

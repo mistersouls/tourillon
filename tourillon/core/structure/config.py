@@ -96,6 +96,25 @@ class RebalanceConfig:
 
 
 @dataclass(frozen=True)
+class KvConfig:
+    """Server-side KV tuning parameters from config.toml → [kv]."""
+
+    fanout_timeout_ms: int = 50
+    hint_replay_stabilization_ms: int = 2000
+    hint_replay_concurrency: int = 16
+
+    _MIN_FANOUT_MS: int = 10  # minimum enforced; node refuses to start otherwise
+
+    def validate(self) -> None:
+        """Raise ValueError if any parameter violates its invariant."""
+        if self.fanout_timeout_ms < self._MIN_FANOUT_MS:
+            raise ValueError(
+                f"kv.fanout_timeout_ms must be >= {self._MIN_FANOUT_MS} ms, "
+                f"got {self.fanout_timeout_ms}"
+            )
+
+
+@dataclass(frozen=True)
 class TourillonConfig:
     """Fully-validated, immutable node configuration.
 
@@ -120,4 +139,5 @@ class TourillonConfig:
     join: JoinConfig = field(default_factory=JoinConfig)
     drain: DrainConfig = field(default_factory=DrainConfig)
     rebalance: RebalanceConfig = field(default_factory=RebalanceConfig)
+    kv: KvConfig = field(default_factory=KvConfig)
     schema_version: int = 1

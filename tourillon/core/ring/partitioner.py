@@ -16,10 +16,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from tourillon.core.ring.hashspace import HashSpace
 from tourillon.core.ring.ring import Ring
 from tourillon.core.ring.vnode import VNode
+
+if TYPE_CHECKING:
+    from tourillon.core.structure.record import StoreKey
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,15 @@ class Partitioner:
         """Return the partition ID for hash h in O(1)."""
         return h >> (self._hs.bits - self._shift)
 
+    def pid_for_addr(self, addr: StoreKey) -> int:
+        """Return the partition ID for a StoreKey in O(1).
+
+        Hashes ``addr`` via ``HashSpace.hash(addr.to_routing_bytes())``.
+        Prefer this over calling ``pid_for_hash(_hash_key(addr))`` directly so
+        the hash function and encoding remain in one place.
+        """
+        return self.pid_for_hash(self._hs.hash(addr.to_routing_bytes()))
+
     def segment_for_pid(self, pid: int) -> LogicalPartition:
         """Return the LogicalPartition arc for the given partition ID."""
         start = pid * self._step
@@ -114,3 +127,18 @@ class Partitioner:
         partition = self.segment_for_pid(pid)
         vnode = ring.successor(token)
         return PartitionPlacement(partition=partition, vnode=vnode)
+
+    def placement_for_addr(self, addr: StoreKey, ring: Ring) -> PartitionPlacement:
+        """Return the PartitionPlacement for a StoreKey on ring.
+
+        Hashes ``addr`` via ``HashSpace.hash(addr.to_routing_bytes())`` then
+        delegates to ``placement_for_token``.  This is the canonical entry
+        point for coordinator code that routes by key; callers should prefer
+        this method over calling ``_hash_key`` + ``placement_for_token``
+        directly so that the hash function and encoding are defined in one
+        place.
+
+        Raise ValueError when ring is empty.
+        """
+        token = self._hs.hash(addr.to_routing_bytes())
+        return self.placement_for_token(token, ring)

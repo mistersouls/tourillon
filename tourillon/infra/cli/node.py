@@ -39,6 +39,7 @@ from tourillon.core.gossip.config import GossipConfig
 from tourillon.core.gossip.engine import GossipEngine
 from tourillon.core.handlers.gossip import register_gossip_handlers
 from tourillon.core.handlers.inspect import NodeInspectHandler
+from tourillon.core.handlers.kv import register_kv_handlers, register_kv_node_handlers
 from tourillon.core.handlers.node_join import NodeJoinHandler
 from tourillon.core.handlers.rebalance import register_rebalance_handlers
 from tourillon.core.lifecycle.bootstrap import run_first_node_bootstrap
@@ -352,12 +353,19 @@ def _build_peer_dispatcher(
         register_rebalance_handlers(
             dispatcher=peer_dispatcher,
             node_id=cfg.node_id,
-            epoch=state_ref[0].epoch,
+            get_epoch=lambda: state_ref[0].epoch,
             storage=storage,  # type: ignore[arg-type]
             state_port=state_port,
             applicator=applicator,
             serializer=serializer,
             max_chunk_bytes=cfg.rebalance.max_chunk_bytes,
+        )
+        register_kv_node_handlers(
+            peer_dispatcher,
+            cfg.node_id,
+            storage,  # type: ignore[arg-type]
+            partitioner,
+            serializer,
         )
         logger.debug(
             "Rebalance handlers registered (epoch=%d, phase=%s).",
@@ -474,8 +482,36 @@ async def _run_phase(
     peer_host, peer_port = _parse_bind(cfg.peer_server.bind)
     kv_host, kv_port = _parse_bind(cfg.kv_server.bind)
 
+    # Build the KV dispatcher with a coordinator wired to the ring.
+    from tourillon.core.kv.coordinator import KvCoordinator
+    from tourillon.core.ring.placement import SimplePreferenceStrategy
+
+    kv_strategy = SimplePreferenceStrategy(rf=cfg.rf)
+    kv_coordinator = KvCoordinator(
+        node_id=cfg.node_id,
+        storage=rebalance_storage,
+        partitioner=partitioner,
+        topology_manager=topology_mgr,
+        probe_manager=probe_mgr,
+        placement_strategy=kv_strategy,
+        pool=container.pool,
+        serializer=container.serializer,
+        fanout_timeout=cfg.kv.fanout_timeout_ms / 1000.0,
+    )
+    kv_dispatcher = Dispatcher()
+    register_kv_handlers(
+        dispatcher=kv_dispatcher,
+        coordinator=kv_coordinator,
+        node_id=cfg.node_id,
+        storage=rebalance_storage,
+        partitioner=partitioner,
+        serializer=container.serializer,
+        default_quorum_write=1,
+        default_quorum_read=1,
+    )
+
     peer_server = TcpServer(peer_dispatcher, container.server_ssl_ctx, name="Peer")
-    kv_server = TcpServer(Dispatcher(), container.server_ssl_ctx, name="KV")
+    kv_server = TcpServer(kv_dispatcher, container.server_ssl_ctx, name="KV")
 
     await peer_server.start(peer_host, peer_port)
 
@@ -500,6 +536,13 @@ async def _run_phase(
         storage=rebalance_storage,
         partitioner=partitioner,
     )
+
+    # When _startup_phase_logic advances the phase (e.g. IDLE → READY on first-node
+    # bootstrap), the KV socket must be bound now if it wasn't already.
+    new_phase = state_ref[0].phase
+    if not bind_kv and new_phase in _KV_PHASES:
+        await kv_server.start(kv_host, kv_port)
+        bind_kv = True
 
     loop = asyncio.get_running_loop()
     _install_signal_handlers(loop, stop)

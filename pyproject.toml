@@ -89,6 +89,7 @@ markers = [
   "gossip: proposal 004 — gossip engine and seeded join",
   "lifecycle: proposal 002/004 — member phase FSM and probe manager",
   "rebalance: proposal 005 — partition rebalance",
+  "kv: proposal 006 — KV read/write path",
   "e2e: end-to-end tests requiring real sockets",
 ]
 

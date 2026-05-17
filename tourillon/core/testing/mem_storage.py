@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""In-memory implementations of Storage, PartitionStore, and PartitionStaging.
+"""In-memory implementations of Storage, PartitionStore, PartitionStaging, PartitionHint.
 
 These classes stand in for the real storage backend in unit tests. They
 implement the same port protocols with full in-memory semantics: staging
@@ -28,7 +28,56 @@ import struct
 from collections.abc import AsyncIterator
 
 from tourillon.core.structure.clock import HLCTimestamp
-from tourillon.core.structure.record import Record
+from tourillon.core.structure.record import (
+    KvMetadata,
+    Record,
+    StoreKey,
+    Tombstone,
+    Version,
+)
+
+
+class InMemoryPartitionHint:
+    """In-memory PartitionHint for one (pid, for_node_id) pair.
+
+    Hint records are kept in a list alongside a set of stale HLCs
+    (hlcs that have been marked STALE after successful replay).
+    """
+
+    def __init__(self, pid: int, for_node_id: str) -> None:
+        self._pid = pid
+        self._for_node_id = for_node_id
+        self._hints: list[Record] = []
+        self._stale_hlcs: set[HLCTimestamp] = set()
+
+    async def put(self, addr: StoreKey, val: bytes, meta: KvMetadata) -> None:
+        """Store a hinted write."""
+        rec = Version(
+            address=addr, metadata=meta.hlc, value=val, quorum_write=meta.quorum_write
+        )
+        self._hints.append(rec)
+
+    async def delete(self, addr: StoreKey, meta: KvMetadata) -> None:
+        """Store a hinted tombstone."""
+        rec = Tombstone(address=addr, metadata=meta.hlc, quorum_write=meta.quorum_write)
+        self._hints.append(rec)
+
+    async def mark_stale(self, addr: StoreKey, hlc: HLCTimestamp) -> None:
+        """Mark a hint as STALE (replayed successfully)."""
+        self._stale_hlcs.add(hlc)
+
+    def pending(self) -> AsyncIterator[Record]:
+        """Yield all pending (non-stale) hint records."""
+        return self._iter_pending()
+
+    async def _iter_pending(self) -> AsyncIterator[Record]:  # type: ignore[override]
+        for rec in self._hints:
+            if rec.metadata not in self._stale_hlcs:
+                yield rec
+
+    def hint_records(self) -> list[Record]:
+        """Return all hint records (test helper)."""
+        return list(self._hints)
 
 
 class InMemoryPartitionStaging:
@@ -59,8 +108,8 @@ class InMemoryPartitionStaging:
         """Return True when at least one staged record is present."""
         return bool(self._staged)
 
-    async def last_staged_index_key(self) -> bytes | None:
-        """Return a synthetic cursor key for the highest-HLC staged record.
+    async def last_staged_log_key(self) -> bytes | None:
+        """Return a synthetic DBI_LOG cursor key for the highest-HLC staged record.
 
         Layout matches the port contract: pid(4B BE) | wall_ms(8B BE) |
         counter(2B BE) | node_id_prefix(2B) | keyspace | key. Callers may
@@ -93,14 +142,19 @@ class InMemoryPartitionStaging:
 class InMemoryPartitionStore:
     """In-memory PartitionStore for one pid.
 
-    Committed records (added via add_record()) are always visible to scan().
-    Staging contexts are keyed by epoch and returned by staging().
+    Committed records (added via add_record() or put/delete) are always
+    visible to scan() and get(). Staging contexts are keyed by epoch and
+    returned by staging(). Hint contexts are keyed by for_node_id.
+
+    Phantom HLCs are tracked; get() skips records whose HLC is phantom.
     """
 
     def __init__(self, pid: int) -> None:
         self._pid = pid
         self._records: list[Record] = []
         self._staging: dict[int, InMemoryPartitionStaging] = {}
+        self._hints: dict[str, InMemoryPartitionHint] = {}
+        self._phantom_hlcs: set[HLCTimestamp] = set()
 
     def add_record(self, record: Record) -> None:
         """Pre-populate committed records (test helper; no staging involved)."""
@@ -110,7 +164,7 @@ class InMemoryPartitionStore:
         """Yield committed records in HLC order.
 
         When resume_from is None, yields all records from the start.
-        When resume_from is a cursor key (as returned by last_staged_index_key()),
+        When resume_from is a cursor key (as returned by last_staged_log_key()),
         positions strictly after the cursor: the cursor record itself is never
         re-yielded. Only records with an HLC strictly greater than the cursor's
         (wall_ms, counter) pair are emitted.
@@ -132,6 +186,62 @@ class InMemoryPartitionStore:
         if epoch not in self._staging:
             self._staging[epoch] = InMemoryPartitionStaging(self._pid, epoch)
         return self._staging[epoch]
+
+    def hint(self, for_node_id: str) -> InMemoryPartitionHint:
+        """Return or create the hint context for for_node_id."""
+        if for_node_id not in self._hints:
+            self._hints[for_node_id] = InMemoryPartitionHint(self._pid, for_node_id)
+        return self._hints[for_node_id]
+
+    async def get(self, addr: StoreKey) -> Record | None:
+        """Return the most recent non-phantom committed record for addr, or None."""
+        candidates = [
+            r
+            for r in self._records
+            if r.address == addr and r.metadata not in self._phantom_hlcs
+        ]
+        if not candidates:
+            # Also check hints
+            for hint_store in self._hints.values():
+                for rec in hint_store.hint_records():
+                    if rec.address == addr and rec.metadata not in self._phantom_hlcs:
+                        candidates.append(rec)
+            if not candidates:
+                return None
+        return max(candidates, key=_hlc_key)
+
+    async def put(self, addr: StoreKey, val: bytes, meta: KvMetadata) -> None:
+        """Write a committed version."""
+        rec = Version(
+            address=addr, metadata=meta.hlc, value=val, quorum_write=meta.quorum_write
+        )
+        self._records.append(rec)
+
+    async def delete(self, addr: StoreKey, meta: KvMetadata) -> None:
+        """Write a committed tombstone."""
+        rec = Tombstone(address=addr, metadata=meta.hlc, quorum_write=meta.quorum_write)
+        self._records.append(rec)
+
+    async def mark_phantom(self, addr: StoreKey, hlc: HLCTimestamp) -> None:
+        """Mark hlc as PHANTOM — get() will skip it."""
+        self._phantom_hlcs.add(hlc)
+
+    async def max_hlc(self) -> HLCTimestamp | None:
+        """Return the max HLC across all committed and hint records, or None.
+
+        Mirrors DBI_LOG semantics: the last key in DBI_LOG is the maximum HLC
+        regardless of record visibility tag. Used once at startup to seed
+        HLCClock.restore() without a separate persisted checkpoint.
+        """
+        all_records: list[Record] = list(self._records)
+        for hint_store in self._hints.values():
+            all_records.extend(hint_store.hint_records())
+        if not all_records:
+            return None
+        return max(
+            (rec.metadata for rec in all_records),
+            key=lambda t: (t.wall_ms, t.counter, t.node_id),
+        )
 
 
 class InMemoryStorage:

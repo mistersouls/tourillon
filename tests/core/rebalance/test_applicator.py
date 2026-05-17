@@ -672,7 +672,7 @@ def _make_state(
 
 @pytest.mark.rebalance
 async def test_19_crash_recovery_same_epoch_staging_exists_sends_resume_from() -> None:
-    """exists() True; last_staged_index_key() → cursor C → resume_from=base64(C)
+    """exists() True; last_staged_log_key() → cursor C → resume_from=base64(C)
     sent in rebalance.plan (JOIN); cleanup() not called."""
     pid = 42
     epoch = 4
@@ -689,7 +689,7 @@ async def test_19_crash_recovery_same_epoch_staging_exists_sends_resume_from() -
     staging = store.staging(epoch)
     await staging.stage(rec)
 
-    # The applicator's _do_join_transfer always calls last_staged_index_key()
+    # The applicator's _do_join_transfer always calls last_staged_log_key()
     # and encodes it as resume_from in the outgoing rebalance.plan.
     state_port = _MockStatePort()
     state_port._state = _make_state(epoch=epoch, staging_pids=(pid,))

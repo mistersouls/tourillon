@@ -31,7 +31,9 @@ from typing import Any
 from tourillon.core.structure.config import (
     DrainConfig,
     JoinConfig,
+    KvConfig,
     NodeSize,
+    RebalanceConfig,
     ServerConfig,
     TlsConfig,
     TourillonConfig,
@@ -132,26 +134,7 @@ def load_config(raw: dict[str, Any]) -> TourillonConfig:
         raise ConfigError(str(exc)) from exc
 
     # [servers.kv] and [servers.peer]
-    _require(raw, "servers")
-    kv_raw = _require(raw, "servers", "kv")
-    peer_raw = _require(raw, "servers", "peer")
-
-    kv_bind: str = _require(raw, "servers", "kv", "bind")
-    peer_bind: str = _require(raw, "servers", "peer", "bind")
-
-    if kv_bind == peer_bind:
-        raise ConfigError(
-            "servers.kv and servers.peer cannot share the same bind address"
-        )
-
-    kv_server = ServerConfig(
-        bind=kv_bind,
-        advertise=kv_raw.get("advertise", ""),
-    )
-    peer_server = ServerConfig(
-        bind=peer_bind,
-        advertise=peer_raw.get("advertise", ""),
-    )
+    kv_server, peer_server = _parse_servers(raw)
 
     # [cluster]
     cluster_raw = raw.get("cluster", {})
@@ -178,21 +161,28 @@ def load_config(raw: dict[str, Any]) -> TourillonConfig:
 
     # [drain]
     drain_raw = raw.get("drain", {})
-    drain = DrainConfig(
-        max_retries=int(drain_raw.get("max_retries", -1)),
-        attempt_timeout=_parse_duration(
-            drain_raw.get("attempt_timeout", 30), "drain.attempt_timeout"
-        ),
-        deadline=_parse_duration(drain_raw.get("deadline", 300), "drain.deadline"),
-        backoff_base=_parse_duration(
-            drain_raw.get("backoff_base", 5), "drain.backoff_base"
-        ),
-        backoff_max=_parse_duration(
-            drain_raw.get("backoff_max", 60), "drain.backoff_max"
-        ),
-        max_concurrent=int(drain_raw.get("max_concurrent", 4)),
-        bandwidth_fraction=float(drain_raw.get("bandwidth_fraction", 1.0)),
+    drain = _parse_drain(drain_raw)
+
+    # [rebalance]
+    rebalance_raw = raw.get("rebalance", {})
+    rebalance = RebalanceConfig(
+        max_concurrent_transfers=int(rebalance_raw.get("max_concurrent_transfers", 4)),
+        max_chunk_bytes=int(rebalance_raw.get("max_chunk_bytes", 1_048_576)),
     )
+
+    # [kv]
+    kv_raw = raw.get("kv", {})
+    kv = KvConfig(
+        fanout_timeout_ms=int(kv_raw.get("fanout_timeout_ms", 50)),
+        hint_replay_stabilization_ms=int(
+            kv_raw.get("hint_replay_stabilization_ms", 2000)
+        ),
+        hint_replay_concurrency=int(kv_raw.get("hint_replay_concurrency", 16)),
+    )
+    try:
+        kv.validate()
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
     return TourillonConfig(
         node_id=node_id,
@@ -206,7 +196,45 @@ def load_config(raw: dict[str, Any]) -> TourillonConfig:
         partition_shift=partition_shift,
         join=join,
         drain=drain,
+        rebalance=rebalance,
+        kv=kv,
         schema_version=schema_version,
+    )
+
+
+def _parse_servers(raw: dict[str, Any]) -> tuple[ServerConfig, ServerConfig]:
+    """Parse [servers.kv] and [servers.peer] returning (kv_server, peer_server)."""
+    _require(raw, "servers")
+    kv_raw = _require(raw, "servers", "kv")
+    peer_raw = _require(raw, "servers", "peer")
+    kv_bind: str = _require(raw, "servers", "kv", "bind")
+    peer_bind: str = _require(raw, "servers", "peer", "bind")
+    if kv_bind == peer_bind:
+        raise ConfigError(
+            "servers.kv and servers.peer cannot share the same bind address"
+        )
+    return (
+        ServerConfig(bind=kv_bind, advertise=kv_raw.get("advertise", "")),
+        ServerConfig(bind=peer_bind, advertise=peer_raw.get("advertise", "")),
+    )
+
+
+def _parse_drain(drain_raw: dict[str, Any]) -> DrainConfig:
+    """Parse the [drain] config section."""
+    return DrainConfig(
+        max_retries=int(drain_raw.get("max_retries", -1)),
+        attempt_timeout=_parse_duration(
+            drain_raw.get("attempt_timeout", 30), "drain.attempt_timeout"
+        ),
+        deadline=_parse_duration(drain_raw.get("deadline", 300), "drain.deadline"),
+        backoff_base=_parse_duration(
+            drain_raw.get("backoff_base", 5), "drain.backoff_base"
+        ),
+        backoff_max=_parse_duration(
+            drain_raw.get("backoff_max", 60), "drain.backoff_max"
+        ),
+        max_concurrent=int(drain_raw.get("max_concurrent", 4)),
+        bandwidth_fraction=float(drain_raw.get("bandwidth_fraction", 1.0)),
     )
 
 

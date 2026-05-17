@@ -38,13 +38,22 @@ class HLCTimestamp:
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serialisable dict for wire encoding."""
-        return {"wall": self.wall_ms, "counter": self.counter, "node_id": self.node_id}
+        return {
+            "wall_ms": self.wall_ms,
+            "counter": self.counter,
+            "node_id": self.node_id,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> HLCTimestamp:
-        """Reconstruct an HLCTimestamp from its wire dict representation."""
+        """Reconstruct an HLCTimestamp from its wire dict representation.
+
+        Accepts both ``wall_ms`` (current format) and ``wall`` (legacy alias)
+        so that records serialised before the rename can still be decoded.
+        """
+        wall_raw = data.get("wall_ms") or data.get("wall")
         return cls(
-            wall_ms=int(data["wall"]),  # type: ignore[arg-type]
+            wall_ms=int(wall_raw),  # type: ignore[arg-type]
             counter=int(data["counter"]),  # type: ignore[arg-type]
             node_id=str(data["node_id"]),
         )
@@ -84,6 +93,25 @@ class HLCClock:
             counter=self._counter,
             node_id=self._node_id,
         )
+
+    def restore(self, wall_ms: int, counter: int) -> None:
+        """Restore lower bounds from persisted state.
+
+        Called once at startup before any tick() or update(). Guarantees that
+        no future timestamp can collide with a timestamp emitted before the
+        last checkpoint. If the provided wall_ms equals the current _wall_ms,
+        the counter is raised to the persisted value so that the next tick()
+        starts above the highest previously emitted counter.
+        """
+        if wall_ms > self._wall_ms:
+            self._wall_ms = wall_ms
+            self._counter = counter
+        elif wall_ms == self._wall_ms:
+            self._counter = max(self._counter, counter)
+
+    def snapshot(self) -> tuple[int, int]:
+        """Return (wall_ms, counter) for checkpointing to persistent storage."""
+        return (self._wall_ms, self._counter)
 
     def update(self, remote: HLCTimestamp) -> HLCTimestamp:
         """Merge a remote timestamp and return the updated local timestamp.

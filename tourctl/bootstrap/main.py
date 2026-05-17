@@ -23,6 +23,7 @@ from rich.console import Console
 from rich.table import Table
 
 from tourctl.core.commands.config import ContextsError, load_contexts, save_contexts
+from tourctl.infra.cli.kv import kv_app
 from tourctl.infra.cli.node import node_app
 from tourctl.infra.cli.rebalance import rebalance_app
 
@@ -31,6 +32,7 @@ config_app = typer.Typer(no_args_is_help=True)
 app.add_typer(config_app, name="config")
 app.add_typer(node_app, name="node")
 app.add_typer(rebalance_app, name="rebalance")
+app.add_typer(kv_app, name="kv")
 
 _console = Console()
 _err_console = Console(stderr=True)

@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from tourillon.core.rebalance.digest import compute_transfer_digest
@@ -63,13 +64,13 @@ class RebalancePlanHandler:
     def __init__(
         self,
         node_id: str,
-        epoch: int,
+        get_epoch: Callable[[], int],
         storage: Storage,
         serializer: SerializerPort,
         max_chunk_bytes: int = 1_048_576,
     ) -> None:
         self._node_id = node_id
-        self._epoch = epoch
+        self._get_epoch = get_epoch
         self._storage = storage
         self._serializer = serializer
         self._max_chunk_bytes = max_chunk_bytes
@@ -88,7 +89,8 @@ class RebalancePlanHandler:
             return
 
         plan_epoch = int(data.get("epoch", -1))
-        if plan_epoch != self._epoch:
+        current_epoch = self._get_epoch()
+        if plan_epoch != current_epoch:
             await self._reject(send, req, "epoch_mismatch")
             return
 
@@ -125,7 +127,7 @@ class RebalancePlanHandler:
         logger.info(
             "Rebalance source: serving %d pid(s) epoch=%d to %s.",
             len(pids),
-            self._epoch,
+            self._get_epoch(),
             ", ".join(sorted(dst_nodes)),
         )
         await self._send_plan_ok(send, req, resume_from=None)
@@ -177,8 +179,8 @@ class RebalancePlanHandler:
             t = transfers[0]
             first_pid = t.pid_start  # use pid_start from PartitionRangeTransfer
             store = self._storage.open_partition(first_pid)
-            staging = store.staging(self._epoch)
-            cursor = await staging.last_staged_index_key()
+            staging = store.staging(self._get_epoch())
+            cursor = await staging.last_staged_log_key()
             if cursor:
                 resume_raw = base64.b64encode(cursor).decode()
         await self._send_plan_ok(send, req, resume_from=resume_raw)
@@ -222,7 +224,7 @@ class RebalancePlanHandler:
         """Push one rebalance.transfer chunk to the destination."""
         payload = self._serializer.encode(
             {
-                "epoch": self._epoch,
+                "epoch": self._get_epoch(),
                 "pid": pid,
                 "chunk_seq": seq,
                 "is_last": is_last,
@@ -244,7 +246,7 @@ class RebalancePlanHandler:
         resume_from: str | None,
     ) -> None:
         """Send rebalance.plan.ok with optional resume_from cursor."""
-        body: dict[str, Any] = {"epoch": self._epoch}
+        body: dict[str, Any] = {"epoch": self._get_epoch()}
         if resume_from is not None:
             body["resume_from"] = resume_from
         payload = self._serializer.encode(body)
@@ -265,7 +267,7 @@ class RebalancePlanHandler:
     ) -> None:
         """Send rebalance.commit.ok or rebalance.commit.reject."""
         kind = "rebalance.commit.ok" if ok else "rebalance.commit.reject"
-        payload = self._serializer.encode({"epoch": self._epoch})
+        payload = self._serializer.encode({"epoch": self._get_epoch()})
         env = Envelope.create(
             payload,
             kind=kind,
@@ -276,7 +278,9 @@ class RebalancePlanHandler:
 
     async def _reject(self, send: SendEnvelope, req: Envelope, reason: str) -> None:
         """Send rebalance.plan.reject with the given reason."""
-        payload = self._serializer.encode({"epoch": self._epoch, "reason": reason})
+        payload = self._serializer.encode(
+            {"epoch": self._get_epoch(), "reason": reason}
+        )
         env = Envelope.create(
             payload,
             kind="rebalance.plan.reject",
@@ -297,13 +301,13 @@ class RebalanceTransferHandler:
     def __init__(
         self,
         node_id: str,
-        epoch: int,
+        get_epoch: Callable[[], int],
         storage: Storage,
         state_port: StatePort,
         serializer: SerializerPort,
     ) -> None:
         self._node_id = node_id
-        self._epoch = epoch
+        self._get_epoch = get_epoch
         self._storage = storage
         self._state_port = state_port
         self._serializer = serializer
@@ -325,16 +329,17 @@ class RebalanceTransferHandler:
 
         pid = int(data.get("pid", -1))
         transfer_epoch = int(data.get("epoch", -1))
-        if transfer_epoch != self._epoch:
+        current_epoch = self._get_epoch()
+        if transfer_epoch != current_epoch:
             logger.warning(
                 "rebalance.transfer epoch mismatch: got %d want %d",
                 transfer_epoch,
-                self._epoch,
+                current_epoch,
             )
             return
 
         store = self._storage.open_partition(pid)
-        staging = store.staging(self._epoch)
+        staging = store.staging(current_epoch)
         records = []
 
         await self._process_chunk(data, staging, records)
@@ -346,7 +351,7 @@ class RebalanceTransferHandler:
         digest = compute_transfer_digest(iter(records))
         commit_payload = self._serializer.encode(
             {
-                "epoch": self._epoch,
+                "epoch": current_epoch,
                 "pid": pid,
                 "digest": digest,
             }
@@ -473,7 +478,7 @@ class RebalanceStatusHandler:
 def register_rebalance_handlers(
     dispatcher: Any,  # noqa: ANN401
     node_id: str,
-    epoch: int,
+    get_epoch: Callable[[], int],
     storage: Storage,
     state_port: StatePort,
     applicator: RebalanceApplicator,
@@ -483,14 +488,14 @@ def register_rebalance_handlers(
     """Register all rebalance responder handlers on *dispatcher*."""
     plan_handler = RebalancePlanHandler(
         node_id=node_id,
-        epoch=epoch,
+        get_epoch=get_epoch,
         storage=storage,
         serializer=serializer,
         max_chunk_bytes=max_chunk_bytes,
     )
     transfer_handler = RebalanceTransferHandler(
         node_id=node_id,
-        epoch=epoch,
+        get_epoch=get_epoch,
         storage=storage,
         state_port=state_port,
         serializer=serializer,
