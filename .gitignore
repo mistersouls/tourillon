@@ -1,0 +1,28 @@
+# Generated
+db/
+.certs/
+.config/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+*.egg-info/
+.eggs/
+
+# uv
+.venv/
+# uv.lock is intentionally committed for reproducible builds (application, not library)
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Type checking
+.mypy_cache/
+
+# IDEA
+.idea/
