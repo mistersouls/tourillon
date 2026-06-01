@@ -19,13 +19,13 @@ snapshot of its internal state. The response carries partition ownership (comput
 local probe state for every tracked peer (including both the gossip phi value and the
 data-circuit-breaker suspect flag). The proposal also updates
 `core/structure/inspect.py` to add the `data_is_suspect` field to `ProbeSummary` and
-a `probe_states_total` field to `NodeInspectResponse`, registers the
-`node.inspect` handler in `core/lifecycle/handlers.py` using the
-`@dispatcher.on("node.inspect")` decorator style, and introduces a `--json` flag for
-machine-readable output. The full `token_hex` value is always present in the wire payload;
-the CLI truncates it to the first 8 hex digits followed by `…` for the human-readable
-table view. No amendments to this proposal are permitted; later proposals extend it only
-through new `Dispatcher` registrations.
+a `probe_states_total` field to `NodeInspectResponse`, and it assumes that the
+`Bootstraper` introduced in proposal 001 wires the `node.inspect` handler into the peer
+dispatcher from a single `TourillonCore` instance rather than scattering registration
+across startup helpers. The full `token_hex` value is always present in the wire
+payload; the CLI truncates it to the first 8 hex digits followed by `…` for the
+human-readable table view. No amendments to this proposal are permitted; later proposals
+extend it only through new `Dispatcher` registrations.
 
 ---
 
@@ -562,10 +562,10 @@ When `start_pid > end_pid` (the vnode with the minimum token; its arc crosses th
 boundary), the CLI renders both bounds literally as they appear in `PartitionRange`:
 
 ```
-  token 0x001a3cb4…  →  pids [ 900–  63]  (188 partitions)  [wraps]
+  token 0x001a3cb4…  →  pids [ 900–  63]  (188 partitions)  [w]
 ```
 
-The `[wraps]` tag makes it clear that the range is `[900, 1023] ∪ [0, 63]`.
+The `[w]` tag makes it clear that the range is `[900, 1023] ∪ [0, 63]`.
 
 ### Core invariants
 
@@ -609,7 +609,7 @@ tourctl side:
   6. Decode payload → NodeInspectResponse.
   7. Render and print.
 
-Daemon side (handle_node_inspect):
+Daemon side (`Bootstraper`-wired `handle_node_inspect`):
   1. Receive "node.inspect" envelope; note correlation_id.
   2. Load NodeState from state_port (in-memory; no disk I/O on hot path).
   3. Snapshot topology (ring + registry) from TopologyManager.
@@ -853,46 +853,6 @@ def _render_json(response: NodeInspectResponse) -> str:
 
 ---
 
-## Proposed code organisation
-
-Files **created or modified** by this proposal (in mandatory creation order):
-
-```
-tourillon/core/structure/inspect.py          MODIFIED — add data_is_suspect to
-                                                         ProbeSummary; add
-                                                         probe_states_total to
-                                                         NodeInspectResponse; add
-                                                         INSPECT_MEMBER_LIMIT constant
-tourillon/core/lifecycle/__init__.py         NEW — package marker (if absent)
-tourillon/core/lifecycle/handlers.py         NEW — register(), handle_node_inspect,
-                                                     _response_to_dict,
-                                                     _dict_to_response
-tourctl/infra/cli/node.py                    MODIFIED — add 'inspect' sub-command,
-                                                         _truncate_token,
-                                                         _render_human, _render_json
-tests/unit/__init__.py                       (already present)
-tests/unit/test_inspect_handler.py           NEW — scenarios 1–10
-tests/unit/test_inspect_cli.py               NEW — scenarios 11–16
-tests/e2e/test_node_inspect.py               NEW — scenarios 17–18
-```
-
-Files already present and unchanged:
-
-```
-tourillon/core/structure/envelope.py         (complete)
-tourillon/core/ring/partitioner.py           (complete — Partitioner, ranges_for)
-tourillon/core/lifecycle/member.py           (complete — MemberPhase, Member)
-tourillon/core/lifecycle/probe.py            (complete)
-tourillon/core/ring/topology.py              (complete — TopologyManager, Topology)
-tourillon/core/transport/dispatcher.py       (complete — Dispatcher)
-tourillon/core/ports/transport.py            (complete — ReceiveEnvelope, SendEnvelope)
-tourillon/core/ports/serializer.py           (complete — SerializerPort)
-tourillon/bootstrap/config.py               (complete — parse_duration, ConfigError)
-tourillon/infra/tls/context.py              (complete — build_client_ssl_context)
-tourillon/infra/contexts.py                 (complete — load_contexts)
-```
-
----
 
 ## Test scenarios
 
@@ -912,7 +872,7 @@ E2e tests use `tmp_path` (pytest fixture) and a real running daemon process.
 | 9 | unit | `_truncate_token("0x001a3cb4f200000000000000000000001a")` (longer than standard) | Call the function directly | Returns `"0x001a3cb4…"` (always slices at position 10, regardless of full length) |
 | 10 | unit | `NodeInspectResponse` built from in-memory state with `kv_address=""` (JOINING node) | Call `_render_human(response)` | Output contains `"(none — not yet READY)"` in the KV address line; `"joining"` in the Phase line |
 | 11 | unit | `NodeInspectResponse` with 2 partition ranges (`token_hex` known) | Call `_render_human(response)` | Output contains `"0x"` + exactly 8 hex chars + `"…"` for each range; pids are padded to consistent width |
-| 12 | unit | `NodeInspectResponse` with a wrapping range (`start_pid=900`, `end_pid=63`) | Call `_render_human(response)` | Output contains `[wraps]` tag for that range row |
+| 12 | unit | `NodeInspectResponse` with a wrapping range (`start_pid=900`, `end_pid=63`) | Call `_render_human(response)` | Output contains `[w]` tag for that range row |
 | 13 | unit | `NodeInspectResponse` with `members_truncated=True`, `members_total=300` | Call `_render_human(response)` | Output contains `"[truncated — showing 256 of 300 members]"` |
 | 14 | unit | `NodeInspectResponse` with `probe_states_truncated=True`, `probe_states_total=300` | Call `_render_human(response)` | Output contains `"[truncated — showing 256 of 300 probe states]"` |
 | 15 | unit | `NodeInspectResponse` with known field values | Call `_render_json(response)` | Output is valid JSON; `json.loads(output)["node_id"]` matches `response.node_id`; all `token_hex` values are present untruncated |
@@ -941,7 +901,7 @@ E2e tests use `tmp_path` (pytest fixture) and a real running daemon process.
 - [ ] CLI `_truncate_token` returns `token_hex[:10] + "…"` regardless of the total
   length of `token_hex`.
 - [ ] `_render_human` renders wrapping ranges (where `start_pid > end_pid`) with a
-  `[wraps]` annotation.
+  `[w]` annotation.
 - [ ] `_render_json` emits the full untruncated `token_hex` value for every
   `PartitionRange` entry.
 - [ ] `members` and `probe_states` are sorted by `node_id` before truncation, making

@@ -416,8 +416,8 @@ max_chunk_bytes          = "1Mi"
 **Duration unit suffixes** (case-sensitive): `ms` (milliseconds), `s` (seconds),
 `m` (minutes), `h` (hours). Examples: `"500ms"`, `"10s"`, `"2m"`, `"1h"`.
 
-**Size unit suffixes** (case-sensitive): `Ki` (kibibytes = 1024), `Mi` (mebibytes = 1024Â²),
-`Gi` (gibibytes = 1024Â³). Examples: `"512Ki"`, `"1Mi"`, `"4Gi"`.
+**Size unit suffixes** (case-sensitive): `Ki` (kibibytes = 1024), `Mi` (mebibytes = 1024²),
+`Gi` (gibibytes = 1024³). Examples: `"512Ki"`, `"1Mi"`, `"4Gi"`.
 
 A bare integer with no suffix is a fatal config error. An unrecognised suffix is a fatal
 config error. Both are reported as `ConfigError` at startup before any socket is opened.
@@ -691,32 +691,69 @@ than through module globals or ad hoc parameter lists.
 
 ### Sequence / flow — node startup
 
+The bootstrap surface is owned by a single orchestration class, `Bootstraper`, rather
+than a chain of top-level helper functions. `bootstrap.main` should stay thin: parse the
+CLI, construct `Bootstraper`, and hand off control.
+
+#### `Bootstraper.start_node()` — orchestration overview
+
 ```
-1. bootstrap.main reads path to config.toml (env var or CLI flag).
-2. load_config(path) → TourillonConfig
+1. bootstrap.main parses config path and logging options.
+2. bootstraper = Bootstraper.from_config_path(config_path)
+3. await bootstraper.start_node()
+```
+
+#### `Bootstraper.start_node()` — happy path
+
+```
+1. load_config(path) → TourillonConfig
    a. Parse TOML.
    b. parse_duration / parse_bytes on all relevant fields → ConfigError on bad suffix.
    c. validate_cert_not_expired(tls.cert_data) → ConfigError on expiry.
    d. validate_cert_key_match(tls.cert_data, tls.key_data) → ConfigError on mismatch.
    e. Return frozen TourillonConfig.
-3. Verify data_dir exists (os.path.isdir); if absent → stderr
+2. Verify data_dir exists (os.path.isdir); if absent → stderr
    "Error: data_dir does not exist: <path>"; exit 1.
-   The daemon never creates data_dir; the operator must create it beforehand.
-4. Acquire ProcessLock on <data_dir>/pid.lock (FileProcessLockAdapter).
+3. Acquire ProcessLock on <data_dir>/pid.lock (FileProcessLockAdapter).
    → If already held → stderr "Error: another tourillon process is already running
      for data_dir <path> (pid.lock held)…"; exit 1.
-5. build_server_ssl_context(cert, key, ca) → ssl_ctx_kv  (for kv_server)
-6. build_server_ssl_context(cert, key, ca) → ssl_ctx_peer (for peer_server)
-7. Build `TourillonCore` from the validated config plus all concrete adapters needed at
-   runtime (storage, serializer, TLS contexts, pool, topology manager, probe manager,
-   partitioner, clock, node state).
-8. Construct `Dispatcher` instances from `TourillonCore` (for example KV and peer-plane
-   dispatchers).
-9. Register handlers at startup time by closing over the `TourillonCore` instance or by
-   instantiating handler objects with explicit constructor injection.
-10. Start TcpServer("peer", ssl_ctx_peer) on peer_server.bind → peer listener up.
-11. (KV server is bound once the node reaches READY phase — deferred to a later proposal.)
-12. Log: "Node <id> listening on peer <advertise>".
+4. Build the runtime facade:
+   a. server SSL contexts for peer and KV listeners
+   b. `TourillonCore` with storage, serializer, TLS contexts, pool, topology manager,
+      probe manager, partitioner, clock, node state
+   c. dispatcher factories / handler registries derived from `TourillonCore`
+5. Branch on the persisted phase:
+   a. `IDLE` + no seeds → `start_first_node()`
+   b. `READY` → `start_ready_node()`
+   c. any other phase → `fail_bootstrap()` with a clear user-facing message
+6. Start the peer listener.
+7. Start the KV listener when the chosen branch allows data-plane service.
+8. Enter the serve loop until shutdown.
+```
+
+#### `Bootstraper.start_first_node()` — fresh bootstrap happy path
+
+```
+1. Generate tokens for the node size.
+2. Build the READY NodeState.
+3. Persist state to disk before any topology announcement (write-before-announce).
+4. Apply the corresponding Member to topology.
+5. Compute partition ranges for logging / observability.
+6. Register handlers through the bootstraper-owned dispatcher factories.
+7. Start the peer listener.
+8. Start the KV listener.
+9. Return the READY NodeState.
+```
+
+#### `Bootstraper.start_ready_node()` — crash-recovery happy path
+
+```
+1. Reuse persisted tokens and generation from state.toml.
+2. Rebuild topology from the persisted state.
+3. Register handlers through the bootstraper-owned dispatcher factories.
+4. Start the peer listener.
+5. Start the KV listener.
+6. Return the restored NodeState.
 ```
 
 ### Sequence / flow — `tourillon pki ca`
@@ -856,6 +893,19 @@ co-located with its registration, and avoids boilerplate class bodies. `register
 retained as the lower-level API because it is essential for test wiring (where the
 kind string is computed at runtime). No per-handler class is required anywhere in the
 system.
+
+### Decision: `Bootstraper` as the orchestration root
+
+**Alternatives considered:**
+- Keep a pile of top-level `run_*` functions and wire them together from CLI entry points.
+- Split startup into many small helpers without a single coordinating object.
+
+**Chosen because:** Startup is the first place where the codebase needs an explicit happy
+path and a place to grow. A `Bootstraper` class gives one home for the whole startup story:
+config loading, process lock acquisition, `TourillonCore` construction, listener setup,
+phase branching, and shutdown. That keeps the flow readable as the node gains more modes
+(`READY`, `JOINING`, `DRAINING`, `PAUSED`, `FAILED`) without scattering orchestration logic
+across unrelated modules.
 
 ### Decision: `TourillonCore` as the bootstrap composition root
 
@@ -1151,58 +1201,6 @@ class ContextsFile:
 
 ---
 
-## Proposed code organisation
-
-Files **created** by this proposal (in mandatory creation order):
-
-```
-tourillon/core/structure/config.py          MODIFIED — duration/size fields → str
-tourillon/core/ports/state.py               NEW — ProcessLockPort, ProcessLockError
-tourillon/bootstrap/__init__.py             NEW — package marker
-tourillon/bootstrap/config.py               NEW — ConfigError, parse_duration,
-                                                  parse_bytes, load_config
-tourillon/infra/cli/__init__.py             NEW — package marker
-tourillon/infra/cli/pki.py                  NEW — tourillon pki ca/issue commands
-tourillon/infra/cli/config.py               NEW — tourillon config generate command
-tourillon/infra/process_lock.py             NEW — FileProcessLockAdapter
-tourctl/__init__.py                         NEW — package marker
-tourctl/infra/__init__.py                   NEW — package marker
-tourctl/infra/cli/__init__.py               NEW — package marker
-tourctl/infra/cli/config.py                 NEW — tourillon config generate-context,
-                                                  tourctl config use-context
-tests/__init__.py                           NEW — package marker
-tests/unit/__init__.py                      NEW — package marker
-tests/unit/test_envelope.py                 NEW — scenarios 1–3
-tests/unit/test_dispatcher.py               NEW — scenarios 4–6
-tests/unit/test_serializer.py               NEW — scenarios 7–8
-tests/unit/test_bootstrap_config.py         NEW — scenarios 9–18
-tests/unit/test_contexts.py                 NEW — scenarios 19–21
-tests/unit/test_process_lock.py             NEW — scenarios 26–28
-tests/e2e/__init__.py                       NEW — package marker
-tests/e2e/test_pki.py                       NEW — scenarios 22–23
-tests/e2e/test_config_generate.py           NEW — scenarios 24–25
-```
-
-Files already present and unchanged:
-
-```
-tourillon/core/structure/envelope.py        (complete)
-tourillon/core/structure/contexts.py        (complete)
-tourillon/core/transport/dispatcher.py      (complete)
-tourillon/core/transport/client.py          (complete)
-tourillon/core/transport/server.py          (complete)
-tourillon/core/transport/framing.py         (complete)
-tourillon/core/transport/pool.py            (complete)
-tourillon/core/ports/serializer.py          (complete)
-tourillon/core/ports/pki.py                 (complete)
-tourillon/core/ports/transport.py           (complete)
-tourillon/infra/pki/x509.py                 (complete)
-tourillon/infra/tls/context.py              (complete)
-tourillon/infra/serializer/msgpack.py       (complete)
-tourillon/infra/contexts.py                 (complete)
-```
-
----
 
 ## Test scenarios
 

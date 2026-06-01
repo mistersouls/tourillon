@@ -33,8 +33,11 @@ operator CLI commands:
 `PartitionRange` (from `core/ring/partitioner.py`) is used for both CLI display and
 transfer planning to minimise wire round-trips. Data-plane transfer outcomes feed
 `ProbeManager.data_fd` so that chronically unreachable rebalance targets are suspected
-by the local failure detector. No amendments to this proposal are permitted; later
-proposals extend it only through new `Dispatcher` registrations and new TOML sections.
+by the local failure detector. The proposal assumes the startup `Bootstraper` and
+`TourillonCore` from proposal 001 are already present: they provide the storage facade,
+dispatchers, and handler wiring that the rebalance engine closes over. No amendments to
+this proposal are permitted; later proposals extend it only through new `Dispatcher`
+registrations and new TOML sections.
 
 ---
 
@@ -161,12 +164,12 @@ ID  RANGE              PENDING  RUNNING  COMMITTED  FAILED  CANCELLED
 `ID` is the 0-based range index matching the order emitted by
 `Partitioner.ranges_for()` on the server side. `RANGE` is formatted as
 `<start_pid>-<end_pid> (<count>)`. Wrapping ranges (where `start_pid >
-end_pid`) are annotated with `[wrap]`:
+end_pid`) are annotated with `[w]`:
 
 ```
 ID  RANGE             PENDING  RUNNING  COMMITTED  FAILED  CANCELLED
 ────────────────────────────────────────────────────────────────────────
- 7   1008-15 (24)[wrap]        0        0         24       0          0
+ 7   1008-15 (24)[w]        0        0         24       0          0
 ```
 
 **Pid-level output (`--range <ID>`):**
@@ -440,7 +443,7 @@ TAG  tag: TagKind.STAGING | epoch (4B BE)
 `commit()` re-tags every staged entry to `TagKind.LIVE` or `TagKind.TOMBSTONE` using
 `BackendStorage.tag()` in a single sweep, then issues a final `BackendStorage.put()` to
 persist the epoch watermark. **`commit()` must complete before the caller updates
-`state.toml`** (invariant Â§1).
+`state.toml`** (invariant §1).
 `cleanup()` iterates staging entries for this `(pid, epoch)` and calls
 `BackendStorage.delete()` on each.
 `exists()` returns `True` if the pid-prefix scan over `TAGS` finds any `STAGING` entry.
@@ -625,7 +628,7 @@ Sent by the **sender** after all chunks for a pid have been transmitted.
 }
 ```
 
-On receiving this, the receiver calls `PartitionStaging.commit()` (invariant Â§1) then
+On receiving this, the receiver calls `PartitionStaging.commit()` (invariant §1) then
 advances the `TransferHandle` to `COMMITTED` and persists `committed_pids` in
 `state.toml`.
 
@@ -647,7 +650,7 @@ all pids have reached `COMMITTED`. Triggers the final phase transition:
 
 ### Core invariants
 
-**Invariant Â§1 — Commit before announce:**
+**Invariant §1 — Commit before announce:**
 `PartitionStaging.commit()` **must** complete successfully before `state.toml` is
 updated to move the pid from `staging_pids` to `committed_pids`. If the node crashes
 between `commit()` returning and the `state.toml` write, the committed staging data
@@ -655,19 +658,19 @@ survives and the next restart can detect the discrepancy by scanning `TagKind.ST
 entries that are epoch-consistent with the current epoch — they are already committed
 at the storage level; the `state.toml` write is idempotent.
 
-**Invariant Â§2 — Pid in `staging_pids` before first `stage()` call:**
+**Invariant §2 — Pid in `staging_pids` before first `stage()` call:**
 Before calling `PartitionStaging.stage()` for the first record in a pid,
 `RebalanceEngine.on_init()` must persist the pid into `state.toml`'s `staging_pids`
 list via `StatePort.save()`. If the node crashes before the first `stage()`, the
 restart knows to clean up the staging area for this pid. If it crashes after the first
 `stage()`, `last_staged_key()` provides a resume cursor.
 
-**Invariant Â§3 — Epoch monotonicity:**
+**Invariant §3 — Epoch monotonicity:**
 Transfers with an epoch older than the current `NodeState.epoch` are rejected with a
 `CANCELLED` transition and an error log. Stale epoch re-attempts after a topology
 change are silently dropped.
 
-**Invariant Â§4 — No direct `BackendStorage` access from handlers:**
+**Invariant §4 — No direct `BackendStorage` access from handlers:**
 Handlers in `core/rebalance/handlers.py` **never** call `BackendStorage` directly.
 All storage access is routed through `PartitionStore` (via `Storage.open_by_pid()`)
 or through `PartitionStaging` and `PartitionHint` sub-contexts.
@@ -690,7 +693,7 @@ or through `PartitionStaging` and `PartitionHint` sub-contexts.
 5.  For each pid p (S iterates in ascending pid order):
     a. S sends rebalance.transfer.init(pid=p, epoch=E, sender_node_id=S.node_id).
     b. N.on_init(p, E, S.node_id):
-         — Adds p to state.toml staging_pids (invariant Â§2).
+         — Adds p to state.toml staging_pids (invariant §2).
          — Advances TransferHandle(p) → RUNNING.
          — Returns PartitionStaging(p, E, backend).
     c. S calls PartitionStore.scan() to iterate all committed records for p.
@@ -700,7 +703,7 @@ or through `PartitionStaging` and `PartitionHint` sub-contexts.
          — Updates chunks_received and records_transferred on the handle.
     f. S sends rebalance.transfer.done(pid=p, epoch=E, total_records=T).
     g. N.on_done(p):
-         — Calls PartitionStaging.commit() (invariant Â§1).
+         — Calls PartitionStaging.commit() (invariant §1).
          — Moves p from staging_pids to committed_pids in state.toml.
          — Advances TransferHandle(p) → COMMITTED.
          — Calls probe_mgr.record_data_success(S.node_id).
@@ -724,10 +727,31 @@ or through `PartitionStaging` and `PartitionHint` sub-contexts.
 5.  D transitions NodeState.phase DRAINING → IDLE via StatePort.save().
 ```
 
+### Répliquage — politiques opérationnelles (JOINING vs DRAINING)
+
+La politique suivante s'applique lors du calcul et de l'exécution des transferts :
+
+- Conditions de déclenchement
+  - Un pid est transféré uniquement lorsqu'il existe une différence entre `owners(pid, ring_old, RF)` et `owners(pid, ring_new, RF)` telle que :
+    - le nœud qui exécute la transition se trouve dans `owners_new` mais pas dans `owners_old` → le nœud doit recevoir le pid (JOINING case), ou
+    - le nœud se trouvait dans `owners_old` mais pas dans `owners_new` → le nœud doit envoyer le pid (sender case).
+  - Si `owners_new` est déjà satisfait par des copies committées (i.e. au moins RF copies présentes), aucun transfert n'est planifié pour ce pid.
+
+- Politique par défaut pour DRAINING sans remplaçant
+  - Par défaut, l'entrée en `DRAINING` n'entraîne pas la réplique automatique des pids vers d'autres nœuds existants si aucun remplaçant n'a été ajouté au ring. L'opérateur peut demander explicitement une re‑réplication (`force_replicate`) pour copier les pids vers cibles choisies parmi les nœuds restants.
+
+- Comportement JOINING et sources
+  - JOINING est receiver-driven : le joining node demande un plan à une source et initie des pulls (`rebalance.transfer.init` → `chunk` → `done`) vers la source choisie. Pour chaque pid, le plan contient un `preferred_source` (un owner committé si possible). Si aucune source committée n'est disponible, le pid est marqué `missing` et nécessite intervention opérateur.
+
+- Sélection de source
+  - Les candidats sont d'abord les owners committés. Parmi eux, on préfère les nœuds sains selon `ProbeManager` et ceux ayant la plus faible charge de sortie.
+  - Si aucun owner committé n'est trouvé dans la set attendue, la sélection cherchera dans `owners_old` avant de déclarer `missing`.
+
 #### Crash recovery on restart
 
 ```
-1.  On startup, NodeState is loaded from state.toml.
+1.  On startup, the Bootstraper loads `NodeState` from `state.toml` before the
+    rebalance engine resumes.
 2.  If staging_pids is non-empty:
     a. For each pid in staging_pids, check PartitionStaging.exists().
     b. If exists → TransferHandle(pid, RUNNING) (resume from last_staged_key()).
@@ -853,44 +877,6 @@ earlier, consistent with the intent of the dual-detector model.
 
 ---
 
-## Proposed code organisation
-
-```
-tourillon/core/kv/
-    store.py                    — PartitionStore, PartitionStaging, PartitionHint
-                                  (implement)
-
-tourillon/core/rebalance/
-    __init__.py
-    engine.py                   — RebalanceEngine, TransferHandle, TransferState,
-                                  RebalancePlan, RangeSummary
-    handlers.py                 — @dispatcher.on("node.leave") handler;
-                                  @dispatcher.on("rebalance.*") handlers
-
-tourillon/core/structure/
-    rebalance.py                — RebalancePlanPayload, TransferInitPayload,
-                                  TransferChunkPayload, TransferDonePayload,
-                                  RebalanceCommitPayload,
-                                  NodeLeavePayload, NodeLeaveAckPayload wire dicts
-
-tourillon/infra/store/
-    storage_adapter.py          — StorageAdapter implementing Storage Protocol;
-                                  one BackendStorage per segment cache
-
-tourctl/infra/cli/
-    rebalance.py                — `tourctl node leave` and
-                                  `tourctl rebalance status [--range <ID>]`
-
-tests/unit/
-    test_partition_store.py     — PartitionStore / PartitionStaging / PartitionHint unit tests
-    test_rebalance_engine.py    — RebalanceEngine FSM unit tests
-    test_rebalance_handlers.py  — handler unit tests with InMemoryDispatcher
-
-tests/e2e/
-    test_rebalance_e2e.py       — full JOINING→READY and DRAINING→IDLE end-to-end
-```
-
----
 
 ## Interfaces (informative)
 
@@ -991,8 +977,8 @@ class RebalanceEngine:
         state_filter: TransferState | None = None,
     ) -> list[RangeSummary] | list[TransferHandle]:
         """
-        Without range_index: return range-level RangeSummary list.
-        With range_index: return pid-level TransferHandle list for that range.
+        Without range_index: return range-level summaries (list[RangeSummary]).
+        With range_index: return pid-level handles for that range (list[TransferHandle]).
         Raises IndexError if range_index is out of bounds.
         """
         ...
@@ -1162,6 +1148,10 @@ All scenarios run with in-memory adapters unless marked `[e2e]`.
 | 29 | e2e | Node B JOINING; connection drops after 50% of chunks; node B restarts | Resume from `last_staged_key()` | Transfer completes; duplicate records are not double-committed; final record count matches source. |
 | 30 | e2e | Node A in READY; `tourctl node leave` sent | `node.leave` → DRAINING; then full drain rebalance | Node A transitions DRAINING → IDLE after all pids committed; `tourctl rebalance status` shows 100% COMMITTED. |
 
+| 31 | unit | RF=3; nodes A,B,C; operator requests `tourctl node leave C` (no replacement) | Dispatch `node.leave` on C | No transfers scheduled by default; cluster RF temporarily reduced to 2; `tourctl rebalance status` shows zero active transfers. |
+| 32 | unit | RF=2; nodes A,B; node C joins (JOINING) and requests rebalance | Full rebalance.plan → init → chunk → done → commit | C pulls missing pids from A or B; after completion, new_owners including C are COMMITTED where source copies existed. |
+| 33 | unit | RF=3; nodes A,B,C; node D joins (JOINING) | Full rebalance plan and selective transfer | D pulls only the subset of pids for which it becomes owner; transfers sourced from A/B/C; `tourctl rebalance status` reflects COMMITTED pids on D. |
+
 ---
 
 ## Exit criteria
@@ -1199,7 +1189,7 @@ All scenarios run with in-memory adapters unless marked `[e2e]`.
   top-level key.
 - [ ] `tourctl rebalance status --range <N> --json` emits valid JSON with the `handles`
   top-level key and a `range_index` field.
-- [ ] Wrapping ranges (`start_pid > end_pid`) rendered with `[wraps]` annotation in human
+- [ ] Wrapping ranges (`start_pid > end_pid`) rendered with `[w]` annotation in human
   output of `tourctl rebalance status`.
 - [ ] `record_data_failure(peer_node_id)` called on `ProbeManager` when `commit()` raises or
   sender closes connection before `done`; `record_data_success(peer_node_id)` called on

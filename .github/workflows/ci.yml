@@ -10,9 +10,9 @@ jobs:
   lint:
     name: lint
     runs-on: ubuntu-latest
-    if: |
+    if: >-
       github.event_name == 'push' ||
-      github.base_ref == 'main' ||
+      github.event.pull_request.base.ref == 'main' ||
       contains(github.event.pull_request.labels.*.name, 'ci/tests')
 
     steps:
@@ -23,6 +23,7 @@ jobs:
         uses: astral-sh/setup-uv@v4
         with:
           python-version: "3.14"
+          enable-cache: true
 
       - name: Sync dev dependencies
         run: uv sync --locked --extra dev
@@ -34,17 +35,17 @@ jobs:
         run: uv run ruff check .
 
       - name: Cyclomatic complexity report (radon cc, fail if any block > 10)
-        run: uv run radon cc tourillon -n C --total-average -s && uv run radon cc tourillon -n C -s --json | python -c "import sys, json; data=json.load(sys.stdin); blocks=[b for f in data.values() for b in f if b['complexity']>10]; [print(f\"FAIL {b['name']} complexity={b['complexity']}\") for b in blocks]; sys.exit(1 if blocks else 0)"
+        run: uv run radon cc tourillon tourctl -n C --total-average -s && uv run radon cc tourillon tourctl -n C -s --json | python -c "import sys, json; data=json.load(sys.stdin); blocks=[b for f in data.values() for b in f if b['complexity']>10]; [print(f\"FAIL {b['name']} complexity={b['complexity']}\") for b in blocks]; sys.exit(1 if blocks else 0)"
 
       - name: Maintainability index (radon mi, fail if any file rated F)
-        run: uv run radon mi tourillon -s && uv run radon mi tourillon --json | python -c "import sys, json; data=json.load(sys.stdin); bad=[f for f,v in data.items() if v['rank']=='F']; [print(f\"FAIL {f} MI={v['mi']:.1f}\") for f,v in data.items() if v['rank']=='F']; sys.exit(1 if bad else 0)"
+        run: uv run radon mi tourillon tourctl -s && uv run radon mi tourillon tourctl --json | python -c "import sys, json; data=json.load(sys.stdin); bad=[f for f,v in data.items() if v['rank']=='F']; [print(f\"FAIL {f} MI={v['mi']:.1f}\") for f,v in data.items() if v['rank']=='F']; sys.exit(1 if bad else 0)"
 
   test:
     name: test
     runs-on: ubuntu-latest
-    if: |
+    if: >-
       github.event_name == 'push' ||
-      github.base_ref == 'main' ||
+      github.event.pull_request.base.ref == 'main' ||
       contains(github.event.pull_request.labels.*.name, 'ci/tests')
 
     steps:
@@ -55,6 +56,7 @@ jobs:
         uses: astral-sh/setup-uv@v4
         with:
           python-version: "3.14"
+          enable-cache: true
 
       - name: Sync dev dependencies
         run: uv sync --locked --extra dev

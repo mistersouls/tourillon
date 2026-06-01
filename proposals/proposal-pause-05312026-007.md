@@ -20,6 +20,9 @@ recovery after a crash — always returns the node to exactly the right phase. `
 a first-class `MemberPhase` value that gossip propagates via the normal `gossip.push` path;
 the `PlacementStrategy` detects it and routes writes to a handoff target without any
 additional mechanism.
+The peer-plane pause/resume handlers are expected to be registered by the `Bootstraper`
+introduced in proposal 001, using the same `TourillonCore` facade that centralises the
+state port, topology, probe manager, and listener wiring.
 
 ---
 
@@ -152,9 +155,13 @@ handler may transition away from `PAUSED`.
 
 #### `READY → PAUSED`
 
-- **KV socket**: stays open. The node was serving KV traffic before the pause and
-  continues to accept connections so clients do not experience an abrupt disconnect.
-- **Reads**: permitted. The node's data is consistent; reads may continue.
+- **KV socket**: stopped/closed. When the node transitions from `READY` to `PAUSED`, the
+  KV coordinator listener MUST be stopped if it is running to ensure the node does not
+  accept coordinator/client requests while paused. Where possible the listener should be
+  closed gracefully to allow active RPCs to complete; operators should expect client
+  connections to be disconnect when pause is applied.
+- **Reads**: rejected. A paused node does not serve KV reads; coordinators must route
+  client reads to other nodes in the cluster.
 - **Writes**: the `PlacementStrategy` observes `phase == PAUSED`, which is a member of
   `_ALWAYS_HANDOFF_PHASES`, and routes all writes to a handoff target. The paused node
   does not accept new writes in this state.
@@ -163,8 +170,11 @@ handler may transition away from `PAUSED`.
 
 #### `DRAINING → PAUSED`
 
-- **KV socket**: stays open (was open during draining).
-- **Reads/writes**: same as `READY → PAUSED` above.
+- **KV socket**: stopped/closed (was open during draining). On transition to `PAUSED` the
+  KV coordinator listener MUST be stopped if running; active client connections should be
+  closed gracefully where possible.
+- **Reads/writes**: a paused node does not accept coordinator reads or writes; write
+  routing uses handoff targets as above.
 - **Ongoing partition transfers**: suspended at their current `RUNNING` chunk boundary.
   The chunk cursor is not advanced. When the operator calls `resume`, the transfer loop
   resumes from the last committed cursor position. No data is lost or duplicated.
@@ -191,14 +201,15 @@ writes around the paused node.
 ### Handler registration
 
 Handlers live in `tourillon/core/lifecycle/handlers.py` and are registered with the
-peer-plane `Dispatcher` via `@dispatcher.on(kind)`:
+peer-plane `Dispatcher` via `@dispatcher.on(kind)`. Handler names follow the
+concise style used elsewhere in the codebase (e.g. `pause(...)`, `resume(...)`):
 
 ```python
 @dispatcher.on("node.pause")
-async def handle_node_pause(receive, send) -> None: ...
+async def pause(receive, send) -> None: ...
 
 @dispatcher.on("node.resume")
-async def handle_node_resume(receive, send) -> None: ...
+async def resume(receive, send) -> None: ...
 ```
 
 A `register(dispatcher)` module-level function calls both registrations so the bootstrap
@@ -220,6 +231,17 @@ No new gossip message kind is required. The `gossip.push` path carries the
 next gossip push propagates the change to all peers. `paused_from` is a local-only field
 stored in `state.toml`; it is **not** gossiped (peers only need to know the node is
 paused, not which phase it paused from).
+
+To improve shutdown safety and match the behaviour described in the gossip proposal,
+the node should attempt a small number of successful gossip rounds before fully
+stopping peer-plane activity. Concretely, on applying `PAUSED` the gossip engine SHOULD
+attempt N successful push rounds (recommended default: N = 3) to a set of known peers
+and only consider the transition fully propagated after receiving success responses
+from those rounds. If a round fails, the engine should retry with exponential backoff
+for a bounded period; the node must not proceed to close peer-plane resources that would
+prevent further propagation until the propagation procedure either completes successfully
+or the operator forces the pause to take effect. This helps ensure that other coordinators
+observe the `PAUSED` phase promptly and route writes away from the paused node.
 
 ### `TopologyManager.apply_member()`
 
@@ -260,14 +282,17 @@ without operator intervention. Operators pause nodes for reasons (disk replaceme
 incident) that may persist across a restart. Requiring an explicit `resume` command keeps
 the operator in control.
 
-### Decision: KV socket stays open for `READY → PAUSED` and `DRAINING → PAUSED`
+### Decision: KV socket stopped on pause transitions (except `JOINING → PAUSED`)
 
-**Alternatives considered:** Close the KV socket unconditionally on any pause transition.
+**Alternatives considered:** Keep the KV socket open for `READY → PAUSED` and
+`DRAINING → PAUSED` to avoid disrupting client connections.
 
-**Chosen because:** A `READY` node may have long-running client connections. Closing the
-socket would interrupt active reads and writes. Since the node's data is consistent and
-reads are still safe, keeping the socket open avoids unnecessary client disruption. The
-`PlacementStrategy` handles write routing; reads need no special treatment.
+**Chosen because:** pausing is an operator-controlled state meant to remove the node
+from serving as a coordinator. To avoid accidental acceptance of coordinator/client
+requests while paused, the KV coordinator listener is stopped on pause entry when it
+is running. Long-running client connections are a downsides; operators should plan
+for client reconnection as part of maintenance procedures. `JOINING → PAUSED` remains
+closed as before because the socket was never opened while joining.
 
 ### Decision: KV socket closed for `JOINING → PAUSED`
 

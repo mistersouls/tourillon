@@ -16,13 +16,21 @@ This proposal specifies the gossip engine and seeded join protocol for Tourillon
 introduces three complementary anti-entropy paths (`gossip.push`, `gossip.ping/pong`,
 `gossip.digest/delta`), the `IDLE → JOINING` phase transition triggered by
 `tourctl node join`, and exponential-backoff seed contact configured via the `[join]`
-section defined in proposal 001. It also rewrites `core/lifecycle/probe.py` to
-support a dual-detector model per peer — a phi-accrual `FailureDetector` (`gossip_fd`)
-fed by `gossip.pong` arrivals, and an asymmetric `DataCircuitBreaker` (`data_fd`) fed
-by data-plane outcomes. New `ProbeConfig` and
+section defined in proposal 001. The startup story remains owned by the same
+`Bootstraper` introduced in proposal 001: it wires the peer-plane dispatchers,
+instantiates `JoinController`, and hands it the central `TourillonCore` facade rather
+than spreading startup logic across standalone functions. This proposal also rewrites
+`core/lifecycle/probe.py` to support a dual-detector model per peer — a phi-accrual
+`FailureDetector` (`gossip_fd`) fed by `gossip.pong` arrivals, and an asymmetric
+`DataCircuitBreaker` (`data_fd`) fed by data-plane outcomes. New `ProbeConfig` and
 `GossipConfig` sections are added to `config.toml`. The convergence proof rests on the
 `Member.supersedes()` comparator (lexicographic `(generation, seq)`), which is
-clock-skew-safe because it uses only logical counters. `GossipEngine` and `JoinController` receive a `PeerClientPool` instance (`core/transport/pool.py`) injected at construction; no port abstraction is needed.
+clock-skew-safe because it uses only logical counters. `GossipEngine` and `JoinController`
+receive a `PeerClientPool` instance (`core/transport/pool.py`) injected at construction;
+the Bootstraper is responsible for assembling that dependency graph at startup.
+The gossip loop also performs a short final flush when the node enters `PAUSED`, `FAILED`,
+or completes `DRAINING → IDLE`: it emits a few more gossip cycles so peers can learn the
+node's last phase, then stops scheduling new gossip work.
 
 No amendments to this proposal are permitted; later proposals extend it only through
 new `Dispatcher` registrations and new `[config]` sections.
@@ -194,7 +202,7 @@ An asymmetric circuit breaker for data-plane reachability. Unlike the phi-accrua
 State machine:
   LIVE  --record_failure()-→  SUSPECT
   SUSPECT --record_failure()-→ SUSPECT (resets counter + clock)
-  SUSPECT --record_success() Ã— K AND cooldown elapsed-→ LIVE
+  SUSPECT --record_success() × K AND cooldown elapsed-→ LIVE
   SUSPECT --record_success() < K-→ SUSPECT  (counter increments, no state change)
   SUSPECT --record_success() = K but cooldown not elapsed-→ SUSPECT (timer pending)
 ```
@@ -622,6 +630,12 @@ rejects a fire-and-forget `gossip.push`.
    populated at import time. Dependencies (topology_mgr, probe_mgr, join_controller)
    are fixed for the process lifetime.
 
+10. **Final gossip flush before stop.** When the local phase becomes `PAUSED`, `FAILED`,
+    or the node completes `DRAINING → IDLE`, the `GossipEngine` finishes the current
+    cycle, emits a short bounded flush of additional gossip rounds, then stops scheduling
+    further gossip work. This gives peers time to observe the last phase before the node
+    goes quiet.
+
 ### Sequence / flow — `tourctl node join`
 
 ```
@@ -636,9 +650,9 @@ CLI side:
   8. If response.kind == "node.join.ack": print success lines; exit 0.
   9. If response.kind == "node.join.error": decode NodeJoinErrorPayload; print error; exit 1.
 
-Daemon side (node_join):
+Daemon side (Bootstraper.handle_node_join / JoinController):
   1. Receive "node.join" envelope via receive().
-  2. Acquire JoinController.
+  2. Bootstraper resolves the JoinController from TourillonCore.
   3. persisted = await state_port.load()
   4. current_phase = persisted.phase if persisted else MemberPhase.IDLE
   5. If current_phase != IDLE:
@@ -809,9 +823,11 @@ that diverged views are reconciled within a bounded number of rounds.
 - Pass `ssl.SSLContext` directly to `GossipEngine`.
 **Chosen because:** `PeerClientPool` is already the shared connection pool used by gossip,
 rebalance, and replication. Adding a Protocol layer on top only introduces indirection without
-new capability � the pool is testable with `ssl_ctx=None`. Reusing it directly keeps one
+new capability — the pool is testable with `ssl_ctx=None`. Reusing it directly keeps one
 fewer abstraction and ensures all subsystems share the same per-node connection, avoiding
-duplicate mTLS handshakes.### Decision: Seed contact in `GossipEngine` startup rather than in `JoinController`
+duplicate mTLS handshakes.
+
+### Decision: Seed contact in `GossipEngine` startup rather than in `JoinController`
 
 **Alternatives considered:**
 - `JoinController.transition_idle_to_joining()` blocks until at least one seed is
@@ -835,7 +851,7 @@ acknowledgment while the gossip engine works in the background.
 
 **Chosen because:** Full jitter provides the best protection against thundering herds
 in a multi-node cluster restart scenario (AWS Architecture Blog, 2015: "Exponential
-Backoff and Jitter"). The Â±20% band ensures that nodes starting simultaneously
+Backoff and Jitter"). The ±20% band ensures that nodes starting simultaneously
 quickly desynchronise, preventing all of them from contacting the same seed at
 exactly the same instant.
 
@@ -1092,56 +1108,6 @@ class TlsPeerConnector:
 
 ---
 
-## Proposed code organisation
-
-Files **created or modified** by this proposal (in mandatory creation order):
-
-```
-tourillon/core/structure/config.py               MODIFIED — adds ProbeConfig, GossipConfig;
-                                                             adds both to TourillonConfig
-tourillon/core/lifecycle/probe.py                CREATE — DataCircuitBreaker,
-                                                             dual-detector ProbeManager,
-                                                             all_states_with_phi() → 4-tuple
-tourillon/core/transport/pool.py                 already present — PeerClientPool (no changes)
-tourillon/core/gossip/__init__.py                NEW — package marker
-tourillon/core/gossip/messages.py                NEW — GossipPushPayload, PingPayload,
-                                                        PongPayload, DigestPayload,
-                                                        DeltaPayload, ErrorPayload,
-                                                        NodeJoinAckPayload,
-                                                        NodeJoinErrorPayload,
-                                                        member_to_dict, dict_to_member
-tourillon/core/gossip/join.py                    NEW — JoinError, JoinTimeoutError,
-                                                        ExponentialBackoff, JoinController
-tourillon/core/gossip/engine.py                  NEW — GossipEngine
-tourillon/core/gossip/handlers/
-    __init__.py                  NEW — re-exports gossip, node dispatchers
-    gossip.py                    NEW — gossip = Dispatcher(); push, ping,
-                                         digest, error handlers
-    node.py                      NEW — node = Dispatcher(); join handler
-tourillon/infra/transport/__init__.py            NEW — package marker (if absent)
-tourillon/infra/transport/connector.py           NEW — TlsPeerConnector
-tourctl/infra/cli/node.py                        MODIFIED — adds tourctl node join command
-tests/unit/test_data_circuit_breaker.py          NEW — scenarios 1–5
-tests/unit/test_probe_dual.py                    NEW — scenarios 6–10
-tests/unit/test_gossip_handlers.py               NEW — scenarios 11–17, 23
-tests/unit/test_join_controller.py               NEW — scenarios 18–22, 24–27
-tests/e2e/test_node_join.py                      NEW — scenario 28
-```
-
-Files already present and unchanged:
-
-```
-tourillon/core/structure/waitgroup.py            (complete — WaitGroup[T])
-tourillon/core/lifecycle/member.py               (complete — Member, MemberPhase)
-tourillon/core/lifecycle/registry.py             (complete — MemberRegistry)
-tourillon/core/lifecycle/phi.py                  (complete — FailureDetector)
-tourillon/core/ring/topology.py                  (complete — TopologyManager, Topology)
-tourillon/core/transport/dispatcher.py           (complete — Dispatcher)
-tourillon/core/structure/envelope.py             (complete — Envelope)
-tourillon/bootstrap/config.py                    (complete — parse_duration, ConfigError)
-```
-
----
 
 ## Test scenarios
 
@@ -1169,7 +1135,7 @@ E2e tests use `tmp_path` (pytest fixture) and real subprocess / filesystem.
 | 17 | unit | `gossip.digest` handler; digest entries match local registry exactly | Deliver `gossip.digest` with up-to-date entries for all local members | Handler sends `gossip.delta` with `members == []` (empty; nothing to send) |
 | 18 | unit | `JoinController`; `InMemoryStateAdapter(None)`; empty `TopologyManager()` | `await join_controller.transition_idle_to_joining()` | Returns `NodeState(phase=JOINING, generation=1, seq=0)`; `len(state.tokens) == cfg.node_size.token_count`; `state_port.save()` called before `topology_mgr.apply_member()` (write-before-announce) |
 | 19 | unit | `JoinController`; `InMemoryStateAdapter(NodeState(phase=JOINING, ...))` | `await join_controller.transition_idle_to_joining()` | Raises `JoinError` (current phase is JOINING, not IDLE) |
-| 20 | unit | `ExponentialBackoff(base_s=2.0, max_s=30.0, deadline_s=999.0)` | `[backoff.next_delay(i) for i in range(5)]` | First five values are approximately `2.0Â±20%, 4.0Â±20%, 8.0Â±20%, 16.0Â±20%, 30.0Â±20%` (cap reached at attempt 4) |
+| 20 | unit | `ExponentialBackoff(base_s=2.0, max_s=30.0, deadline_s=999.0)` | `[backoff.next_delay(i) for i in range(5)]` | First five values are approximately `2.0±20%, 4.0±20%, 8.0±20%, 16.0±20%, 30.0±20%` (cap reached at attempt 4) |
 | 21 | unit | `ExponentialBackoff(base_s=2.0, max_s=30.0, deadline_s=0.001)` | `backoff.next_delay(0)` after `time.monotonic() > deadline_at` | Returns `None` (deadline exceeded; no further delay) |
 | 22 | unit | `JoinController`; `InMemoryStateAdapter(None)`; all seed connections raise `ConnectionClosedError`; `cfg.join.deadline = "100ms"` | `await join_controller.transition_idle_to_joining()` then seed loop exhausts deadline | `JoinTimeoutError` raised; JOINING state was persisted (write-before-announce satisfied); topology has JOINING member |
 | 23 | unit | `gossip.push` handler; topology seeded with one READY member | Deliver `gossip.push` containing `Member("n3", phase=JOINING, gen=1, seq=0, tokens=(5,))` | `"n3"` inserted into registry with `phase=JOINING`; ring size unchanged (JOINING nodes not added to ring via `TopologyManager` rule) |
