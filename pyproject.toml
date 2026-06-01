@@ -14,7 +14,7 @@ dependencies = [
   "rich>=13",
   "tomli-w>=1.1",
   "typer>=0.12",
-  "cryptography==46.0.3",
+  "cryptography==46.0.3"
 ]
 
 [project.scripts]
@@ -83,21 +83,12 @@ testpaths = ["tests"]
 addopts = "-v --tb=short --cov=tourillon --cov=tourctl --cov-report=term-missing --cov-report=xml --cov-fail-under=90"
 asyncio_mode = "auto"
 markers = [
-  "bootstrap: bootstrap and provisioning",
-  "ring: ring and first-node bootstrap",
-  "gossip: gossip and seeded join",
-  "inspect: node inspect",
-  "rebalance: partition rebalance",
-  "kv: kv operations and hinted handoff",
-  "pause: pause and resume",
-  "gc: garbage collection",
-]
-
-# ---------------------------------------------------------------------------
-# Coverage
-# ---------------------------------------------------------------------------
-[tool.coverage.run]
-omit = [
-  # In-memory test helpers live in core/testing/ but are not production code.
-  "tourillon/core/testing/*",
+  "bootstrap: proposal 001 — bootstrap and provisioning",
+  "ring: proposal 002 — consistent-hashing ring",
+  "inspect: proposal 003 — node inspect command",
+  "gossip: proposal 004 — gossip engine and seeded join",
+  "lifecycle: proposal 002/004 — member phase FSM and probe manager",
+  "rebalance: proposal 005 — partition rebalance",
+  "kv: proposal 006 — KV read/write path",
+  "e2e: end-to-end tests requiring real sockets",
 ]

@@ -610,6 +610,7 @@ dependencies = [
 dev = [
     { name = "autoflake" },
     { name = "black" },
+    { name = "click" },
     { name = "pre-commit" },
     { name = "pre-commit-hooks" },
     { name = "pytest" },
@@ -623,6 +624,7 @@ dev = [
 requires-dist = [
     { name = "autoflake", marker = "extra == 'dev'", specifier = ">=2" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=24" },
+    { name = "click", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "cryptography", specifier = "==46.0.3" },
     { name = "msgpack", specifier = ">=1.1" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4" },
