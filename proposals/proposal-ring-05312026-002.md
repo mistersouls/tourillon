@@ -1,10 +1,7 @@
 # Proposal: Ring & First-Node Bootstrap
 
-<!-- Naming: proposal-<short-desc>-MMDDYYYY-SEQ.md
-     Example: proposal-ring-05312026-002.md     -->
-
-**Author**: Tourillon Contributors <tourillon@example.com>
-**Status:** Draft
+**Author**: Souleymane BA <soulsmister@gmail.com>
+**Status:** Accepted
 **Date:** 2026-05-31
 **Sequence:** 002
 
@@ -50,7 +47,7 @@ can flow, two further foundations must exist:
 
 ## CLI contract
 
-All commands print to stdout on success and to stderr on failure.
+Non-daemon commands print to stdout on success and to stderr on failure; daemon commands (notably `tourillon node start`) emit output via Python logging only.
 Exit code `0` = success; `1` = user or config error; `2` = internal error.
 
 ### Logging convention
@@ -97,62 +94,64 @@ Options:
   --help          Show this message and exit.
 ```
 
-**Happy path — fresh first-node bootstrap (stdout):**
+**Happy path — fresh first-node bootstrap (INFO log records):**
 
 ```
-Node node-1 starting (phase: idle).
-Generated 4 token(s) for node size M.
-Partition ranges owned (1024 total partitions):
-  token 0xaf3c12b8… → pids [  0– 255]  (256 partitions)
-  token 0x3e9d7fa1… → pids [256– 511]  (256 partitions)
-  token 0x8ab21c44… → pids [512– 767]  (256 partitions)
-  token 0xd1047e9c… → pids [768–1023]  (256 partitions)
-State persisted (phase: ready, epoch: 1, generation: 1).
-Node node-1 is READY.
-Peer listener: 192.168.1.1:7001
-KV  listener: 192.168.1.1:7000
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] Node node-1 starting (phase: idle).
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] Generated 4 token(s) for node size M.
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] Partition ranges owned (1024 total partitions):
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] token 0xaf3c12b8… → pids [  0– 255]  (256 partitions)
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] token 0x3e9d7fa1… → pids [256– 511]  (256 partitions)
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] token 0x8ab21c44… → pids [512– 767]  (256 partitions)
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] token 0xd1047e9c… → pids [768–1023]  (256 partitions)
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] State persisted (phase: ready, epoch: 1, generation: 1).
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] Node node-1 is READY.
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] Peer listener: 192.168.1.1:7001
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] KV  listener: 192.168.1.1:7000
 ```
 
 The token hex values are the first 8 hex characters of the full integer (128-bit for
 production rings) followed by `…`. Partition range rows are sorted by `start_pid`
 ascending. The display is produced by `Partitioner.ranges_for(node_id, ring)`.
 
-**Happy path — crash-recovery restart (stdout):**
+**Happy path — crash-recovery restart (INFO log records):**
 
 ```
-Node node-1 starting (phase: ready).
-Topology rebuilt from state.toml: 4 vnode(s), epoch 1.
-Node node-1 is READY.
-Peer listener: 192.168.1.1:7001
-KV  listener: 192.168.1.1:7000
+2026-05-31T09:10:00 INFO     [tourillon.bootstrap.node] Node node-1 starting (phase: ready).
+2026-05-31T09:10:00 INFO     [tourillon.bootstrap.node] Topology rebuilt from state.toml: 4 vnode(s), epoch 1.
+2026-05-31T09:10:00 INFO     [tourillon.bootstrap.node] Node node-1 is READY.
+2026-05-31T09:10:00 INFO     [tourillon.bootstrap.node] Peer listener: 192.168.1.1:7001
+2026-05-31T09:10:00 INFO     [tourillon.bootstrap.node] KV  listener: 192.168.1.1:7000
 ```
 
-**Error — config file not found (stderr, exit 1):**
+The examples below are logging records emitted by the daemon logger (not `print()`/`Console.print()` output).
+
+**Error — config file not found (ERROR log record, exit 1):**
 
 ```
-Error: config file not found: ./config.toml
+2026-05-31T09:15:00 ERROR    [tourillon.bootstrap.node] Error: config file not found: ./config.toml
 ```
 
-**Error — state.toml belongs to a different node (stderr, exit 1):**
+**Error — state.toml belongs to a different node (ERROR log records, exit 1):**
 
 ```
-Error: node_id mismatch: config=node-1 state=node-2
-This data_dir belongs to a different node. Check your config.toml
-or point data_dir at the correct directory.
+2026-05-31T09:15:00 ERROR    [tourillon.bootstrap.node] Error: node_id mismatch: config=node-1 state=node-2
+2026-05-31T09:15:00 ERROR    [tourillon.bootstrap.node] This data_dir belongs to a different node. Check your config.toml
+2026-05-31T09:15:00 ERROR    [tourillon.bootstrap.node] or point data_dir at the correct directory.
 ```
 
-**Error — unexpected persisted phase (stderr, exit 1):**
+**Error — unexpected persisted phase (ERROR log records, exit 1):**
 
 ```
-Error: unexpected phase joining — cannot start from this state via 'node start'.
-Use 'tourctl node join' to resume a join in progress.
+2026-05-31T09:15:00 ERROR    [tourillon.bootstrap.node] Error: unexpected phase joining — cannot start from this state via 'node start'.
+2026-05-31T09:15:00 ERROR    [tourillon.bootstrap.node] Use 'tourctl node join' to resume a join in progress.
 ```
 
-**Error — token count does not match node size (stderr, exit 1):**
+**Error — token count does not match node size (ERROR log records, exit 1):**
 
 ```
-Error: token count mismatch: state has 2 token(s) but node size M requires 4.
-The node was likely reconfigured after joining. Resolve manually or wipe data_dir.
+2026-05-31T09:15:00 ERROR    [tourillon.bootstrap.node] Error: token count mismatch: state has 2 token(s) but node size M requires 4.
+2026-05-31T09:15:00 ERROR    [tourillon.bootstrap.node] The node was likely reconfigured after joining. Resolve manually or wipe data_dir.
 ```
 
 ---
