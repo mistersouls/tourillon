@@ -1,10 +1,7 @@
 ﻿# Proposal: Bootstrap & Provisioning
 
-<!-- Naming: proposal-<short-desc>-MMDDYYYY-SEQ.md
-     Example: proposal-bootstrap-05312026-001.md     -->
-
-**Author**: Tourillon Contributors <tourillon@example.com>
-**Status:** Draft
+**Author**: Souleymane BA <soulsmister@gmail.com>
+**Status:** Accepted
 **Date:** 2026-05-31
 **Sequence:** 001
 
@@ -182,9 +179,8 @@ Options:
   --size [XS|S|M|L|XL|XXL]  Node size class                  [default: M]
   --data-dir PATH         Data directory                      [default: ./data]
   --kv-bind TEXT          KV listener bind address            [default: 0.0.0.0:7000]
-  --kv-advertise TEXT     KV advertise address (defaults to --kv-bind)
   --peer-bind TEXT        Peer listener bind address          [default: 0.0.0.0:7001]
-  --peer-advertise TEXT   Peer advertise address (defaults to --peer-bind)
+  --peer-advertise TEXT   Peer advertise address (defaults to 127.0.0.1:7001)
   --seed TEXT             Seed peer address (repeatable)
   --rf INT                Replication factor                  [default: 3]
   --partition-shift INT   Partition shift (immutable after bootstrap) [default: 10]
@@ -367,6 +363,12 @@ fields are unit-embedded strings. No `*_file` path variants exist anywhere in th
 schema. `config.toml` is written at mode **0600** because it embeds the node private key;
 copying it to a world-readable path is a security misconfiguration.
 
+The preferred layout uses nested `[servers.kv]` / `[servers.peer]` tables with the
+KV server having only a `bind` field and the peer server having both `bind` and `advertise`.
+For backward compatibility, `load_config` also accepts the legacy flat layout with
+top-level `[kv_server]` / `[peer_server]` sections, but the CLI currently emits the
+nested `servers` form.
+
 ```toml
 schema_version = 1
 
@@ -378,11 +380,10 @@ rf              = 3
 partition_shift = 10
 seeds           = ["192.168.1.2:7001", "192.168.1.3:7001"]
 
-[kv_server]
+[servers.kv]
 bind      = "0.0.0.0:7000"
-advertise = "192.168.1.1:7000"
 
-[peer_server]
+[servers.peer]
 bind      = "0.0.0.0:7001"
 advertise = "192.168.1.1:7001"
 
@@ -528,8 +529,10 @@ are **not** duration/size fields and retain numeric types.
     `validate_cert_key_match` via `infra/tls/context.py`. A `TlsValidationError` is
     re-raised as `ConfigError`.
   - `node.size` must be a valid `NodeSize` value; invalid values raise `ConfigError`.
-  - `[node]`, `[kv_server]`, `[peer_server]`, and `[tls]` sections are mandatory;
-    `[join]`, `[drain]`, and `[rebalance]` are optional (defaults from the dataclasses
+  - `[node]` and `[tls]` sections are mandatory.
+  - Either `[kv_server]` / `[peer_server]` or `[servers.kv]` / `[servers.peer]`
+    must be present.
+  - `[join]`, `[drain]`, and `[rebalance]` are optional (defaults from the dataclasses
     are used when absent).
 
 #### mTLS and dual-endpoint model
@@ -537,15 +540,13 @@ are **not** duration/size fields and retain numeric types.
 Each running node binds **two independent TCP listeners**, each with its own
 `ssl.SSLContext` built from the same `TlsConfig` credentials:
 
-| Listener | Port field | Lifecycle | Purpose |
-|---|---|---|---|
-| **KV server** | `kv_server` | `READY` and `DRAINING` phases only | Client KV traffic (`kv.*` envelope kinds) |
-| **Peer server** | `peer_server` | Always up while the daemon runs | Inter-node control plane (`gossip.*`, `node.*`, `rebalance.*`) |
+| Listener | Port field | Lifecycle | Purpose | Advertise |
+|---|---|---|---|---|
+| **KV server** | `servers.kv.bind` | `READY` and `DRAINING` phases only | Client KV traffic (`kv.*` envelope kinds) | None (internal only) |
+| **Peer server** | `servers.peer.bind` / `advertise` | Always up while the daemon runs | Inter-node control plane (`gossip.*`, `node.*`, `rebalance.*`) | `servers.peer.advertise` (default: `127.0.0.1:<port>`) |
 
-Both servers use `build_server_ssl_context(cert_data, key_data, ca_data)` from
-`infra/tls/context.py`. The KV server and peer server receive separate `ssl.SSLContext`
-instances (though constructed identically) so they can be independently started and
-stopped.
+The KV listener binds only; other nodes never connect to it — clients do.
+The peer listener both binds (for accepting) and advertises (for other nodes to discover).
 
 Clients (`TcpClient`) connect using `build_client_ssl_context(cert_data, key_data,
 ca_data)` where the credentials come from `ContextEntry.credentials` and the CA comes
@@ -759,12 +760,12 @@ CLI, construct `Bootstraper`, and hand off control.
 ### Sequence / flow — `tourillon pki ca`
 
 ```
-1. Parse CLI options (out_dir, name, days, key_size).
-2. Compute out_cert = out_dir / "ca.pem", out_key = out_dir / "ca-key.pem".
+1. Parse CLI options (out_cert, out_key, name, days, key_size).
+2. Use the provided output paths for the CA certificate and private key.
 3. CryptographyCaAdapter().generate_ca(CaRequest(common_name, valid_days, key_size, out_cert, out_key))
    a. Generate RSA key pair.
    b. Build self-signed x509 cert with BasicConstraints(ca=True).
-   c. Write ca-key.pem at mode 0600; write ca.pem.
+   c. Write ca.key at mode 0600; write ca.crt.
 4. Print success lines to stdout.
 ```
 
@@ -772,28 +773,25 @@ CLI, construct `Bootstraper`, and hand off control.
 
 ```
 1. Parse CLI options.
-2. Read ca_cert, cert, key files as bytes; base64-encode each.
-3. validate_cert_not_expired(b64_cert) — error on expiry.
-4. validate_cert_key_match(b64_cert, b64_key) — error on mismatch.
-5. Auto-generate node_id if not supplied.
-6. Build TOML dict representing config.toml.
-7. Write to --out path.
-8. Print success line to stdout.
+2. Issue a node certificate signed by the supplied CA.
+3. Auto-generate node_id if not supplied.
+4. Build TOML dict representing config.toml.
+5. Write to --out path.
+6. Print success line to stdout.
 ```
 
 ### Sequence / flow — `tourillon config generate-context`
 
 ```
 1. Parse CLI options; require at least one of --kv / --peer.
-2. Read ca_cert, client_cert, client_key files as bytes; base64-encode each.
-3. validate_cert_key_match(b64_client_cert, b64_client_key) — error on mismatch.
-4. load_contexts(contexts_file) → ContextsFile (empty if absent).
-5. Build ContextEntry(name, ClusterRef(name, ca_data), EndpointsConfig(kv, peer),
+2. Issue a client certificate signed by the supplied CA.
+3. load_contexts(out) → ContextsFile (empty if absent).
+4. Build ContextEntry(name, ClusterRef(name, ca_data), EndpointsConfig(kv, peer),
                       CredentialsConfig(cert_data, key_data)).
-6. file.upsert(entry).
-7. If --set-current: file.current_context = name.
-8. save_contexts(contexts_file, file).
-9. Print success line to stdout.
+5. file.upsert(entry).
+6. If --set-current: file.current_context = name.
+7. save_contexts(out, file).
+8. Print success line to stdout.
 ```
 
 ### Sequence / flow — `tourctl config use-context`
@@ -996,16 +994,16 @@ def parse_bytes(s: str) -> int:
     """
 
 def load_config(path: Path) -> TourillonConfig:
-    """Load, validate, and return an immutable TourillonConfig from *path*.
+     """Load, validate, and return an immutable TourillonConfig from *path*.
 
-    Validation steps (all fatal — raise ConfigError):
-      1. TOML parse error.
-      2. Missing mandatory sections ([node], [kv_server], [peer_server], [tls]).
-      3. Invalid NodeSize value.
-      4. Invalid duration/size strings (parse_duration / parse_bytes called on each).
-      5. TLS cert expired (validate_cert_not_expired).
-      6. TLS cert/key mismatch (validate_cert_key_match).
-    """
+     Validation steps (all fatal — raise ConfigError):
+       1. TOML parse error.
+       2. Missing mandatory sections ([node]. [tls], and either [servers] with [servers.kv] and [servers.peer], or legacy [kv_server] and [peer_server]).
+       3. Invalid NodeSize value.
+       4. Invalid duration/size strings (parse_duration / parse_bytes called on each).
+       5. TLS cert expired (validate_cert_not_expired).
+       6. TLS cert/key mismatch (validate_cert_key_match).
+     """
 ```
 
 ### `tourillon/core/structure/envelope.py` (informative)
@@ -1230,10 +1228,10 @@ Unit tests use no real sockets or real disk I/O. E2e tests use `tmp_path` (pytes
 | 19 | unit | Non-existent path | `load_contexts(absent_path)` | Returns `ContextsFile(current_context=None, contexts=[])` |
 | 20 | unit | `ContextsFile` with one entry | `save_contexts(tmp_path, cf)` then `load_contexts(tmp_path)` | Round-trip: entry name, endpoints, ca_data, cert_data, key_data all equal |
 | 21 | unit | `ContextsFile` with entry named `"a"` | `cf.upsert(ContextEntry(name="a", ...))` | `len(cf.contexts) == 1` and entry is replaced |
-| 22 | e2e | `tmp_path` (real filesystem) | `tourillon pki ca --out-dir tmp_path` | `ca.pem` and `ca-key.pem` exist; `ca-key.pem` has mode 0600 |
-| 23 | e2e | `tmp_path` + CA from scenario 22 | `tourillon pki issue --ca-cert ca.pem --ca-key ca-key.pem --name node1 --san-ip 127.0.0.1 --out-dir tmp_path` | `node1.pem` and `node1-key.pem` exist; `node1.pem` verifiable against `ca.pem` |
-| 24 | e2e | `tmp_path` + CA and node cert from scenarios 22–23 | `tourillon config generate --ca-cert ca.pem --cert node1.pem --key node1-key.pem --out tmp_path/config.toml` | `config.toml` written at mode 0600; `load_config(config.toml)` returns `TourillonConfig` without error; `join.attempt_timeout == "10s"` |
-| 25 | e2e | `tmp_path` + CA and client cert/key | `tourillon config generate-context --name my-cluster --ca-cert ca.pem --client-cert client.pem --client-key client-key.pem --peer 127.0.0.1:7001 --contexts-file tmp_path/contexts.toml` | `contexts.toml` written; `load_contexts` returns `ContextsFile` with one entry named `"my-cluster"` |
+| 22 | e2e | `tmp_path` (real filesystem) | `tourillon pki ca --out-cert tmp_path/ca.crt --out-key tmp_path/ca.key` | `ca.crt` and `ca.key` exist; `ca.key` has mode 0600 |
+| 23 | e2e | `tmp_path` + CA from scenario 22 | `tourillon pki issue --ca-cert ca.crt --ca-key ca.key --name node1 --san-ip 127.0.0.1 --out-cert tmp_path/node1.pem --out-key tmp_path/node1-key.pem` | `node1.pem` and `node1-key.pem` exist; `node1.pem` verifiable against `ca.crt` |
+| 24 | e2e | `tmp_path` + CA and node cert from scenarios 22–23 | `tourillon config generate --ca-cert ca.crt --ca-key ca.key --node-id node1 --out tmp_path/config.toml` | `config.toml` written at mode 0600; `load_config(config.toml)` returns `TourillonConfig` without error; `join.attempt_timeout == "10s"` |
+| 25 | e2e | `tmp_path` + CA and client cert/key | `tourillon config generate-context my-cluster --ca-cert ca.crt --ca-key ca.key --peer 127.0.0.1:7001 --out tmp_path/contexts.toml` | `contexts.toml` written; `load_contexts` returns `ContextsFile` with one entry named `"my-cluster"` |
 | 26 | unit | `ContextsFile` with two entries `"a"` and `"b"` saved to `tmp_path/contexts.toml` | `tourctl config use-context b --contexts-file tmp_path/contexts.toml` | `contexts.toml` reloaded; `current_context == "b"` |
 | 27 | unit | `ContextsFile` present but without entry `"z"` | `tourctl config use-context z --contexts-file <path>` | Prints error "context \"z\" not found in …"; exit 1 |
 | 28 | unit | `FileProcessLockAdapter` on a `tmp_path` directory | `acquire()` twice from different instances targeting the same path | First succeeds; second raises `ProcessLockError` |
@@ -1250,15 +1248,13 @@ Unit tests use no real sockets or real disk I/O. E2e tests use `tmp_path` (pytes
 - [ ] `tourillon/bootstrap/config.py` — `parse_duration`, `parse_bytes`, `ConfigError`, and `load_config` are present and exported.
 - [ ] `load_config` rejects a TOML with an unrecognised duration/size suffix with `ConfigError`.
 - [ ] `load_config` rejects a TOML with an expired node certificate with `ConfigError`.
-- [ ] `tourillon pki ca` writes `ca.pem` (mode default) and `ca-key.pem` (mode 0600).
+- [ ] `tourillon pki ca` writes `ca.crt` (mode default) and `ca-key.pem` (mode 0600).
 - [ ] `tourillon pki issue` issues a leaf cert verifiable against the CA cert.
 - [ ] `tourillon config generate` writes a self-contained `config.toml` at mode 0600 with base64 inline PEM; no path fields.
 - [ ] `tourillon config generate-context` writes an atomic `contexts.toml` at mode 0600.
 - [ ] `tourctl config use-context <name>` updates `current-context` field in `contexts.toml` atomically.
 - [ ] `tourctl config use-context` with an unknown name exits 1 with a descriptive error.
 - [ ] `FileProcessLockAdapter.acquire()` raises `ProcessLockError` when the lock file is already held by another process.
-- [ ] Daemon startup aborts with exit 1 and a clear message if `data_dir` does not exist (before lock acquisition).
-- [ ] Daemon startup aborts with exit 1 and a clear message if `pid.lock` is already held.
 - [ ] No module under `tourillon/core/` imports `msgpack`, `ssl`, `cryptography`, or any `tourillon/infra/` module.
 - [ ] `uv run pre-commit run --all-files` passes.
 
