@@ -1,7 +1,7 @@
 ﻿# Proposal: Bootstrap & Provisioning
 
 **Author**: Souleymane BA <soulsmister@gmail.com>
-**Status:** Accepted
+**Status:** Implemented
 **Date:** 2026-05-31
 **Sequence:** 001
 
