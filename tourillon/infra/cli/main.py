@@ -16,15 +16,19 @@
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import stat
 import tempfile
 import uuid
+from asyncio import run as asyncio_run
 from pathlib import Path
 
 import tomli_w
 import typer
 
+from tourillon.bootstrap.log import setup_logging
+from tourillon.bootstrap.node_start import NodeStartError, run_node_start
 from tourillon.core.ports.pki import CaRequest, CertRequest, PkiError
 from tourillon.core.structure.config import NodeSize
 from tourillon.core.structure.contexts import (
@@ -42,8 +46,12 @@ from tourillon.infra.pki.x509 import (
 app = typer.Typer(no_args_is_help=True)
 pki_app = typer.Typer(no_args_is_help=True)
 config_app = typer.Typer(no_args_is_help=True)
+node_app = typer.Typer(no_args_is_help=True)
 app.add_typer(pki_app, name="pki")
 app.add_typer(config_app, name="config")
+app.add_typer(node_app, name="node")
+
+logger = logging.getLogger("tourillon.bootstrap.node")
 
 
 class _CliServices:
@@ -280,3 +288,18 @@ def generate_context(
         key_path.unlink(missing_ok=True)
     typer.echo("✓ Client certificate issued")
     typer.echo(f'✓ Context "{name}" written to {out}')
+
+
+@node_app.command("start")
+def node_start(
+    config: Path = typer.Option(Path("./config.toml")),
+    log_level: str = typer.Option("INFO", "--log-level"),
+) -> None:
+    """Start this node as the first node of a cluster."""
+    setup_logging(log_level)
+    try:
+        asyncio_run(run_node_start(config))
+    except NodeStartError as exc:
+        raise typer.Exit(code=exc.exit_code) from exc
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested.")

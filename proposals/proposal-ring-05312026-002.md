@@ -1,7 +1,7 @@
 # Proposal: Ring & First-Node Bootstrap
 
 **Author**: Souleymane BA <soulsmister@gmail.com>
-**Status:** Accepted
+**Status:** Implemented
 **Date:** 2026-05-31
 **Sequence:** 002
 
@@ -100,9 +100,9 @@ Options:
 2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] Node node-1 starting (phase: idle).
 2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] Generated 4 token(s) for node size M.
 2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] Partition ranges owned (1024 total partitions):
-2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] token 0xaf3c12b8… → pids [  0– 255]  (256 partitions)
-2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] token 0x3e9d7fa1… → pids [256– 511]  (256 partitions)
-2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] token 0x8ab21c44… → pids [512– 767]  (256 partitions)
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] token 0xaf3c12b8… → pids [  0–255]  (256 partitions)
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] token 0x3e9d7fa1… → pids [256–511]  (256 partitions)
+2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] token 0x8ab21c44… → pids [512–767]  (256 partitions)
 2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] token 0xd1047e9c… → pids [768–1023]  (256 partitions)
 2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] State persisted (phase: ready, epoch: 1, generation: 1).
 2026-05-31T09:00:00 INFO     [tourillon.bootstrap.node] Node node-1 is READY.
@@ -1144,26 +1144,26 @@ E2e tests use `tmp_path` (pytest fixture) and real filesystem / subprocess.
 
 ## Exit criteria
 
-- [ ] All 50 test scenarios pass (`uv run pytest -m "unit or e2e" -x`).
-- [ ] `uv run pytest --cov=tourillon --cov-fail-under=90` passes.
-- [ ] `uv run ruff check tourillon/ tests/` passes with zero violations.
-- [ ] `uv run black --check tourillon/ tests/` passes.
-- [ ] `segment_shift` is derived from `NodeSize.token_count` as `log2(token_count)`; `load_config` validates the derived `segment_shift < partition_shift`.
-- [ ] `Partitioner.__init__` raises `ValueError` when `partition_shift >= hash_space.bits` or `segment_shift >= partition_shift`.
-- [ ] `Bootstraper.start_first_node()` calls `state_port.save()` before `topology_mgr.apply_member()` on the `IDLE` path (write-before-announce).
-- [ ] `Bootstraper.start_ready_node()` does not call `state_port.save()` on the crash-recovery `READY` path.
-- [ ] `Bootstraper.start_node()` raises `BootstrapError(exit_code=1)` for any phase other than `IDLE` or `READY`.
-- [ ] `FileStateAdapter.save()` leaves no temp file on disk after a successful write.
-- [ ] `FileStateAdapter.load()` returns `None` when `state.toml` is absent.
-- [ ] `state.toml` round-trip via `_encode_state` / `_parse_state` preserves all eight `NodeState` fields.
-- [ ] `TopologyManager.apply_member` adds vnodes to ring on `IDLE/JOINING → READY` transition.
-- [ ] `TopologyManager.apply_member` removes vnodes from ring on `DRAINING → IDLE` transition.
-- [ ] `TopologyManager.apply_member` returns `False` and leaves epoch unchanged for a no-op (same or older record).
-- [ ] `TopologyManager.apply_member` with `IDLE → JOINING` leaves epoch unchanged.
-- [ ] `member_fingerprint` is invalidated and recomputed after every accepted mutation.
-- [ ] `SimplePreferenceStrategy` never includes `IDLE`, `JOINING`, or `FAILED` nodes in the preference list.
-- [ ] Startup log output for a fresh bootstrap includes one `PartitionRange` line per vnode, formatted as specified in the CLI contract.
-- [ ] No module under `tourillon/core/` imports `infra/`, `msgpack`, `ssl`, or `tomllib`/`tomli_w` directly.
+- [x] All 50 test scenarios pass (`uv run pytest -m "unit or e2e" -x`).
+- [x] `uv run pytest --cov=tourillon --cov-fail-under=90` passes.
+- [x] `uv run ruff check tourillon/ tests/` passes with zero violations.
+- [x] `uv run black --check tourillon/ tests/` passes.
+- [x] `segment_shift` is derived from `NodeSize.token_count` as `log2(token_count)`; `load_config` validates the derived `segment_shift < partition_shift`.
+- [x] `Partitioner.__init__` raises `ValueError` when `partition_shift >= hash_space.bits` or `segment_shift >= partition_shift`.
+- [x] `Bootstraper.start_first_node()` calls `state_port.save()` before `topology_mgr.apply_member()` on the `IDLE` path (write-before-announce).
+- [x] `Bootstraper.start_ready_node()` does not call `state_port.save()` on the crash-recovery `READY` path.
+- [x] `Bootstraper.start_node()` raises `BootstrapError(exit_code=1)` for any phase other than `IDLE` or `READY`.
+- [x] `FileStateAdapter.save()` leaves no temp file on disk after a successful write.
+- [x] `FileStateAdapter.load()` returns `None` when `state.toml` is absent.
+- [x] `state.toml` round-trip via `_encode_state` / `_parse_state` preserves all eight `NodeState` fields.
+- [x] `TopologyManager.apply_member` adds vnodes to ring on `IDLE/JOINING → READY` transition.
+- [x] `TopologyManager.apply_member` removes vnodes from ring on `DRAINING → IDLE` transition.
+- [x] `TopologyManager.apply_member` returns `False` and leaves epoch unchanged for a no-op (same or older record).
+- [x] `TopologyManager.apply_member` with `IDLE → JOINING` leaves epoch unchanged.
+- [x] `member_fingerprint` is invalidated and recomputed after every accepted mutation.
+- [x] `SimplePreferenceStrategy` never includes `IDLE`, `JOINING`, or `FAILED` nodes in the preference list.
+- [x] Startup log output for a fresh bootstrap includes one `PartitionRange` line per vnode, formatted as specified in the CLI contract.
+- [x] No module under `tourillon/core/` imports `infra/`, `msgpack`, `ssl`, or `tomllib`/`tomli_w` directly.
 - [ ] `uv run pre-commit run --all-files` passes.
 
 ---

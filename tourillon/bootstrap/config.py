@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 from tomllib import loads
 
+from tourillon.core.lifecycle.bootstrap import derive_segment_shift
 from tourillon.core.structure.config import (
     DrainConfig,
     JoinConfig,
@@ -89,6 +90,8 @@ def parse_bytes(s: str) -> int:
 
 
 def _read_toml(path: Path) -> dict[str, object]:
+    if not path.exists():
+        raise ConfigError(f"config file not found: {path}")
     try:
         return loads(path.read_text())
     except Exception as e:
@@ -236,6 +239,12 @@ def load_config(path: Path) -> TourillonConfig:
     assert isinstance(peer_server_data, dict)
 
     node_size = _parse_node_size(node_data)
+    segment_shift = derive_segment_shift(node_size.token_count)
+    partition_shift = int(node_data.get("partition_shift", 10))
+    if segment_shift >= partition_shift:
+        raise ConfigError(
+            "derived segment_shift must be strictly less than partition_shift"
+        )
     _validate_tls_config(tls_data)
     _validate_duration_fields(join_data, "join")
     _validate_duration_fields(drain_data, "drain")
@@ -250,7 +259,7 @@ def load_config(path: Path) -> TourillonConfig:
         peer_server=_build_server(peer_server_data),
         seeds=node_data.get("seeds", []),
         rf=int(node_data.get("rf", 3)),
-        partition_shift=int(node_data.get("partition_shift", 10)),
+        partition_shift=partition_shift,
         join=_build_join(join_data),
         drain=_build_drain(drain_data),
         rebalance=_build_rebalance(rebalance_data),

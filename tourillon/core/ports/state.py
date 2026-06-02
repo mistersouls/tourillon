@@ -11,11 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""ProcessLockPort — exclusive process lock abstraction for data_dir access."""
+"""State and process-lock ports."""
 
 from __future__ import annotations
 
-from typing import Protocol, Self
+from typing import TYPE_CHECKING, Protocol, Self
+
+if TYPE_CHECKING:
+    from tourillon.core.lifecycle.state import NodeState
+
+
+class StateError(Exception):
+    """Raised by StatePort implementations on I/O or decode failure."""
+
+
+class StatePort(Protocol):
+    async def load(self) -> NodeState | None:
+        """Return persisted node state or None when state.toml is absent."""
+
+    async def save(self, state: NodeState) -> None:
+        """Persist node state atomically and durably."""
 
 
 class ProcessLockError(Exception):
