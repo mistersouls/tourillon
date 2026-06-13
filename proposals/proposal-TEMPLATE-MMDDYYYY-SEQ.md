@@ -1,9 +1,9 @@
 # Proposal: [Short title]
 
 <!-- Naming: proposal-<short-desc>-MMDDYYYY-SEQ.md
-     Example: proposal-bootstrap-05022026-001.md     -->
+     Example: proposal-ring-05312026-002.md -->
 
-**Author**: Firstname Lastname <Email>
+**Author**: [Team or name] <[email]>
 **Status:** Draft | Accepted | Implemented
 **Date:** YYYY-MM-DD
 **Sequence:** NNN
@@ -12,25 +12,29 @@
 
 ## Summary
 
-One paragraph. What problem does this solve, and why does it matter?
+One concise paragraph describing the capability, bounded scope, and intended
+operator impact.
 
 ---
 
 ## Motivation
 
-Why is this being proposed? What breaks or is missing without it?
+Explain what is missing today, what risk or friction exists without this
+change, and why now.
 
 ---
 
 ## CLI contract
 
-Start here. Describe every user-visible command this proposal introduces or
-modifies. Use realistic examples including flags, output, and error cases.
-The implementation follows from the CLI contract — never the other way around.
+Define all user-visible command/flag/output/error behavior first.
 
-```
-$ tourillon <command> [flags]
-$ tourctl <command> [flags]
+- Cover new or modified commands for `tourillon` and/or `tourctl`.
+- Provide happy-path and failure-path examples.
+- Specify stdout vs stderr and exit codes.
+
+```bash
+$ tourillon <command> [OPTIONS]
+$ tourctl <command> [OPTIONS]
 ```
 
 ---
@@ -39,19 +43,20 @@ $ tourctl <command> [flags]
 
 ### Data model
 
-Key types, interfaces, or dataclasses.
+Describe new or changed domain records (dataclasses/enums/value objects), wire
+messages, and config/state schema fragments.
 
 ### Core invariants
 
-Rules that must never be violated.
+List non-negotiable rules that must always hold.
 
 ### Sequence / flow
 
-Step-by-step description of the happy path.
+Document the main orchestration path(s) step-by-step.
 
 ### Error paths
 
-What can go wrong and what the user sees.
+Map concrete failure scenarios to operator-visible behavior.
 
 ---
 
@@ -59,39 +64,61 @@ What can go wrong and what the user sees.
 
 ### Decision: [title]
 
-**Alternatives considered:** ...
-**Chosen because:** ...
+**Alternatives considered:**
+
+- [option A]
+- [option B]
+
+**Chosen because:** [short rationale]
+
+---
+
+## Proposed code organisation
+
+List files created/modified, with concise intent per file.
+
+```text
+tourillon/...   NEW/MODIFIED — [reason]
+tourlib/...     NEW/MODIFIED — [reason]
+tourctl/...     NEW/MODIFIED — [reason]
+tests/...       NEW/MODIFIED — [reason]
+```
 
 ---
 
 ## Interfaces (informative)
 
-Relevant Python Protocols, dataclasses, or enum snippets.
-Illustrative, not prescriptive.
+Show minimal illustrative signatures for protocols/services/models.
 
 ```python
+# illustrative only
+class ExamplePort(Protocol):
+    async def call(self, ...) -> ...: ...
 ```
 
 ---
 
 ## Test scenarios
 
-All scenarios run with in-memory adapters unless marked `[e2e]`.
+State assumptions (in-memory vs `[e2e]`) and enumerate observable scenarios.
 
-| # | Fixture | Action | Expected |
-|---|---------|--------|----------|
-| 1 | ... | ... | ... |
+| # | Mark | Fixture | Action | Expected |
+|---|------|---------|--------|----------|
+| 1 | unit | ... | ... | ... |
 
 ---
 
 ## Exit criteria
 
-- [ ] All test scenarios pass.
+- [ ] CLI contract examples are implemented as specified.
+- [ ] Listed test scenarios pass.
 - [ ] `uv run pytest --cov-fail-under=90` passes.
+- [ ] `uv run ruff check .` passes.
+- [ ] `uv run black --check .` passes.
 - [ ] `uv run pre-commit run --all-files` passes.
 
 ---
 
 ## Out of scope
 
-What this proposal explicitly does not cover.
+Explicitly list what this proposal does not change.

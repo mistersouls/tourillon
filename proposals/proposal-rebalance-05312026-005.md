@@ -14,8 +14,8 @@
 
 This proposal specifies the full partition-rebalance protocol for Tourillon: the
 wire-level exchange that moves partition data between nodes during `JOINING → READY`
-(receiver) and `DRAINING → IDLE` (sender) transitions. It defines the implementation of
-implementations in `core/kv/store.py` (`PartitionStaging`, `PartitionHint`,
+(receiver) and `DRAINING → IDLE` (sender) transitions. It defines implementations in
+`tourillon/core/services/kv/store.py` (`PartitionStaging`, `PartitionHint`,
 `PartitionStore`) so that domain code can stage, commit, scan, put, and tombstone
 records via `BackendStorage`. It introduces `TransferHandle` and its five-state FSM
 (`PENDING → RUNNING → COMMITTED / FAILED / CANCELLED`), six envelope kinds
@@ -30,7 +30,7 @@ operator CLI commands:
   `PartitionRange`; with `--range <N>` it renders one row per `TransferHandle` inside
   that range.
 
-`PartitionRange` (from `core/ring/partitioner.py`) is used for both CLI display and
+`PartitionRange` (from `tourillon/core/structure/partition.py`) is used for both CLI display and
 transfer planning to minimise wire round-trips. Data-plane transfer outcomes feed
 `ProbeManager.data_fd` so that chronically unreachable rebalance targets are suspected
 by the local failure detector. No amendments to this proposal are permitted; later
@@ -161,12 +161,12 @@ ID  RANGE              PENDING  RUNNING  COMMITTED  FAILED  CANCELLED
 `ID` is the 0-based range index matching the order emitted by
 `Partitioner.ranges_for()` on the server side. `RANGE` is formatted as
 `<start_pid>-<end_pid> (<count>)`. Wrapping ranges (where `start_pid >
-end_pid`) are annotated with `[wrap]`:
+end_pid`) are annotated with `[wraps]`:
 
 ```
 ID  RANGE             PENDING  RUNNING  COMMITTED  FAILED  CANCELLED
 ────────────────────────────────────────────────────────────────────────
- 7   1008-15 (24)[wrap]        0        0         24       0          0
+ 7   1008-15 (24)[wraps]        0        0         24       0          0
 ```
 
 **Pid-level output (`--range <ID>`):**
@@ -396,7 +396,7 @@ ranges          list[PartitionRange]   — grouped view for display
 source_node_id  str             — peer that will send
 ```
 
-#### `PartitionRange` (`core/ring/partitioner.py`)
+#### `PartitionRange` (`tourillon/core/structure/partition.py`)
 
 No new fields. Used here for two purposes:
 1. **Display** — `tourctl rebalance status` (without `--range`) groups per-pid state
@@ -405,7 +405,7 @@ No new fields. Used here for two purposes:
    groups contiguous pids into the plan so the receiver can allocate all
    `TransferHandle` objects up-front before the first chunk arrives.
 
-#### `PartitionStore` (`core/kv/store.py`)
+#### `PartitionStore` (`tourillon/core/services/kv/store.py`)
 
 The concrete domain implementation that wraps `BackendStorage`. Stores records using
 `NamespaceKey`-encoded keys in `Namespace.LOG` (ordered by address then HLC) and
@@ -424,7 +424,7 @@ the highest HLC for `addr`, or `None`. `put` and `tombstone` delegate to
 `TagKind.TOMBSTONE`). `scan(resume_from)` iterates `Namespace.LOG` within the pid
 prefix to enumerate all committed records for the partition.
 
-#### `PartitionStaging` (`core/kv/store.py`)
+#### `PartitionStaging` (`tourillon/core/services/kv/store.py`)
 
 Wraps `BackendStorage` for one `(pid, epoch)` pair. Uses `TagKind.STAGING` with an
 epoch-bearing payload to tag staged records, keeping them invisible to normal reads.
@@ -440,14 +440,14 @@ TAG  tag: TagKind.STAGING | epoch (4B BE)
 `commit()` re-tags every staged entry to `TagKind.LIVE` or `TagKind.TOMBSTONE` using
 `BackendStorage.tag()` in a single sweep, then issues a final `BackendStorage.put()` to
 persist the epoch watermark. **`commit()` must complete before the caller updates
-`state.toml`** (invariant Â§1).
+`state.toml`** (invariant §1).
 `cleanup()` iterates staging entries for this `(pid, epoch)` and calls
 `BackendStorage.delete()` on each.
 `exists()` returns `True` if the pid-prefix scan over `TAGS` finds any `STAGING` entry.
 `last_staged_key()` returns the highest-HLC `STAGING` entry key, used as a chunk
 resume cursor after a crash.
 
-#### `PartitionHint` (`core/kv/store.py`)
+#### `PartitionHint` (`tourillon/core/services/kv/store.py`)
 
 Wraps `BackendStorage` for one `(pid, node_id)` pair. Uses `TagKind.HINT` with a
 sub-kind byte (`TagKind.LIVE.value` or `TagKind.TOMBSTONE.value`) in the payload.
@@ -459,16 +459,16 @@ sub-kind byte (`TagKind.LIVE.value` or `TagKind.TOMBSTONE.value`) in the payload
 `iter(resume_from)` iterates `Namespace.TAGS` for the pid prefix, yielding only entries
 whose tag kind is `TagKind.HINT` and whose tag payload starts with the encoded node_id.
 
-#### `RebalanceEngine` (`core/rebalance/engine.py`)
+#### `RebalanceEngine` (`tourillon/core/services/rebalance/engine.py`)
 
 In-memory coordinator that owns the `TransferHandle` registry and drives the FSM
-transitions. Injected with `Storage`, `StatePort`, and `ProbeManager`.
+transitions. Injected with `Storage`, `StatePersistence`, and `ProbeManager`.
 
 ```python
 @dataclass
 class RebalanceEngine:
     storage: Storage
-    state_port: StatePort
+    state_port: StatePersistence
     probe_mgr: ProbeManager
     _handles: dict[int, TransferHandle]  # keyed by pid
 ```
@@ -625,7 +625,7 @@ Sent by the **sender** after all chunks for a pid have been transmitted.
 }
 ```
 
-On receiving this, the receiver calls `PartitionStaging.commit()` (invariant Â§1) then
+On receiving this, the receiver calls `PartitionStaging.commit()` (invariant §1) then
 advances the `TransferHandle` to `COMMITTED` and persists `committed_pids` in
 `state.toml`.
 
@@ -647,7 +647,7 @@ all pids have reached `COMMITTED`. Triggers the final phase transition:
 
 ### Core invariants
 
-**Invariant Â§1 — Commit before announce:**
+**Invariant §1 — Commit before announce:**
 `PartitionStaging.commit()` **must** complete successfully before `state.toml` is
 updated to move the pid from `staging_pids` to `committed_pids`. If the node crashes
 between `commit()` returning and the `state.toml` write, the committed staging data
@@ -655,20 +655,20 @@ survives and the next restart can detect the discrepancy by scanning `TagKind.ST
 entries that are epoch-consistent with the current epoch — they are already committed
 at the storage level; the `state.toml` write is idempotent.
 
-**Invariant Â§2 — Pid in `staging_pids` before first `stage()` call:**
+**Invariant §2 — Pid in `staging_pids` before first `stage()` call:**
 Before calling `PartitionStaging.stage()` for the first record in a pid,
 `RebalanceEngine.on_init()` must persist the pid into `state.toml`'s `staging_pids`
-list via `StatePort.save()`. If the node crashes before the first `stage()`, the
+list via `StatePersistence.save()`. If the node crashes before the first `stage()`, the
 restart knows to clean up the staging area for this pid. If it crashes after the first
 `stage()`, `last_staged_key()` provides a resume cursor.
 
-**Invariant Â§3 — Epoch monotonicity:**
+**Invariant §3 — Epoch monotonicity:**
 Transfers with an epoch older than the current `NodeState.epoch` are rejected with a
 `CANCELLED` transition and an error log. Stale epoch re-attempts after a topology
 change are silently dropped.
 
-**Invariant Â§4 — No direct `BackendStorage` access from handlers:**
-Handlers in `core/rebalance/handlers.py` **never** call `BackendStorage` directly.
+**Invariant §4 — No direct `BackendStorage` access from handlers:**
+Handlers in `tourillon/bootstrap/handlers/peer.py` **never** call `BackendStorage` directly.
 All storage access is routed through `PartitionStore` (via `Storage.open_by_pid()`)
 or through `PartitionStaging` and `PartitionHint` sub-contexts.
 
@@ -690,23 +690,23 @@ or through `PartitionStaging` and `PartitionHint` sub-contexts.
 5.  For each pid p (S iterates in ascending pid order):
     a. S sends rebalance.transfer.init(pid=p, epoch=E, sender_node_id=S.node_id).
     b. N.on_init(p, E, S.node_id):
-         — Adds p to state.toml staging_pids (invariant Â§2).
+         — Adds p to state.toml staging_pids (invariant §2).
          — Advances TransferHandle(p) → RUNNING.
          — Returns PartitionStaging(p, E, backend).
     c. S calls PartitionStore.scan() to iterate all committed records for p.
     d. S sends rebalance.transfer.chunk batches (each ≤ max_chunk_bytes).
     e. N.on_chunk(p, records):
          — Calls PartitionStaging.stage(record) for each record.
-         — Updates chunks_received and records_transferred on the handle.
+         — Updates chunks_done and bytes_transferred on the handle.
     f. S sends rebalance.transfer.done(pid=p, epoch=E, total_records=T).
     g. N.on_done(p):
-         — Calls PartitionStaging.commit() (invariant Â§1).
+         — Calls PartitionStaging.commit() (invariant §1).
          — Moves p from staging_pids to committed_pids in state.toml.
          — Advances TransferHandle(p) → COMMITTED.
          — Calls probe_mgr.record_data_success(S.node_id).
 6.  Once all pids are COMMITTED, S sends rebalance.commit(epoch=E, committed_pids=[...]).
 7.  N validates the committed_pids set matches its own.
-8.  N transitions NodeState.phase JOINING → READY via StatePort.save().
+8.  N transitions NodeState.phase JOINING → READY via StatePersistence.save().
 ```
 
 #### Sender path (`DRAINING → IDLE`)
@@ -721,7 +721,7 @@ or through `PartitionStaging` and `PartitionHint` sub-contexts.
 2.  D sends rebalance.plan.response to receiver R.
 3.  D iterates pids, sending init / chunks / done envelopes as in steps 5a–5f above.
 4.  On successful transfer of all pids, D sends rebalance.commit.
-5.  D transitions NodeState.phase DRAINING → IDLE via StatePort.save().
+5.  D transitions NodeState.phase DRAINING → IDLE via StatePersistence.save().
 ```
 
 #### Crash recovery on restart
@@ -769,7 +769,7 @@ chunk_concurrency = 1        # number of pids transferred in parallel (default: 
 transfer_timeout  = "5m"     # per-pid transfer deadline
 ```
 
-`max_chunk_bytes` is parsed by `parse_bytes()` from `bootstrap/config.py`.
+`max_chunk_bytes` is parsed by `parse_bytes()` in the node config loader (`tourillon/core/services/config.py`).
 `transfer_timeout` is parsed by `parse_duration()`.
 
 ---
@@ -792,13 +792,13 @@ The sender iterates pids in pid-ascending order regardless of range boundaries;
 
 ### One `BackendStorage` per segment
 
-The infra adapter `tourillon/infra/store/storage_adapter.py` maintains a
+The infra adapter `tourillon/infra/storage.py` maintains a
 `dict[int, BackendStorage]` keyed by segment ID. `open_by_pid(pid)` calls
 `Partitioner.segment_for(pid)` to resolve the segment, opens (or retrieves from cache)
 the `BackendStorage` for that segment, and returns a `PartitionStore(pid, backend)`.
 Multiple pids sharing the same segment share one `BackendStorage` instance.
 
-The domain layer (`core/kv/store.py`) never imports `infra/` and never knows which
+The domain layer (`tourillon/core/services/kv/store.py`) never imports `infra/` and never knows which
 backend engine backs its `BackendStorage` reference. `BackendStorage` is the only
 storage abstraction the domain ever touches.
 
@@ -856,16 +856,14 @@ earlier, consistent with the intent of the dual-detector model.
 ## Proposed code organisation
 
 ```
-tourillon/core/kv/
+tourillon/core/services/kv/
     store.py                    — PartitionStore, PartitionStaging, PartitionHint
                                   (implement)
 
-tourillon/core/rebalance/
+tourillon/core/services/rebalance/
     __init__.py
     engine.py                   — RebalanceEngine, TransferHandle, TransferState,
                                   RebalancePlan, RangeSummary
-    handlers.py                 — @dispatcher.on("node.leave") handler;
-                                  @dispatcher.on("rebalance.*") handlers
 
 tourillon/core/structure/
     rebalance.py                — RebalancePlanPayload, TransferInitPayload,
@@ -873,11 +871,15 @@ tourillon/core/structure/
                                   RebalanceCommitPayload,
                                   NodeLeavePayload, NodeLeaveAckPayload wire dicts
 
-tourillon/infra/store/
-    storage_adapter.py          — StorageAdapter implementing Storage Protocol;
+tourillon/bootstrap/handlers/
+    peer.py                     — @dispatcher.on("node.leave") and
+                                  @dispatcher.on("rebalance.*") handlers
+
+tourillon/infra/
+    storage.py                  — StorageAdapter implementing Storage Protocol;
                                   one BackendStorage per segment cache
 
-tourctl/infra/cli/
+tourctl/bootstrap/cli/
     rebalance.py                — `tourctl node leave` and
                                   `tourctl rebalance status [--range <ID>]`
 
@@ -895,7 +897,7 @@ tests/e2e/
 ## Interfaces (informative)
 
 ```python
-# core/rebalance/engine.py
+# tourillon/core/services/rebalance/engine.py
 
 from __future__ import annotations
 
@@ -903,10 +905,10 @@ import enum
 from dataclasses import dataclass, field
 
 from tourillon.core.ports.storage import PartitionStaging, Storage
-from tourillon.core.ports.state import StatePort
-from tourillon.core.lifecycle.probe import ProbeManager
-from tourillon.core.ring.partitioner import PartitionRange
-from tourillon.core.ring.vnode import VNode
+from tourillon.core.machinery.state import StatePersistence
+from tourillon.core.services.probe import ProbeManager
+from tourillon.core.structure.partition import PartitionRange
+from tourillon.core.structure.ring import VNode
 from tourillon.core.structure.record import Record
 
 
@@ -922,10 +924,13 @@ class TransferState(enum.Enum):
 class TransferHandle:
     pid: int
     epoch: int
-    peer_node_id: str
+    from_node_id: str
+    to_node_id: str
     state: TransferState
-    chunks_received: int = 0
-    records_transferred: int = 0
+    chunks_done: int = 0
+    chunks_total: int | None = None
+    bytes_transferred: int = 0
+    started_at: float | None = None
     last_error: str | None = None
 
 
@@ -956,7 +961,7 @@ class RangeSummary:
 @dataclass
 class RebalanceEngine:
     storage: Storage
-    state_port: StatePort
+    state_port: StatePersistence
     probe_mgr: ProbeManager
     _handles: dict[int, TransferHandle] = field(default_factory=dict)
     _plan: RebalancePlan | None = None
@@ -972,7 +977,7 @@ class RebalanceEngine:
         ...
 
     async def on_chunk(self, pid: int, records: list[Record]) -> None:
-        """Stage records; update chunks_received and records_transferred."""
+        """Stage records; update chunks_done and bytes_transferred."""
         ...
 
     async def on_done(self, pid: int) -> None:
@@ -999,7 +1004,7 @@ class RebalanceEngine:
 ```
 
 ```python
-# core/kv/store.py  (fleshed-out PartitionStore)
+# tourillon/core/services/kv/store.py  (fleshed-out PartitionStore)
 
 from __future__ import annotations
 
@@ -1047,61 +1052,61 @@ class PartitionStore:
 ```
 
 ```python
-# core/rebalance/handlers.py
+# tourillon/bootstrap/handlers/peer.py
 
 from __future__ import annotations
 
-from tourillon.core.transport.dispatcher import Dispatcher
-from tourillon.core.transport.types import ReceiveEnvelope, SendEnvelope
-from tourillon.core.rebalance.engine import RebalanceEngine
+from tourillon.bootstrap.deps import peer_dispatcher
+from tourillon.core.transport.conn import ReceiveEnvelope, SendEnvelope
+from tourillon.core.services.rebalance.engine import RebalanceEngine
 
+dispatcher = peer_dispatcher()
 
-def register(dispatcher: Dispatcher, engine: RebalanceEngine) -> None:
-    @dispatcher.on("node.leave")
-    async def handle_node_leave(
-        receive: ReceiveEnvelope, send: SendEnvelope
-    ) -> None:
-        ...
+@dispatcher.on("node.leave")
+async def handle_node_leave(
+    receive: ReceiveEnvelope, send: SendEnvelope
+) -> None:
+    ...
 
-    @dispatcher.on("rebalance.plan")
-    async def handle_rebalance_plan(
-        receive: ReceiveEnvelope, send: SendEnvelope
-    ) -> None:
-        ...
+@dispatcher.on("rebalance.plan")
+async def handle_rebalance_plan(
+    receive: ReceiveEnvelope, send: SendEnvelope
+) -> None:
+    ...
 
-    @dispatcher.on("rebalance.transfer.init")
-    async def handle_transfer_init(
-        receive: ReceiveEnvelope, send: SendEnvelope
-    ) -> None:
-        ...
+@dispatcher.on("rebalance.transfer.init")
+async def handle_transfer_init(
+    receive: ReceiveEnvelope, send: SendEnvelope
+) -> None:
+    ...
 
-    @dispatcher.on("rebalance.transfer.chunk")
-    async def handle_transfer_chunk(
-        receive: ReceiveEnvelope, send: SendEnvelope
-    ) -> None:
-        ...
+@dispatcher.on("rebalance.transfer.chunk")
+async def handle_transfer_chunk(
+    receive: ReceiveEnvelope, send: SendEnvelope
+) -> None:
+    ...
 
-    @dispatcher.on("rebalance.transfer.done")
-    async def handle_transfer_done(
-        receive: ReceiveEnvelope, send: SendEnvelope
-    ) -> None:
-        ...
+@dispatcher.on("rebalance.transfer.done")
+async def handle_transfer_done(
+    receive: ReceiveEnvelope, send: SendEnvelope
+) -> None:
+    ...
 
-    @dispatcher.on("rebalance.commit")
-    async def handle_rebalance_commit(
-        receive: ReceiveEnvelope, send: SendEnvelope
-    ) -> None:
-        ...
+@dispatcher.on("rebalance.commit")
+async def handle_rebalance_commit(
+    receive: ReceiveEnvelope, send: SendEnvelope
+) -> None:
+    ...
 ```
 
 ```python
-# infra/store/storage_adapter.py
+# tourillon/infra/storage.py
 
 from __future__ import annotations
 
 from tourillon.core.ports.storage import BackendStorage, PartitionStore, Storage
-from tourillon.core.kv.store import PartitionStore as ConcretePartitionStore
-from tourillon.core.ring.partitioner import Partitioner
+from tourillon.core.services.kv.store import PartitionStore as ConcretePartitionStore
+from tourillon.core.structure.partition import Partitioner
 
 
 class StorageAdapter:
@@ -1143,7 +1148,7 @@ All scenarios run with in-memory adapters unless marked `[e2e]`.
 | 10 | unit | `PartitionHint`; hint for tombstone | `tombstone(addr, meta)` then `iter()` | Yields one `TaggedRecord` whose hint sub-kind byte is `TagKind.TOMBSTONE.value[0]`. |
 | 11 | unit | `RebalanceEngine`; `plan` with 3 pids | `allocate(plan)` | All 3 pids have `TransferHandle.state == PENDING`. |
 | 12 | unit | `RebalanceEngine`; pid=0 in PENDING | `on_init(0, epoch=1, "node-a")` | `TransferHandle.state == RUNNING`; pid 0 in `state.toml staging_pids`. |
-| 13 | unit | `RebalanceEngine`; pid=0 in RUNNING | `on_chunk(0, [record1, record2])` | `TransferHandle.records_transferred == 2`; records visible in staging. |
+| 13 | unit | `RebalanceEngine`; pid=0 in RUNNING | `on_chunk(0, [record1, record2])` | `TransferHandle.chunks_done == 1`; records visible in staging. |
 | 14 | unit | `RebalanceEngine`; pid=0 in RUNNING | `on_done(0)` | `TransferHandle.state == COMMITTED`; pid 0 in `committed_pids`; not in `staging_pids`. |
 | 15 | unit | `RebalanceEngine`; pid=1 in RUNNING | `cancel(1)` | `TransferHandle.state == CANCELLED`; staging entries for pid=1 are absent. |
 | 16 | unit | `RebalanceEngine`; stale epoch chunk (epoch=0, current=2) | `on_init(0, epoch=0, "node-a")` | Raises `ValueError`; `TransferHandle.state == CANCELLED`. |
@@ -1154,8 +1159,8 @@ All scenarios run with in-memory adapters unless marked `[e2e]`.
 | 21 | unit | `RebalanceEngine`; on_done raises `StorageError` from `commit()` | `on_done(pid=0)` | `TransferHandle.state == FAILED`; `probe_mgr.record_data_failure("node-a")` called once. |
 | 22 | unit | `RebalanceEngine`; pid=0 transitions RUNNING→COMMITTED | `on_done(0)` | `probe_mgr.record_data_success("node-a")` called once. |
 | 23 | unit | `RebalancePlan` with `ranges`; `status()` with `range_index=99` out of bounds | `status(range_index=99)` | Raises `IndexError` with message containing `"out of bounds"`. |
-| 24 | unit | `PartitionStaging.commit()` called then `state.toml` written (invariant §1 check) | Mock `StatePort.save` records call order | `commit()` observed before `save()` in call log. |
-| 25 | unit | `RebalanceEngine.on_init()` called; mock `StatePort.save` records call order | `on_init(pid=0, ...)` | `StatePort.save()` (adding pid to `staging_pids`) called before first `stage()` invocation (invariant §2). |
+| 24 | unit | `PartitionStaging.commit()` called then `state.toml` written (invariant §1 check) | Mock `StatePersistence.save` records call order | `commit()` observed before `save()` in call log. |
+| 25 | unit | `RebalanceEngine.on_init()` called; mock `StatePersistence.save` records call order | `on_init(pid=0, ...)` | `StatePersistence.save()` (adding pid to `staging_pids`) called before first `stage()` invocation (invariant §2). |
 | 26 | unit | `handle_node_leave` handler; node in `READY` phase | Dispatch `node.leave` envelope | Node transitions to `DRAINING`; response kind is `node.leave.ack` with `phase: "DRAINING"`. |
 | 27 | unit | `handle_node_leave` handler; node in `JOINING` phase | Dispatch `node.leave` envelope | Response kind is `node.leave.error` with `error` field; node phase unchanged. |
 | 28 | e2e | Two in-process nodes; node B in JOINING, node A in READY with 256 pids | Full rebalance.plan → init → chunk → done → commit exchange | Node B transitions to READY; all 256 pids COMMITTED; node A sends no further chunks. |
@@ -1170,19 +1175,19 @@ All scenarios run with in-memory adapters unless marked `[e2e]`.
 - [ ] `uv run pytest --cov=tourillon --cov=tourctl --cov-fail-under=90` passes.
 - [ ] `uv run ruff check tourillon/ tourctl/ tests/` passes with zero violations.
 - [ ] `uv run black --check tourillon/ tourctl/ tests/` passes.
-- [ ] `core/kv/store.py` — `PartitionStore`, `PartitionStaging`, and `PartitionHint`
+- [ ] `tourillon/core/services/kv/store.py` — `PartitionStore`, `PartitionStaging`, and `PartitionHint`
   all methods are fully implemented.
-- [ ] `core/rebalance/engine.py` — `RebalanceEngine` enforces invariant §1: `commit()` is
-  called and awaited before `StatePort.save()` is called to move the pid to `committed_pids`.
-- [ ] `core/rebalance/engine.py` — `RebalanceEngine` enforces invariant §2: `StatePort.save()`
+- [ ] `tourillon/core/services/rebalance/engine.py` — `RebalanceEngine` enforces invariant §1: `commit()` is
+  called and awaited before `StatePersistence.save()` is called to move the pid to `committed_pids`.
+- [ ] `tourillon/core/services/rebalance/engine.py` — `RebalanceEngine` enforces invariant §2: `StatePersistence.save()`
   is called to add the pid to `staging_pids` before the first `PartitionStaging.stage()` call.
-- [ ] `core/rebalance/engine.py` — `RebalanceEngine.on_init()` rejects transfers with
+- [ ] `tourillon/core/services/rebalance/engine.py` — `RebalanceEngine.on_init()` rejects transfers with
   `epoch < NodeState.epoch` by advancing the handle to `CANCELLED` and raising `ValueError`.
-- [ ] `core/rebalance/handlers.py` — `register(dispatcher, engine)` registers exactly **six**
+- [ ] `tourillon/bootstrap/handlers/peer.py` — module-level dispatcher wiring registers exactly **six**
   handlers using `@dispatcher.on(kind)` for the six envelope kinds specified above
   (`node.leave`, `rebalance.plan`, `rebalance.transfer.init`, `rebalance.transfer.chunk`,
   `rebalance.transfer.done`, `rebalance.commit`).
-- [ ] `infra/store/storage_adapter.py` — `StorageAdapter.open_by_pid()` calls
+- [ ] `tourillon/infra/storage.py` — `StorageAdapter.open_by_pid()` calls
   `Partitioner.segment_for(pid)` and caches one `BackendStorage` per unique segment;
   pids sharing a segment return a `PartitionStore` backed by the same instance.
 - [ ] No module under `tourillon/core/` imports `infra/`, `msgpack`, `ssl`, or

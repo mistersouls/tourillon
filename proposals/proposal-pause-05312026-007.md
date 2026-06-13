@@ -3,7 +3,7 @@
 <!-- Naming: proposal-<short-desc>-MMDDYYYY-SEQ.md
      Example: proposal-pause-05312026-007.md     -->
 
-**Author**: Tourillon Contributors <dev@tourillon.io>
+**Author**: Tourillon Contributors <tourillon@example.com>
 **Status:** Draft
 **Date:** 2026-05-31
 **Sequence:** 007
@@ -62,16 +62,22 @@ Error: node is already paused (paused_from=ready).
 $ tourctl node resume 10.0.0.3:7100
 Error: node is not paused (current phase: ready).
 
-# Drain while paused
-$ tourctl node drain 10.0.0.3:7100
-Error: node is paused; resume before draining.
+# Leave while paused
+$ tourctl node leave 10.0.0.3:7100
+Error: node is paused; resume before leaving.
 
 # Pause from an ineligible phase (IDLE / FAILED)
 $ tourctl node pause 10.0.0.3:7100
 Error: cannot pause node in phase idle.
 ```
 
-All errors are written to **stderr**; exit code is **1** on error, **0** on success.
+All errors are written to **stderr**. Exit-code mapping follows the established
+`tourctl` convention used by other proposals:
+
+- `0` — success
+- `1` — local CLI usage/config error
+- `2` — transport / TLS / timeout failure
+- `3` — remote node rejected the requested phase transition
 
 The `--json` flag emits a machine-readable object on stdout:
 
@@ -88,13 +94,13 @@ The `--json` flag emits a machine-readable object on stdout:
 
 #### `MemberPhase.PAUSED`
 
-`PAUSED` is defined in `tourillon/core/lifecycle/member.py` as `"paused"`. This
+`PAUSED` is defined in `tourillon/core/structure/member.py` as `"paused"`. This
 proposal wires up all transitions to and from it.
 
 #### `NodeState.paused_from` (new field)
 
 ```python
-# tourillon/core/lifecycle/state.py
+# tourillon/core/structure/member.py
 @dataclass(frozen=True)
 class NodeState:
     ...
@@ -107,9 +113,9 @@ back to `None` when `node.resume` is applied. It is persisted in the `[node]` se
 `state.toml` as the string `paused_from = "ready"` (or `"draining"` / `"joining"`); the
 key is absent entirely when the node is not paused (never written as `paused_from = ""`).
 
-#### `_parse_state` / `_encode_state` (updated)
+#### `FileStatePersistence._parse_state` / `FileStatePersistence._encode_state` (updated)
 
-`tourillon/infra/store/state.py` is updated:
+`tourillon/core/machinery/state.py` is updated:
 
 - `_parse_state`: reads `node.get("paused_from")`, passes it through `MemberPhase(...)` if
   present, otherwise leaves it `None`.
@@ -142,8 +148,8 @@ Legal pause and resume transitions:
 - Pause when already `PAUSED` → error: `"node is already paused (paused_from=<phase>)"`.
 - Pause from `IDLE` or `FAILED` → error: `"cannot pause node in phase <phase>"`.
 - Resume when not `PAUSED` → error: `"node is not paused (current phase: <phase>)"`.
-- `node.drain` while `PAUSED` → error: `"node is paused; resume before draining"`.
-  The drain handler checks `phase == PAUSED` before any other drain logic.
+- `node.leave` while `PAUSED` → error: `"node is paused; resume before leaving"`.
+  The `node.leave` handler checks `phase == PAUSED` before any other leave/drain logic.
 
 `PAUSED` has **no legal exits besides the three resume transitions** above. No other
 handler may transition away from `PAUSED`.
@@ -179,7 +185,8 @@ handler may transition away from `PAUSED`.
 
 ### Write routing while PAUSED
 
-`_ALWAYS_HANDOFF_PHASES` (defined in `core/ring/placement.py`) includes `MemberPhase.PAUSED`.
+`_ALWAYS_HANDOFF_PHASES` (defined in `tourillon/core/services/placement.py`) includes
+`MemberPhase.PAUSED`.
 `SimplePreferenceStrategy.preference_list()` evaluates `member.phase in _ALWAYS_HANDOFF_PHASES`
 for every primary replica; a `PAUSED` primary therefore always gets a handoff target, regardless
 of its source phase. No changes to `placement.py` are required by this proposal.
@@ -190,8 +197,8 @@ writes around the paused node.
 
 ### Handler registration
 
-Handlers live in `tourillon/core/lifecycle/handlers.py` and are registered with the
-peer-plane `Dispatcher` via `@dispatcher.on(kind)`:
+Handlers live in `tourillon/bootstrap/handlers/peer.py` and are registered with the
+peer-plane `Dispatcher` via module-level `@dispatcher.on(kind)` decorators:
 
 ```python
 @dispatcher.on("node.pause")
@@ -200,9 +207,6 @@ async def handle_node_pause(receive, send) -> None: ...
 @dispatcher.on("node.resume")
 async def handle_node_resume(receive, send) -> None: ...
 ```
-
-A `register(dispatcher)` module-level function calls both registrations so the bootstrap
-sequence needs only one call.
 
 ### Crash recovery
 
@@ -232,11 +236,11 @@ casing in `TopologyManager`.
 
 | Condition | Response payload | stderr output | Exit code |
 |---|---|---|---|
-| Node already paused | `ok=false, error="node is already paused (paused_from=<phase>)"` | same | 1 |
-| Node not in pausable phase | `ok=false, error="cannot pause node in phase <phase>"` | same | 1 |
-| Node not paused on resume | `ok=false, error="node is not paused (current phase: <phase>)"` | same | 1 |
-| Drain while paused | `ok=false, error="node is paused; resume before draining"` | same | 1 |
-| Transport / mTLS error | *(no envelope)* | `Error: connection failed: <reason>` | 1 |
+| Node already paused | `ok=false, error="node is already paused (paused_from=<phase>)"` | same | 3 |
+| Node not in pausable phase | `ok=false, error="cannot pause node in phase <phase>"` | same | 3 |
+| Node not paused on resume | `ok=false, error="node is not paused (current phase: <phase>)"` | same | 3 |
+| Leave while paused | `ok=false, error="node is paused; resume before leaving"` | same | 3 |
+| Transport / mTLS error | *(no envelope)* | `Error: connection failed: <reason>` | 2 |
 
 ---
 
@@ -280,10 +284,9 @@ the node lifecycle invariant.
 ## Interfaces (informative)
 
 ```python
-# tourillon/core/lifecycle/state.py  (updated)
+# tourillon/core/structure/member.py  (updated)
 from __future__ import annotations
-from dataclasses import dataclass, field
-from tourillon.core.lifecycle.member import MemberPhase
+from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class NodeState:
@@ -298,37 +301,40 @@ class NodeState:
     paused_from: MemberPhase | None = None  # NEW
 
 
-# tourillon/infra/store/state.py  (_parse_state / _encode_state updated)
-def _parse_state(raw: dict[str, Any]) -> NodeState:
-    node = raw["node"]
-    pf_raw = node.get("paused_from")
-    paused_from = MemberPhase(pf_raw) if pf_raw else None
-    ...
-    return NodeState(..., paused_from=paused_from)
+# tourillon/core/machinery/state.py  (FileStatePersistence methods updated)
+from typing import Any
+
+class FileStatePersistence:
+    def _parse_state(self, raw: dict[str, Any]) -> NodeState:
+        node = raw["node"]
+        pf_raw = node.get("paused_from")
+        paused_from = MemberPhase(pf_raw) if pf_raw else None
+        ...
+        return NodeState(..., paused_from=paused_from)
+
+    @staticmethod
+    def _encode_state(state: NodeState) -> dict[str, Any]:
+        node_section: dict[str, Any] = {
+            "node_id": state.node_id,
+            "phase": state.phase.value,
+            "generation": state.generation,
+            "seq": state.seq,
+            "tokens": list(state.tokens),
+        }
+        if state.paused_from is not None:
+            node_section["paused_from"] = state.paused_from.value
+        return {
+            "node": node_section,
+            "topology": {"epoch": state.epoch},
+            "rebalance": {
+                "committed_pids": list(state.committed_pids),
+                "staging_pids": list(state.staging_pids),
+            },
+        }
 
 
-def _encode_state(state: NodeState) -> dict[str, Any]:
-    node_section: dict[str, Any] = {
-        "node_id": state.node_id,
-        "phase": state.phase.value,
-        "generation": state.generation,
-        "seq": state.seq,
-        "tokens": list(state.tokens),
-    }
-    if state.paused_from is not None:
-        node_section["paused_from"] = state.paused_from.value
-    return {
-        "node": node_section,
-        "topology": {"epoch": state.epoch},
-        "rebalance": {
-            "committed_pids": list(state.committed_pids),
-            "staging_pids": list(state.staging_pids),
-        },
-    }
-
-
-# tourillon/core/lifecycle/handlers.py  (new file)
-from tourillon.core.transport.dispatcher import Dispatcher
+# tourillon/bootstrap/handlers/peer.py  (updated)
+from tourillon.core.structure.member import MemberPhase
 
 _PAUSABLE_PHASES = frozenset({
     MemberPhase.READY, MemberPhase.DRAINING, MemberPhase.JOINING
@@ -342,12 +348,7 @@ async def handle_node_resume(receive, send) -> None:
     """Handle node.resume envelope on the peer plane."""
     ...
 
-def register(dispatcher: Dispatcher) -> None:
-    dispatcher.on("node.pause")(handle_node_pause)
-    dispatcher.on("node.resume")(handle_node_resume)
-
-
-# tourctl commands (tourctl/infra/cli/node.py)
+# tourctl commands (tourctl/bootstrap/cli/node.py)
 import typer
 
 app = typer.Typer()
@@ -381,7 +382,7 @@ All scenarios run with in-memory adapters unless marked `[e2e]`.
 | 8 | Node in `READY` (not paused) | Send `node.resume` | Response `ok=false`, error contains `"not paused"`; phase unchanged |
 | 9 | Node in `IDLE` phase | Send `node.pause` | Response `ok=false`, error contains `"cannot pause node in phase idle"` |
 | 10 | Node in `FAILED` phase | Send `node.pause` | Response `ok=false`, error contains `"cannot pause node in phase failed"` |
-| 11 | Node in `PAUSED` | Send `node.drain` | Response `ok=false`, error contains `"node is paused; resume before draining"` |
+| 11 | Node in `PAUSED` | Send `node.leave` | Response `ok=false`, error contains `"node is paused; resume before leaving"` |
 | 12 | `READY → PAUSED` then save/load `state.toml` | Reload `NodeState` from disk | `phase == PAUSED`, `paused_from == READY` |
 | 13 | `PAUSED` node in `PlacementStrategy` | Build preference list | Node appears with `handoff != None`; write is routed to handoff target |
 | 14 | Not-paused node in `PlacementStrategy` | Build preference list | `paused_from` absence has no effect; normal preference list returned |
@@ -402,11 +403,11 @@ All scenarios run with in-memory adapters unless marked `[e2e]`.
 - [ ] `uv run ruff check tourillon/ tourctl/ tests/` passes with zero warnings.
 - [ ] `uv run black --check tourillon/ tourctl/ tests/` passes.
 - [ ] `uv run pre-commit run --all-files` passes.
-- [ ] `NodeState.paused_from` field is present in `core/lifecycle/state.py`.
+- [ ] `NodeState.paused_from` field is present in `tourillon/core/structure/member.py`.
 - [ ] `_parse_state` reads `paused_from` from `[node]` TOML section without error when absent.
 - [ ] `_encode_state` omits `paused_from` key when value is `None`.
-- [ ] `node.pause` and `node.resume` handlers registered in `core/lifecycle/handlers.py`.
-- [ ] Drain-while-paused guard present in the drain handler.
+- [ ] `node.pause` and `node.resume` handlers are registered in `tourillon/bootstrap/handlers/peer.py` using `@dispatcher.on(...)`.
+- [ ] Leave-while-paused guard present in the `node.leave` handler.
 - [ ] `tourctl node pause` and `tourctl node resume` commands exist with `--json` flag.
 
 ---

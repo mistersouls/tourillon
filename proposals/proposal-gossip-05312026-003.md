@@ -15,8 +15,9 @@
 This proposal specifies the gossip engine and seeded join protocol for Tourillon. It
 introduces three complementary anti-entropy paths (`gossip.push`, `gossip.ping/pong`,
 `gossip.digest/delta`), the `IDLE → JOINING` phase transition triggered by
-`tourctl node join`, and exponential-backoff seed contact configured via the `[join]`
-section defined in proposal 001. It also rewrites `core/lifecycle/probe.py` to
+`tourctl node join`, and exponential-backoff seed contact configured from
+`[node].seeds` plus join timing fields in `[gossip]`. It also rewrites
+`core/services/probe.py` to
 support a dual-detector model per peer — a phi-accrual `FailureDetector` (`gossip_fd`)
 fed by `gossip.pong` arrivals, and an asymmetric `DataCircuitBreaker` (`data_fd`) fed
 by data-plane outcomes. New `ProbeConfig` and
@@ -113,7 +114,7 @@ Error: peer address required: supply --peer or a context with a peer endpoint.
 
 ```
 Error: no response from 192.168.1.1:7001 within 30s.
-The node may be unreachable or not running. Check peer_server.bind in config.toml.
+The node may be unreachable or not running. Check servers.peer.bind in config.toml.
 ```
 
 **Error — connection refused (stderr, exit 2):**
@@ -153,6 +154,10 @@ class ProbeConfig:
 push_interval = "1s"    # how often each node pushes to fanout random peers
 ping_interval = "500ms" # how often each node pings every known peer
 fanout        = 3       # number of peers to push to per push cycle
+request_timeout = "30s"  # timeout for ping/digest request/response round-trips
+seed_deadline   = "2m"   # total deadline for contacting at least one seed
+backoff_base    = "250ms" # exponential-backoff base delay
+backoff_max     = "5s"    # exponential-backoff cap
 ```
 
 ```python
@@ -161,9 +166,13 @@ class GossipConfig:
     push_interval: str = "1s"
     ping_interval: str = "500ms"
     fanout: int = 3
+    request_timeout: str = "30s"
+    seed_deadline: str = "2m"
+    backoff_base: str = "250ms"
+    backoff_max: str = "5s"
 ```
 
-Both duration fields are validated by `parse_duration` at startup.
+All duration fields are validated by `parse_duration` at startup.
 
 #### `TourillonConfig` additions
 
@@ -177,7 +186,7 @@ class TourillonConfig:
 
 Both sections are optional in TOML; their dataclass defaults apply when absent.
 
-#### `DataCircuitBreaker` (new, `core/lifecycle/probe.py`)
+#### `DataCircuitBreaker` (new, `core/services/probe.py`)
 
 An asymmetric circuit breaker for data-plane reachability. Unlike the phi-accrual
 `FailureDetector`, which models a continuous distribution of heartbeat inter-arrivals,
@@ -208,7 +217,7 @@ counter; stamps `_last_failure_time = time.monotonic()`.
 if `_consecutive_successes >= min_successes` **and**
 `time.monotonic() - _last_failure_time >= cooldown_s`. Does nothing in LIVE state.
 
-#### Updated `ProbeManager` (rewrite of `core/lifecycle/probe.py`)
+#### Updated `ProbeManager` (rewrite of `core/services/probe.py`)
 
 `ProbeManager` holds **two independent detectors** per peer:
 
@@ -266,7 +275,7 @@ Note: `data_fd.is_suspect` (SUSPECT from data plane) does NOT override an UNKNOW
 gossip state. A peer with no gossip observations at all is UNKNOWN regardless of
 data outcomes.
 
-#### Gossip message payload dataclasses (`core/gossip/messages.py`)
+#### Gossip message payload dataclasses (`core/services/gossip/messages.py`)
 
 All payloads are serialised with `SerializerPort` (MessagePack schema). The domain
 layer defines frozen dataclasses; the handlers encode/decode via the injected
@@ -327,10 +336,10 @@ class NodeJoinErrorPayload:
 gossip push and delta payloads. The mapping is 1-to-1 with `Member`'s fields; `tokens`
 is a list of ints (each ≤ 128-bit, encoded as `ExtType(1)` by `MsgpackSerializerAdapter`).
 A helper `member_to_dict(m: Member) -> dict` / `dict_to_member(d: dict) -> Member`
-lives in `core/gossip/messages.py` and is the single codec for this transformation.
+lives in `core/services/gossip/messages.py` and is the single codec for this transformation.
 It never imports msgpack; it only produces/consumes plain Python dicts.
 
-#### `GossipEngine` (`core/gossip/engine.py`)
+#### `GossipEngine` (`core/services/gossip/engine.py`)
 
 `GossipEngine` drives all gossip activity for a running node. It owns two background
 `asyncio.Task` instances (managed via `asyncio.TaskGroup` inside `start()`):
@@ -393,7 +402,7 @@ sleep only after all outgoing sends have been attempted.
                    kind="gossip.ping", schema_id=1,
                )
                pong_env = await client.request(
-                   ping_env, timeout=parse_duration(cfg.join.attempt_timeout)
+                   ping_env, timeout=parse_duration(cfg.gossip.request_timeout)
                )
                pong = decode(pong_env.payload, GossipPongPayload)
                await probe_mgr.record_heartbeat(p.node_id)
@@ -409,7 +418,7 @@ sleep only after all outgoing sends have been attempted.
 ```
 
 `WaitGroup[str]` is keyed by `node_id`. `success_nodes` (from `wg.wait()`) are the
-peers that replied within `attempt_timeout`; they have been fed to `record_heartbeat`.
+peers that replied within `gossip.request_timeout`; they have been fed to `record_heartbeat`.
 `failed_nodes` have been fed to `record_miss`.
 
 **Digest initiation (`_initiate_digest`):**
@@ -428,7 +437,7 @@ peers that replied within `attempt_timeout`; they have been fed to `record_heart
 7. await topology_mgr.merge_registry(members)
 ```
 
-#### `JoinController` and `ExponentialBackoff` (`core/gossip/join.py`)
+#### `JoinController` and `ExponentialBackoff` (`core/services/gossip/join.py`)
 
 `JoinController` handles the `IDLE → JOINING` transition atomically:
 
@@ -457,12 +466,12 @@ delay(attempt) = min(backoff_base_s * 2^attempt, backoff_max_s) * uniform(0.8, 1
 Seed contact loop (called from `GossipEngine` startup):
 
 ```
-deadline_at = time.monotonic() + parse_duration(cfg.join.deadline)
+deadline_at = time.monotonic() + parse_duration(cfg.gossip.seed_deadline)
 attempt = 0
 while time.monotonic() < deadline_at:
     for seed in cfg.seeds:
         try:
-            client = await connector.connect(seed)
+            client = await pool.acquire(seed, seed)
             push_env = Envelope.create(
                 encode(GossipPushPayload(sender_id, members=[self_member])),
                 kind="gossip.push", schema_id=1,
@@ -478,7 +487,7 @@ while time.monotonic() < deadline_at:
     await asyncio.sleep(delay)
 raise JoinTimeoutError(
     f"could not contact any seed within deadline "
-    f"{cfg.join.deadline!r}; tried seeds: {cfg.seeds}"
+    f"{cfg.gossip.seed_deadline!r}; tried seeds: {cfg.seeds}"
 )
 ```
 
@@ -510,40 +519,44 @@ joining node immediately, which speeds convergence. The KV server is bound only 
 - Binding the KV server as part of the `JOINING → READY` transition is out of scope
   for this proposal.
 
-#### Gossip handler grouping (`core/gossip/handlers/`)
-Handlers are organised in a package with one module per envelope prefix. Each module
-owns a module-level `Dispatcher` instance and registers its handlers via `@<name>.on(kind)`
-at import time. No `register()` function.
+#### Gossip handler grouping (`bootstrap/handlers/`)
+Peer-plane handlers live in the bootstrap adapter package and register against the
+shared peer dispatcher from `bootstrap/deps.py` at import time.
 ```python
-# core/gossip/handlers/gossip.py
-from tourillon.core.transport.dispatcher import Dispatcher
-from tourillon.core.transport.types import ReceiveEnvelope, SendEnvelope
-gossip = Dispatcher()
-@gossip.on("gossip.push")
+# bootstrap/handlers/peer_gossip.py
+from tourillon.bootstrap.deps import peer_dispatcher
+from tourillon.core.transport.conn import ReceiveEnvelope, SendEnvelope
+
+dispatcher = peer_dispatcher()
+
+@dispatcher.on("gossip.push")
 async def push(receive: ReceiveEnvelope, send: SendEnvelope) -> None: ...
-@gossip.on("gossip.ping")
+@dispatcher.on("gossip.ping")
 async def ping(receive: ReceiveEnvelope, send: SendEnvelope) -> None: ...
-@gossip.on("gossip.digest")
+@dispatcher.on("gossip.digest")
 async def digest(receive: ReceiveEnvelope, send: SendEnvelope) -> None: ...
-@gossip.on("gossip.error")
+@dispatcher.on("gossip.error")
 async def error(receive: ReceiveEnvelope, send: SendEnvelope) -> None:
     # Receives unsolicited gossip.error (e.g. partition_shift_mismatch).
     # Logs at ERROR level; no response sent.
     ...
 ```
 ```python
-# core/gossip/handlers/node.py
-from tourillon.core.transport.dispatcher import Dispatcher
-from tourillon.core.transport.types import ReceiveEnvelope, SendEnvelope
-node = Dispatcher()
-@node.on("node.join")
+# bootstrap/handlers/peer_node.py
+from tourillon.bootstrap.deps import peer_dispatcher
+from tourillon.core.transport.conn import ReceiveEnvelope, SendEnvelope
+
+dispatcher = peer_dispatcher()
+
+@dispatcher.on("node.join")
 async def join(receive: ReceiveEnvelope, send: SendEnvelope) -> None: ...
 ```
 ```python
-# core/gossip/handlers/__init__.py
-from tourillon.core.gossip.handlers.gossip import gossip
-from tourillon.core.gossip.handlers.node import node
-__all__ = ["gossip", "node"]
+# bootstrap/handlers/__init__.py
+# import side-effects register handlers on peer_dispatcher
+from tourillon.bootstrap.handlers import peer, peer_gossip, peer_node
+
+__all__ = ["peer", "peer_gossip", "peer_node"]
 ```
 
 #### `PeerClientPool` (`core/transport/pool.py`)
@@ -617,9 +630,9 @@ rejects a fire-and-forget `gossip.push`.
    **not** call `record_data_failure` or `record_data_success`. Only data-plane
    outcomes (rebalance transfer errors, KV fanout errors) feed the `DataCircuitBreaker`.
 
-9. **Handler registration is startup-time only.** `core/gossip/handlers/` modules are imported once during bootstrap;
-   `gossip = Dispatcher()` and `node = Dispatcher()` are module-level singletons
-   populated at import time. Dependencies (topology_mgr, probe_mgr, join_controller)
+9. **Handler registration is startup-time only.** `bootstrap/handlers/` modules are imported once during bootstrap;
+   each handler registers on the singleton returned by `peer_dispatcher()` in
+   `bootstrap/deps.py`. Dependencies (topology_mgr, probe_mgr, join_controller)
    are fixed for the process lifetime.
 
 ### Sequence / flow — `tourctl node join`
@@ -772,7 +785,7 @@ compact tabular format. A 4-tuple is the minimal addition that preserves
 backward-compatibility with existing call sites that destructure 3-tuples (they will
 receive a `ValueError` at destructuring time, which is an explicit compile/test failure
 rather than silent data loss). A dataclass would require callers to import from
-`core/lifecycle/probe.py`, which they already do; so the 4-tuple is not a meaningful
+`core/services/probe.py`, which they already do; so the 4-tuple is not a meaningful
 constraint. The plain tuple is chosen for simplicity: no new dataclass, no extra import.
 
 **Note for callers:** any existing code that destructures `all_states_with_phi()` as
@@ -805,20 +818,22 @@ that diverged views are reconciled within a bounded number of rounds.
 
 ### Decision: `PeerClientPool` as the gossip layer's networking abstraction
 **Alternatives considered:**
-- A `PeerConnectorPort` Protocol in `core/ports/` with a `TlsPeerConnector` infra adapter.
+- A dedicated connector Protocol in `core/ports/` plus a separate infra connector adapter.
 - Pass `ssl.SSLContext` directly to `GossipEngine`.
 **Chosen because:** `PeerClientPool` is already the shared connection pool used by gossip,
 rebalance, and replication. Adding a Protocol layer on top only introduces indirection without
-new capability � the pool is testable with `ssl_ctx=None`. Reusing it directly keeps one
+new capability — the pool is testable with `ssl_ctx=None`. Reusing it directly keeps one
 fewer abstraction and ensures all subsystems share the same per-node connection, avoiding
-duplicate mTLS handshakes.### Decision: Seed contact in `GossipEngine` startup rather than in `JoinController`
+duplicate mTLS handshakes.
+
+### Decision: Seed contact in `GossipEngine` startup rather than in `JoinController`
 
 **Alternatives considered:**
 - `JoinController.transition_idle_to_joining()` blocks until at least one seed is
   contacted (before returning to the `node.join` handler).
 
 **Chosen because:** Seed contact may involve many retries with exponential backoff,
-potentially taking up to `join.deadline` (default 2 minutes). Blocking the
+potentially taking up to `gossip.seed_deadline` (default 2 minutes). Blocking the
 `handle_node_join` handler for that duration would tie up the peer socket connection
 to `tourctl` and provide no progress feedback. Decoupling seed contact into an
 async background task inside `GossipEngine` means `node.join.ack` is returned
@@ -835,7 +850,7 @@ acknowledgment while the gossip engine works in the background.
 
 **Chosen because:** Full jitter provides the best protection against thundering herds
 in a multi-node cluster restart scenario (AWS Architecture Blog, 2015: "Exponential
-Backoff and Jitter"). The Â±20% band ensures that nodes starting simultaneously
+Backoff and Jitter"). The ±20% band ensures that nodes starting simultaneously
 quickly desynchronise, preventing all of them from contacting the same seed at
 exactly the same instant.
 
@@ -875,7 +890,7 @@ class TourillonConfig:
     gossip: GossipConfig = field(default_factory=GossipConfig)
 ```
 
-### `tourillon/core/lifecycle/probe.py` — rewrite
+### `tourillon/core/services/probe.py` — rewrite
 
 ```python
 class DataCircuitBreaker:
@@ -921,7 +936,7 @@ class ProbeManager:
         ...
 ```
 
-### `tourillon/core/gossip/messages.py`
+### `tourillon/core/services/gossip/messages.py`
 
 ```python
 def member_to_dict(m: Member) -> dict[str, Any]: ...
@@ -977,7 +992,7 @@ class NodeJoinErrorPayload:
     current_phase: str
 ```
 
-### `tourillon/core/gossip/join.py`
+### `tourillon/core/services/gossip/join.py`
 
 ```python
 class JoinError(Exception):
@@ -1002,7 +1017,7 @@ class JoinController:
     def __init__(
         self,
         cfg: TourillonConfig,
-        state_port: StatePort,
+        state_port: StatePersistence,
         topology_mgr: TopologyManager,
         hash_space: HashSpace,
     ) -> None: ...
@@ -1016,7 +1031,7 @@ class JoinController:
         ...
 ```
 
-### `tourillon/core/gossip/engine.py`
+### `tourillon/core/services/gossip/engine.py`
 
 ```python
 class GossipEngine:
@@ -1043,52 +1058,37 @@ class GossipEngine:
         ...
 ```
 
-### `tourillon/core/gossip/handlers/`
+### `tourillon/bootstrap/handlers/`
 
 ```python
-# core/gossip/handlers/gossip.py
-gossip = Dispatcher()
+# bootstrap/handlers/peer_gossip.py
+dispatcher = peer_dispatcher()
 
-@gossip.on("gossip.push")
+@dispatcher.on("gossip.push")
 async def push(receive: ReceiveEnvelope, send: SendEnvelope) -> None: ...
 
-@gossip.on("gossip.ping")
+@dispatcher.on("gossip.ping")
 async def ping(receive: ReceiveEnvelope, send: SendEnvelope) -> None: ...
 
-@gossip.on("gossip.digest")
+@dispatcher.on("gossip.digest")
 async def digest(receive: ReceiveEnvelope, send: SendEnvelope) -> None: ...
 
-@gossip.on("gossip.error")
+@dispatcher.on("gossip.error")
 async def error(receive: ReceiveEnvelope, send: SendEnvelope) -> None: ...
 ```
 
 ```python
-# core/gossip/handlers/node.py
-node = Dispatcher()
+# bootstrap/handlers/peer_node.py
+dispatcher = peer_dispatcher()
 
-@node.on("node.join")
+@dispatcher.on("node.join")
 async def join(receive: ReceiveEnvelope, send: SendEnvelope) -> None: ...
 ```
 
-### `tourillon/core/ports/connector.py`
+### `tourillon/bootstrap/deps.py` (wiring)
 
-```python
-from tourillon.core.transport.client import TcpClient
-
-```
-
-### `tourillon/infra/transport/connector.py`
-
-```python
-import ssl
-
-class TlsPeerConnector:
-    """PeerClientPool is used directly; see core/transport/pool.py."""
-
-    def __init__(self, ssl_ctx: ssl.SSLContext) -> None: ...
-
-    async def connect(self, address: str) -> TcpClient: ...
-```
+`PeerClientPool` is wired once in bootstrap using `tourillon.infra.tls.CryptographyTlsContext`
+and injected into `JoinController` and `GossipEngine`.
 
 ---
 
@@ -1099,28 +1099,26 @@ Files **created or modified** by this proposal (in mandatory creation order):
 ```
 tourillon/core/structure/config.py               MODIFIED — adds ProbeConfig, GossipConfig;
                                                              adds both to TourillonConfig
-tourillon/core/lifecycle/probe.py                CREATE — DataCircuitBreaker,
+tourillon/core/services/probe.py                 MODIFIED — DataCircuitBreaker,
                                                              dual-detector ProbeManager,
                                                              all_states_with_phi() → 4-tuple
-tourillon/core/transport/pool.py                 already present — PeerClientPool (no changes)
-tourillon/core/gossip/__init__.py                NEW — package marker
-tourillon/core/gossip/messages.py                NEW — GossipPushPayload, PingPayload,
+tourillon/core/transport/pool.py                 NEW — PeerClientPool
+tourillon/core/services/gossip/__init__.py       NEW — package marker
+tourillon/core/services/gossip/messages.py       NEW — GossipPushPayload, PingPayload,
                                                         PongPayload, DigestPayload,
                                                         DeltaPayload, ErrorPayload,
                                                         NodeJoinAckPayload,
                                                         NodeJoinErrorPayload,
                                                         member_to_dict, dict_to_member
-tourillon/core/gossip/join.py                    NEW — JoinError, JoinTimeoutError,
+tourillon/core/services/gossip/join.py           NEW — JoinError, JoinTimeoutError,
                                                         ExponentialBackoff, JoinController
-tourillon/core/gossip/engine.py                  NEW — GossipEngine
-tourillon/core/gossip/handlers/
-    __init__.py                  NEW — re-exports gossip, node dispatchers
-    gossip.py                    NEW — gossip = Dispatcher(); push, ping,
-                                         digest, error handlers
-    node.py                      NEW — node = Dispatcher(); join handler
-tourillon/infra/transport/__init__.py            NEW — package marker (if absent)
-tourillon/infra/transport/connector.py           NEW — TlsPeerConnector
-tourctl/infra/cli/node.py                        MODIFIED — adds tourctl node join command
+tourillon/core/services/gossip/engine.py         NEW — GossipEngine
+tourillon/bootstrap/handlers/peer.py             MODIFIED — keeps node.join adapter entrypoint
+tourillon/bootstrap/handlers/peer_gossip.py      NEW — gossip.push/ping/digest/error handlers
+tourillon/bootstrap/handlers/peer_node.py        NEW — node.join handler specialization
+tourillon/bootstrap/deps.py                      MODIFIED — wires PeerClientPool + gossip services
+tourctl/bootstrap/cli/node.py                    NEW — adds tourctl node join command
+tourctl/bootstrap/main.py                        MODIFIED — registers `node` typer app
 tests/unit/test_data_circuit_breaker.py          NEW — scenarios 1–5
 tests/unit/test_probe_dual.py                    NEW — scenarios 6–10
 tests/unit/test_gossip_handlers.py               NEW — scenarios 11–17, 23
@@ -1131,14 +1129,15 @@ tests/e2e/test_node_join.py                      NEW — scenario 28
 Files already present and unchanged:
 
 ```
-tourillon/core/structure/waitgroup.py            (complete — WaitGroup[T])
-tourillon/core/lifecycle/member.py               (complete — Member, MemberPhase)
-tourillon/core/lifecycle/registry.py             (complete — MemberRegistry)
-tourillon/core/lifecycle/phi.py                  (complete — FailureDetector)
-tourillon/core/ring/topology.py                  (complete — TopologyManager, Topology)
+tourillon/core/structure/member.py               (complete — Member, MemberPhase, NodeState)
+tourillon/core/machinery/state.py                (complete — StatePersistence adapters)
+tourillon/core/services/manager.py               (complete — node service façade)
+tourillon/core/services/starter.py               (complete — socket lifecycle orchestration)
 tourillon/core/transport/dispatcher.py           (complete — Dispatcher)
 tourillon/core/structure/envelope.py             (complete — Envelope)
-tourillon/bootstrap/config.py                    (complete — parse_duration, ConfigError)
+tourillon/core/services/config.py                (complete — config loading/validation)
+tourillon/infra/tls.py                           (complete — TLS context adapter)
+tourlib/contexts.py                              (complete — contexts.toml loading)
 ```
 
 ---
@@ -1160,24 +1159,24 @@ E2e tests use `tmp_path` (pytest fixture) and real subprocess / filesystem.
 | 8 | unit | `ProbeManager(ProbeConfig())` with `"n1"` already LIVE via gossip heartbeat | `await pm.record_data_failure("n1")`; then `await pm.is_suspect("n1")` | Returns `True` (data_fd suspects n1; combined OR rule applies) |
 | 9 | unit | `ProbeManager(ProbeConfig())` | `await pm.record_heartbeat("n2")`; `await pm.all_states_with_phi()` | Returns list with one 4-tuple `("n2", MemberState.LIVE, 0.0, False)`; 4th element is `data_fd.is_suspect == False` |
 | 10 | unit | `ProbeManager(ProbeConfig())` with no prior failures for `"n3"` | `await pm.record_data_failure("n3")`; then `await pm.record_data_success("n3")`; `await pm.record_data_success("n3")`; `await pm.is_suspect("n3")` | Returns `True` (only 2 consecutive successes; K=3 not reached) |
-| 11 | unit | In-memory `TopologyManager()`; `push_handler` from `handlers.register(...)` | Deliver `gossip.push` envelope containing one `Member(node_id="n2", phase=READY, gen=1, seq=1, ...)` | `topology_mgr.snapshot().registry.get("n2")` returns the member; `merge_registry` call count is 1 |
+| 11 | unit | In-memory `TopologyManager()`; handler loaded via `bootstrap.handlers.peer_gossip` import side-effect | Deliver `gossip.push` envelope containing one `Member(node_id="n2", phase=READY, gen=1, seq=1, ...)` | `topology_mgr.snapshot().registry.get("n2")` returns the member; `merge_registry` call count is 1 |
 | 12 | unit | In-memory `TopologyManager()` seeded with `Member("n2", gen=1, seq=5)` | Deliver `gossip.push` containing `Member("n2", gen=1, seq=3)` (stale) | Registry unchanged (`get("n2").seq == 5`); `merge_registry` called but accepted count is 0 |
 | 13 | unit | `gossip.push` handler; local `cfg.partition_shift = 10` | Deliver `gossip.push` containing `Member(partition_shift=8)` | Handler calls `send()` with envelope `kind="gossip.error"`; decoded payload has `code="partition_shift_mismatch"`; member not merged |
 | 14 | unit | `gossip.ping` handler; `ProbeManager()` | Deliver `gossip.ping(sender_id="n2", fingerprint="abc123")` | Handler sends `gossip.pong` response with same `correlation_id`; `pong.sender_id == cfg.node_id`; `probe_mgr.record_heartbeat("n2")` called once |
 | 15 | unit | `gossip.ping` handler; local fingerprint `"xyz789"` | Deliver `gossip.ping(sender_id="n2", fingerprint="abc123")` | Decoded `GossipPongPayload.needs_digest == True`; `pong.fingerprint == "xyz789"` (local fingerprint) |
 | 16 | unit | `gossip.digest` handler; local registry has `Member("n1", gen=1, seq=5)` | Deliver `gossip.digest` with entry `("n1", gen=1, seq=2)` (stale entry) | Handler sends `gossip.delta`; decoded `GossipDeltaPayload.members` contains exactly one entry for `"n1"` with `gen=1, seq=5` |
 | 17 | unit | `gossip.digest` handler; digest entries match local registry exactly | Deliver `gossip.digest` with up-to-date entries for all local members | Handler sends `gossip.delta` with `members == []` (empty; nothing to send) |
-| 18 | unit | `JoinController`; `InMemoryStateAdapter(None)`; empty `TopologyManager()` | `await join_controller.transition_idle_to_joining()` | Returns `NodeState(phase=JOINING, generation=1, seq=0)`; `len(state.tokens) == cfg.node_size.token_count`; `state_port.save()` called before `topology_mgr.apply_member()` (write-before-announce) |
-| 19 | unit | `JoinController`; `InMemoryStateAdapter(NodeState(phase=JOINING, ...))` | `await join_controller.transition_idle_to_joining()` | Raises `JoinError` (current phase is JOINING, not IDLE) |
-| 20 | unit | `ExponentialBackoff(base_s=2.0, max_s=30.0, deadline_s=999.0)` | `[backoff.next_delay(i) for i in range(5)]` | First five values are approximately `2.0Â±20%, 4.0Â±20%, 8.0Â±20%, 16.0Â±20%, 30.0Â±20%` (cap reached at attempt 4) |
+| 18 | unit | `JoinController`; `InMemoryStatePersistence(None)`; empty `TopologyManager()` | `await join_controller.transition_idle_to_joining()` | Returns `NodeState(phase=JOINING, generation=1, seq=0)`; `len(state.tokens) == cfg.node_size.token_count`; `state_port.save()` called before `topology_mgr.apply_member()` (write-before-announce) |
+| 19 | unit | `JoinController`; `InMemoryStatePersistence(NodeState(phase=JOINING, ...))` | `await join_controller.transition_idle_to_joining()` | Raises `JoinError` (current phase is JOINING, not IDLE) |
+| 20 | unit | `ExponentialBackoff(base_s=2.0, max_s=30.0, deadline_s=999.0)` | `[backoff.next_delay(i) for i in range(5)]` | First five values are approximately `2.0±20%, 4.0±20%, 8.0±20%, 16.0±20%, 30.0±20%` (cap reached at attempt 4) |
 | 21 | unit | `ExponentialBackoff(base_s=2.0, max_s=30.0, deadline_s=0.001)` | `backoff.next_delay(0)` after `time.monotonic() > deadline_at` | Returns `None` (deadline exceeded; no further delay) |
-| 22 | unit | `JoinController`; `InMemoryStateAdapter(None)`; all seed connections raise `ConnectionClosedError`; `cfg.join.deadline = "100ms"` | `await join_controller.transition_idle_to_joining()` then seed loop exhausts deadline | `JoinTimeoutError` raised; JOINING state was persisted (write-before-announce satisfied); topology has JOINING member |
+| 22 | unit | `JoinController`; `InMemoryStatePersistence(None)`; all seed connections raise `ConnectionClosedError`; `cfg.gossip.seed_deadline = "100ms"` | `await join_controller.transition_idle_to_joining()` then seed loop exhausts deadline | `JoinTimeoutError` raised; JOINING state was persisted (write-before-announce satisfied); topology has JOINING member |
 | 23 | unit | `gossip.push` handler; topology seeded with one READY member | Deliver `gossip.push` containing `Member("n3", phase=JOINING, gen=1, seq=0, tokens=(5,))` | `"n3"` inserted into registry with `phase=JOINING`; ring size unchanged (JOINING nodes not added to ring via `TopologyManager` rule) |
 | 24 | unit | `MemberRegistry()` with `Member("n4", gen=2, seq=0)` | `registry.upsert(Member("n4", gen=1, seq=99))` | Returns `False`; stored member still has `gen=2` (higher generation always wins regardless of seq) |
 | 25 | unit | `TopologyManager()`; two members with identical `node_id` but different `seq` | `await tm.merge_registry([m_gen1_seq3, m_gen1_seq5])` | Registry stores `seq=5`; `merge_registry` returns `1` (only one accepted) |
-| 26 | unit | `node.join` handler; `InMemoryStateAdapter(NodeState(phase=READY, ...))` | Deliver `node.join` envelope | Handler sends `node.join.error` response; `decoded.code == "invalid_phase"`; `decoded.current_phase == "ready"` |
+| 26 | unit | `node.join` handler; `InMemoryStatePersistence(NodeState(phase=READY, ...))` | Deliver `node.join` envelope | Handler sends `node.join.error` response; `decoded.code == "invalid_phase"`; `decoded.current_phase == "ready"` |
 | 27 | unit | `DataCircuitBreaker(min_successes=3, cooldown_s=0.0)` recovered to LIVE after 3 successes | `dcb.record_failure()` | `dcb.is_suspect` returns `True` again immediately; `_consecutive_successes` reset to 0 |
-| 28 | e2e | Running first-node daemon (proposal 002 bootstrap); valid `contexts.toml` with peer endpoint | `tourctl node join --peer <peer_addr> --contexts-file tmp/contexts.toml` | Exit code 0; stdout contains "is now JOINING"; `state.toml` in `data_dir` has `phase = "joining"` and non-empty `tokens` array |
+| 28 | e2e | Running first-node daemon (proposal 002 bootstrap); valid `contexts.toml` with peer endpoint | `tourctl node join <peer_addr> --contexts-file tmp/contexts.toml` | Exit code 0; stdout contains "is now JOINING"; `state.toml` in `data_dir` has `phase = "joining"` and non-empty `tokens` array |
 
 ---
 
@@ -1190,7 +1189,8 @@ E2e tests use `tmp_path` (pytest fixture) and real subprocess / filesystem.
 - [ ] `core/structure/config.py` — `ProbeConfig` and `GossipConfig` dataclasses exist;
   both are fields on `TourillonConfig` with `field(default_factory=...)`.
 - [ ] `load_config` calls `parse_duration` on `ProbeConfig.data_suspect_cooldown`,
-  `GossipConfig.push_interval`, and `GossipConfig.ping_interval`; invalid suffixes
+  `GossipConfig.push_interval`, `GossipConfig.ping_interval`, `GossipConfig.request_timeout`,
+  `GossipConfig.seed_deadline`, `GossipConfig.backoff_base`, and `GossipConfig.backoff_max`; invalid suffixes
   raise `ConfigError` before any socket is opened.
 - [ ] `DataCircuitBreaker.record_failure()` sets `is_suspect = True` regardless of
   prior state.
@@ -1205,17 +1205,17 @@ E2e tests use `tmp_path` (pytest fixture) and real subprocess / filesystem.
 - [ ] `JoinController` raises `JoinError` when current phase is not IDLE.
 - [ ] `TopologyManager.apply_member()` with `IDLE → JOINING` does not add vnodes to
   the ring and does not increment the epoch (not changed by this proposal).
-- [ ] `handlers/gossip.py::push` rejects members with a mismatched `partition_shift` by
+- [ ] `bootstrap/handlers/peer_gossip.py::push` rejects members with a mismatched `partition_shift` by
   sending `gossip.error(code="partition_shift_mismatch")` and ignoring the push.
-- [ ] `handlers/gossip.py::error` logs the received error at `ERROR` level and sends no response.
-- [ ] `handlers/gossip.py::ping` calls `probe_mgr.record_heartbeat(sender_id)` and sends a
+- [ ] `bootstrap/handlers/peer_gossip.py::error` logs the received error at `ERROR` level and sends no response.
+- [ ] `bootstrap/handlers/peer_gossip.py::ping` calls `probe_mgr.record_heartbeat(sender_id)` and sends a
   `gossip.pong` response with the local fingerprint.
-- [ ] `handlers/gossip.py::digest` sends a `gossip.delta` containing only members newer
+- [ ] `bootstrap/handlers/peer_gossip.py::digest` sends a `gossip.delta` containing only members newer
   than the digest entries supplied by the sender.
 - [ ] `ExponentialBackoff.next_delay()` returns `None` after the deadline is exceeded.
 - [ ] `GossipEngine` calls `pool.acquire(node_id, address)` and sends via the returned `TcpClient`; it does not import `ssl`.
 - [ ] `GossipEngine` push and ping cycles use `WaitGroup[str]` (from `core/structure/waitgroup.py`) to fan out concurrently; `wg.wait()` is awaited before the next `asyncio.sleep`.
-- [ ] `core/gossip/handlers/` — `gossip = Dispatcher()` and `node = Dispatcher()` are module-level; handlers registered at import time via `@gossip.on(kind)` / `@node.on(kind)`; no `register()` function.
+- [ ] `bootstrap/handlers/` — gossip and node handlers register on `peer_dispatcher()` at import time via `@dispatcher.on(kind)`; no runtime re-registration.
 - [ ] No module under `tourillon/core/` imports `infra/`, `msgpack`, `ssl`, or
   `tomllib`/`tomli_w` directly.
 - [ ] `tourctl node join` exits with code 1 when the node is not IDLE.

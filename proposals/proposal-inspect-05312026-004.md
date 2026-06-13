@@ -18,9 +18,9 @@ snapshot of its internal state. The response carries partition ownership (comput
 `Partitioner.ranges_for()`), the full membership registry view held by the target, and
 local probe state for every tracked peer (including both the gossip phi value and the
 data-circuit-breaker suspect flag). The proposal also updates
-`core/structure/inspect.py` to add the `data_is_suspect` field to `ProbeSummary` and
+`tourillon/core/structure/inspect.py` to add the `data_is_suspect` field to `ProbeSummary` and
 a `probe_states_total` field to `NodeInspectResponse`, registers the
-`node.inspect` handler in `core/lifecycle/handlers.py` using the
+`node.inspect` handler in `tourillon/bootstrap/handlers/peer.py` using the
 `@dispatcher.on("node.inspect")` decorator style, and introduces a `--json` flag for
 machine-readable output. The full `token_hex` value is always present in the wire payload;
 the CLI truncates it to the first 8 hex digits followed by `…` for the human-readable
@@ -165,7 +165,7 @@ Probe states (2 tracked):
 
 #### Partition range display — `PARTITION_DISPLAY_THRESHOLD`
 
-`PARTITION_DISPLAY_THRESHOLD = 64` (constant in `tourctl/infra/cli/node.py`).
+`PARTITION_DISPLAY_THRESHOLD = 64` (constant in `tourctl/bootstrap/cli/node.py`).
 
 - When `len(partition_ranges) ≤ PARTITION_DISPLAY_THRESHOLD`, every range is always
   rendered individually using the `token 0x…  →  pids  N–M  (K partitions)` line.
@@ -259,7 +259,7 @@ The node may not be running. Start it with 'tourillon node start'.
 
 ```
 Error: no response from 192.168.1.1:7001 within 30s.
-The node may be unreachable or not running. Check peer_server.bind in config.toml.
+The node may be unreachable or not running. Check servers.peer.bind in config.toml.
 ```
 
 **Error — no address and no context peer endpoint (stderr, exit 1):**
@@ -281,7 +281,7 @@ Ensure the client certificate was issued by the cluster CA and has not expired.
 
 ### Data model
 
-#### `INSPECT_MEMBER_LIMIT` (constant, `core/structure/inspect.py`)
+#### `INSPECT_MEMBER_LIMIT` (constant, `tourillon/core/structure/inspect.py`)
 
 ```python
 INSPECT_MEMBER_LIMIT: int = 256
@@ -293,10 +293,10 @@ entries than this limit, the corresponding `*_truncated` flag is set to `True` a
 matching `*_total` field records the true count before truncation. Entries are sorted by
 `node_id` before truncation so the result is deterministic.
 
-#### `PartitionRange` modification (`core/structure/inspect.py`)
+#### `PartitionRange` modification (`tourillon/core/structure/inspect.py`)
 
 `PartitionRange` in `inspect.py` is the **wire-level** representation of a partition
-range; it is distinct from `PartitionRange` in `core/ring/partitioner.py`, which is the
+range; it is distinct from `PartitionRange` in `tourillon/core/structure/partition.py`, which is the
 **ring-level** representation (it carries an `owner: VNode` reference and is never
 serialised). The inspect-level `PartitionRange` is derived from the ring-level one:
 
@@ -317,7 +317,7 @@ followed by `…`:
 
 Full value is always present in the wire payload and in `--json` output.
 
-#### `ProbeSummary` modification (`core/structure/inspect.py`)
+#### `ProbeSummary` modification (`tourillon/core/structure/inspect.py`)
 
 `ProbeManager.all_states_with_phi()` returns 4-tuples
 `(node_id, MemberState, gossip_phi, data_is_suspect)`. `ProbeSummary` is updated to
@@ -337,7 +337,7 @@ operators can distinguish "gossip-live but data-dead" (`state="suspect"`, `phi=0
 `data_is_suspect=True`) from "gossip-dead but data-live" (`state="suspect"`, `phi=12.4`,
 `data_is_suspect=False`).
 
-#### `NodeInspectResponse` modification (`core/structure/inspect.py`)
+#### `NodeInspectResponse` modification (`tourillon/core/structure/inspect.py`)
 
 `probe_states_total: int` is added as a new field (mirroring `members_total`) so that
 callers can determine the true probe-manager size even when the payload is truncated:
@@ -366,28 +366,21 @@ class NodeInspectResponse:
     probe_states_total: int  # NEW — true probe manager size before truncation
 ```
 
-#### Handler construction (`core/lifecycle/handlers.py`)
+#### Handler construction (`tourillon/bootstrap/handlers/peer.py`)
 
-The `node.inspect` handler is a plain `async def` decorated with
-`@dispatcher.on("node.inspect")` inside a `register()` function that captures all
-dependencies via closure:
+The `node.inspect` handler is registered in the bootstrap peer handler module using
+the same import-time decorator style already used by `node.join`:
 
 ```python
-def register(
-    dispatcher: Dispatcher,
-    node_id: str,
-    cfg: TourillonConfig,
-    topology_mgr: TopologyManager,
-    probe_mgr: ProbeManager,
-    partitioner: Partitioner,
-    state_port: StatePort,
-    serializer: SerializerPort,
-) -> None:
-    @dispatcher.on("node.inspect")
-    async def handle_node_inspect(
-        receive: ReceiveEnvelope, send: SendEnvelope
-    ) -> None:
-        ...
+from tourillon.bootstrap.deps import get_core, peer_dispatcher
+from tourillon.core.transport.conn import ReceiveEnvelope, SendEnvelope
+
+dispatcher = peer_dispatcher()
+
+
+@dispatcher.on("node.inspect")
+async def inspect(receive: ReceiveEnvelope, send: SendEnvelope) -> None:
+    ...
 ```
 
 The handler does not require the request envelope payload (it is ignored); it uses only
@@ -396,15 +389,18 @@ the `correlation_id` from the incoming envelope to tag the response.
 #### Response construction algorithm
 
 ```
-1.  _ = await receive()           # consume the request (payload ignored)
-2.  node_state = await state_port.load()
+1.  request_env = await receive()  # consume request; payload ignored
+2.  core = get_core()              # bootstrap service container
+3.  resolve `cfg`, `state_port`, `topology_mgr`, `probe_mgr`, `partitioner`,
+    and `serializer` from `core.node` wiring.
+4.  node_state = await state_port.load()
     # node_state: NodeState — current phase, generation, seq, epoch, tokens
-3.  topo = await topology_mgr.snapshot()
+5.  topo = await topology_mgr.snapshot()
     # topo: Topology — ring, registry
-4.  ring = topo.ring
-5.  registry_members = sorted(topo.registry.all(), key=lambda m: m.node_id)
+6.  ring = topo.ring
+7.  registry_members = sorted(topo.registry.all(), key=lambda m: m.node_id)
 
-6.  # Build partition ranges for this node
+8.  # Build partition ranges for this node
     ring_ranges = partitioner.ranges_for(node_id, ring)
     # ring_ranges: list[ring.PartitionRange]  (sorted by start_pid)
     inspect_ranges = tuple(
@@ -418,7 +414,7 @@ the `correlation_id` from the incoming envelope to tag the response.
     )
     owned_partitions = sum(r.count for r in ring_ranges)
 
-7.  # Truncate members
+9.  # Truncate members
     members_total = len(registry_members)
     members_truncated = members_total > INSPECT_MEMBER_LIMIT
     members_slice = registry_members[:INSPECT_MEMBER_LIMIT]
@@ -433,7 +429,7 @@ the `correlation_id` from the incoming envelope to tag the response.
         for m in members_slice
     )
 
-8.  # Build probe states
+10. # Build probe states
     raw_probes = await probe_mgr.all_states_with_phi()
     # raw_probes: list[tuple[str, MemberState, float, bool]]
     sorted_probes = sorted(raw_probes, key=lambda t: t[0])
@@ -450,16 +446,16 @@ the `correlation_id` from the incoming envelope to tag the response.
         for nid, state, phi, data_is_suspect in probes_slice
     )
 
-9.  response = NodeInspectResponse(
+11. response = NodeInspectResponse(
         node_id=node_id,
         phase=str(node_state.phase),
         peer_address=cfg.peer_server.advertise,
         kv_address=(
-            cfg.kv_server.advertise
+            cfg.kv_server.bind
             if node_state.phase in {MemberPhase.READY, MemberPhase.DRAINING}
             else ""
         ),
-        size=str(cfg.node.size),
+        size=cfg.node_size.value,
         generation=node_state.generation,
         seq=node_state.seq,
         epoch=topo.epoch,
@@ -476,20 +472,20 @@ the `correlation_id` from the incoming envelope to tag the response.
         probe_states_total=probe_states_total,
     )
 
-10. payload = serializer.encode(_response_to_dict(response))
-11. await send(
+12. payload = serializer.encode(_response_to_dict(response))
+13. await send(
         Envelope.create(
             payload,
             kind="node.inspect.response",
             schema_id=serializer.schema_id,
-            correlation_id=request_envelope.correlation_id,
+            correlation_id=request_env.correlation_id,
         )
     )
 ```
 
 The helper `_response_to_dict(r: NodeInspectResponse) -> dict` performs a recursive
 conversion of the frozen dataclass tree to a plain `dict` / `list` / primitive tree
-that `SerializerPort.encode` can serialise. It lives in `core/lifecycle/handlers.py`
+that `SerializerPort.encode` can serialise. It lives in `tourillon/bootstrap/handlers/peer.py`
 and never imports `msgpack`.
 
 #### `tourctl node inspect` CLI flow
@@ -500,10 +496,11 @@ and never imports `msgpack`.
       a. If ADDRESS positional argument supplied → use it.
       b. Else resolve from context's peer endpoint.
       c. If neither → stderr error; exit 1.
-3.  load_contexts(contexts_file) → ContextsFile; select context if --context given.
-4.  Build ssl_ctx = build_client_ssl_context(
-            cert_data, key_data, ca_data
-        ) from selected context credentials.
+3.  `ContextConfigurer(...).load_contexts(contexts_file)` → `ContextsFile`; select
+    context if `--context` is given.
+4.  Build `ssl_ctx` via
+    `CryptographyTlsContext.build_client_ssl_context(cert_data, key_data, ca_data)`
+    from selected context credentials.
 5.  TcpClient.connect(peer_address, ssl_ctx).
 6.  request_env = Envelope.create(
             payload=serializer.encode({}),
@@ -609,7 +606,7 @@ tourctl side:
   6. Decode payload → NodeInspectResponse.
   7. Render and print.
 
-Daemon side (handle_node_inspect):
+Daemon side (`inspect` handler):
   1. Receive "node.inspect" envelope; note correlation_id.
   2. Load NodeState from state_port (in-memory; no disk I/O on hot path).
   3. Snapshot topology (ring + registry) from TopologyManager.
@@ -684,18 +681,17 @@ to cover production clusters of meaningful size (typical clusters are 5–50 nod
 use other tooling for full registry inspection when needed. A configurable limit is
 deferred until a clear operator need exists.
 
-### Decision: handler lives in `core/lifecycle/handlers.py`, not `core/gossip/handlers.py`
+### Decision: handler lives in `bootstrap/handlers/peer.py`, not `core/services/gossip/*`
 
 **Alternatives considered:**
-- Register the `node.inspect` handler inside `core/gossip/handlers.py` alongside
+- Register the `node.inspect` handler inside gossip service modules alongside
   `gossip.push`, `gossip.ping`, etc.
 
 **Chosen because:** `node.inspect` is a lifecycle diagnostic operation that reads
-`NodeState`, the `TopologyManager`, and the `ProbeManager`. Gossip handlers deal
-exclusively with membership propagation. Placing the inspect handler in
-`core/lifecycle/handlers.py` keeps a clean separation of concerns and avoids adding
-a `StatePort` dependency to `core/gossip/handlers.py`. Both files share the same
-`register(dispatcher, ...)` convention; there is no functional difference.
+`NodeState`, the `TopologyManager`, and the `ProbeManager`. Gossip services deal
+exclusively with membership propagation. Placing the inspect adapter in
+`bootstrap/handlers/peer.py` keeps transport wiring at the bootstrap layer and avoids
+cross-layer coupling from services back into socket handler code.
 
 ### Decision: `token_hex` is a `str` in the wire payload, not the raw `int` token
 
@@ -733,7 +729,7 @@ INSPECT_MEMBER_LIMIT: int = 256
 class PartitionRange:
     """Wire-level partition range for node inspect payloads.
 
-    Distinct from core/ring/partitioner.py PartitionRange (which carries owner VNode).
+    Distinct from core/structure/partition.py PartitionRange (which carries owner VNode).
     token_hex is the full "0x<32 hex digits>" string; CLI truncates to first 8 digits.
     """
     start_pid: int
@@ -782,31 +778,16 @@ class NodeInspectResponse:
     probe_states_total: int  # true count before truncation
 ```
 
-### `tourillon/core/lifecycle/handlers.py`
+### `tourillon/bootstrap/handlers/peer.py`
 
 ```python
-def register(
-    dispatcher: Dispatcher,
-    node_id: str,
-    cfg: TourillonConfig,
-    topology_mgr: TopologyManager,
-    probe_mgr: ProbeManager,
-    partitioner: Partitioner,
-    state_port: StatePort,
-    serializer: SerializerPort,
-) -> None:
-    """Register the node.inspect handler on dispatcher.
+dispatcher = peer_dispatcher()
 
-    All dependencies are captured via closure. Called once at daemon startup.
-    """
 
-    @dispatcher.on("node.inspect")
-    async def handle_node_inspect(
-        receive: ReceiveEnvelope,
-        send: SendEnvelope,
-    ) -> None:
-        """Handle a node.inspect request; respond with node.inspect.response."""
-        ...
+@dispatcher.on("node.inspect")
+async def inspect(receive: ReceiveEnvelope, send: SendEnvelope) -> None:
+    """Handle node.inspect; respond with node.inspect.response."""
+    ...
 
 
 def _response_to_dict(response: NodeInspectResponse) -> dict[str, object]:
@@ -819,11 +800,11 @@ def _dict_to_response(raw: dict[str, object]) -> NodeInspectResponse:
     ...
 ```
 
-### `tourctl/infra/cli/node.py` (additions)
+### `tourctl/bootstrap/cli/node.py` (additions)
 
 ```python
-@node_app.command("inspect")
-def inspect_node(
+@app.command("inspect")
+def inspect(
     address: str = typer.Argument(..., help="Peer address (host:port)"),
     context: str | None = typer.Option(None, "--context"),
     contexts_file: Path = typer.Option(
@@ -863,13 +844,13 @@ tourillon/core/structure/inspect.py          MODIFIED — add data_is_suspect to
                                                          probe_states_total to
                                                          NodeInspectResponse; add
                                                          INSPECT_MEMBER_LIMIT constant
-tourillon/core/lifecycle/__init__.py         NEW — package marker (if absent)
-tourillon/core/lifecycle/handlers.py         NEW — register(), handle_node_inspect,
+tourillon/bootstrap/handlers/peer.py         MODIFIED — add node.inspect handler,
                                                      _response_to_dict,
                                                      _dict_to_response
-tourctl/infra/cli/node.py                    MODIFIED — add 'inspect' sub-command,
+tourctl/bootstrap/cli/node.py                NEW — add 'inspect' sub-command,
                                                          _truncate_token,
                                                          _render_human, _render_json
+tourctl/bootstrap/main.py                    MODIFIED — registers `node` typer app
 tests/unit/__init__.py                       (already present)
 tests/unit/test_inspect_handler.py           NEW — scenarios 1–10
 tests/unit/test_inspect_cli.py               NEW — scenarios 11–16
@@ -880,16 +861,16 @@ Files already present and unchanged:
 
 ```
 tourillon/core/structure/envelope.py         (complete)
-tourillon/core/ring/partitioner.py           (complete — Partitioner, ranges_for)
-tourillon/core/lifecycle/member.py           (complete — MemberPhase, Member)
-tourillon/core/lifecycle/probe.py            (complete)
-tourillon/core/ring/topology.py              (complete — TopologyManager, Topology)
+tourillon/core/structure/partition.py        (complete — Partitioner, ranges_for)
+tourillon/core/structure/member.py           (complete — MemberPhase, Member)
+tourillon/core/services/probe.py             (complete)
+tourillon/core/services/topology.py          (complete — TopologyManager, Topology)
 tourillon/core/transport/dispatcher.py       (complete — Dispatcher)
-tourillon/core/ports/transport.py            (complete — ReceiveEnvelope, SendEnvelope)
-tourillon/core/ports/serializer.py           (complete — SerializerPort)
-tourillon/bootstrap/config.py               (complete — parse_duration, ConfigError)
-tourillon/infra/tls/context.py              (complete — build_client_ssl_context)
-tourillon/infra/contexts.py                 (complete — load_contexts)
+tourillon/core/transport/conn.py             (complete — ReceiveEnvelope, SendEnvelope)
+tourillon/core/transport/framing.py          (complete — frame codec with schema_id)
+tourillon/core/services/config.py            (complete — ConfigError and config loading)
+tourillon/infra/tls.py                       (complete — build_client_ssl_context)
+tourlib/contexts.py                          (complete — ContextConfigurer.load_contexts)
 ```
 
 ---
@@ -901,7 +882,7 @@ E2e tests use `tmp_path` (pytest fixture) and a real running daemon process.
 
 | # | Mark | Fixture | Action | Expected |
 |---|------|---------|--------|----------|
-| 1 | unit | `handle_node_inspect` handler wired with `InMemoryStateAdapter(NodeState(phase=READY, gen=1, seq=3, epoch=2, tokens=(100,200,300,400)))`, single-node ring (4 vnodes), `Partitioner(shift=10)`, empty `ProbeManager()`, 1-member `TopologyManager` | Deliver `node.inspect` envelope | Handler calls `send()` once with `kind="node.inspect.response"`; decoded `NodeInspectResponse.phase == "ready"` and `NodeInspectResponse.total_partitions == 1024` |
+| 1 | unit | `inspect` handler wired with `InMemoryStateAdapter(NodeState(phase=READY, gen=1, seq=3, epoch=2, tokens=(100,200,300,400)))`, single-node ring (4 vnodes), `Partitioner(shift=10)`, empty `ProbeManager()`, 1-member `TopologyManager` | Deliver `node.inspect` envelope | Handler calls `send()` once with `kind="node.inspect.response"`; decoded `NodeInspectResponse.phase == "ready"` and `NodeInspectResponse.total_partitions == 1024` |
 | 2 | unit | Same handler as scenario 1; single-node ring owns all partitions | Decode `partition_ranges` from the response | `len(partition_ranges) == 4`; `sum(r.count for r in partition_ranges) == 1024`; each `token_hex` starts with `"0x"` and is 34 chars long |
 | 3 | unit | Handler wired with `TopologyManager` containing 3 members (`"n1"`, `"n2"`, `"n3"`) | Deliver `node.inspect` envelope; decode response | `len(members) == 3`; `[m.node_id for m in members] == ["n1", "n2", "n3"]` (sorted); `members_total == 3`; `members_truncated == False` |
 | 4 | unit | `ProbeManager` (after proposal 003 rewrite) with `"n2"` tracked: 1 heartbeat + 1 `record_data_failure` call | Deliver `node.inspect` envelope; decode `probe_states` | `len(probe_states) == 1`; `probe_states[0].node_id == "n2"`; `probe_states[0].data_is_suspect == True`; `probe_states[0].state == "suspect"` |
@@ -928,12 +909,12 @@ E2e tests use `tmp_path` (pytest fixture) and a real running daemon process.
 - [ ] `uv run pytest --cov=tourillon --cov=tourctl --cov-fail-under=90` passes.
 - [ ] `uv run ruff check tourillon/ tourctl/ tests/` passes with zero violations.
 - [ ] `uv run black --check tourillon/ tourctl/ tests/` passes.
-- [ ] `core/structure/inspect.py` — `ProbeSummary` has a `data_is_suspect: bool` field;
+- [ ] `tourillon/core/structure/inspect.py` — `ProbeSummary` has a `data_is_suspect: bool` field;
   `NodeInspectResponse` has a `probe_states_total: int` field; `INSPECT_MEMBER_LIMIT = 256`
   is defined.
-- [ ] `core/lifecycle/handlers.py` — `register(dispatcher, ...)` is present and
-  registers exactly one handler for kind `"node.inspect"` using `@dispatcher.on(...)`.
-- [ ] `handle_node_inspect` never calls `state_port.save()`, `topology_mgr.apply_member()`,
+- [ ] `tourillon/bootstrap/handlers/peer.py` registers exactly one handler for kind
+  `"node.inspect"` using `@dispatcher.on(...)`.
+- [ ] `inspect` handler never calls `state_port.save()`, `topology_mgr.apply_member()`,
   `probe_mgr.record_data_failure()`, or `probe_mgr.record_data_success()` (read-only
   invariant enforced by code review).
 - [ ] `NodeInspectResponse.kv_address` is the empty string when

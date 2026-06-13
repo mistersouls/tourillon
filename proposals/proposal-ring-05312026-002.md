@@ -19,7 +19,8 @@ static partition grid laid over that ring (`Partitioner`, `LogicalPartition`,
 (`PlacementStrategy`, `SimplePreferenceStrategy`, `PreferenceEntry`), topology management
 (`TopologyManager`, `Topology`), the full node-lifecycle FSM (`MemberPhase`, `Member`,
 `MemberRegistry`, `NodeState`), local failure detection (`FailureDetector`, `MemberState`,
-`ProbeManager`), the `StatePort` protocol, and the `FileStateAdapter` backed by `state.toml`.
+`ProbeManager`), the `StatePersistence` protocol, and the `FileStatePersistence`
+adapter backed by `state.toml`.
 It then assembles these pieces into the `tourillon node start` command, which executes the
 `IDLE → READY` transition for a seedless first-node cluster bootstrap or recovers a node
 that crashed while `READY`. `PartitionRange` (computed by `Partitioner.ranges_for()`) is
@@ -58,7 +59,7 @@ Exit code `0` = success; `1` = user or config error; `2` = internal error.
 `tourillon node start` is a daemon — it emits **zero terminal output** outside of the
 Python `logging` subsystem. Every line the operator sees (progress, errors, ready
 signal, shutdown) is a structured `logging` record routed through the root logger.
-`setup_logging()` (`tourillon/bootstrap/log.py`) is the **first call** in every
+`setup_logging()` (`tourillon/bootstrap/deps.py`) is the **first call** in every
 Typer command and configures the root logger with a level-aware format:
 
 ```
@@ -299,9 +300,9 @@ belonging to `node_id`, computes the predecessor's token, and maps both bounds t
 The result is in ascending `start_pid` order because `pid_for_hash` is monotone with
 ascending token.
 
-`TourillonConfig` gains a new optional field `segment_shift: int = 4` (immutable after
-cluster bootstrap, co-located with `partition_shift`). Both are validated at startup so
-that `segment_shift < partition_shift < hash_space.bits`.
+`TourillonConfig` exposes `segment_shift` as a derived immutable property from
+`node_size` (power-of-two token count). Startup validation still enforces
+`segment_shift < partition_shift < hash_space.bits`.
 
 #### `MemberPhase`
 
@@ -419,10 +420,10 @@ Fields:
 The `[rebalance]` section is always written even when both lists are empty, so that
 `_parse_state` never encounters a missing key.
 
-#### `StatePort`
+#### `StatePersistence`
 
 ```python
-class StatePort(Protocol):
+class StatePersistence(Protocol):
     async def load(self) -> NodeState | None: ...
     async def save(self, state: NodeState) -> None: ...
 ```
@@ -432,22 +433,21 @@ atomic and durable (write to temp file → `os.replace()` → fsync containing d
 The **write-before-announce** invariant: `save()` must complete before any socket is
 opened or any gossip record is emitted.
 
-`StateError(Exception)` is raised by any `StatePort` implementor on I/O or decode
-failure. The bootstrap entry point catches it, prints to stderr, and exits with code 1.
+`StateError(Exception)` is raised by any `StatePersistence` implementor on I/O or
+decode failure. `StateError` is defined in `tourillon/core/exceptions.py`.
 
-#### `FileStateAdapter`
+#### `FileStatePersistence`
 
-`FileStateAdapter(path: Path)` implements `StatePort` for `state.toml` on local disk.
+`FileStatePersistence(path: Path, config_rw: ConfigReadWriter)` implements
+`StatePersistence` for `state.toml` on local disk.
 
 - All `load()` and `save()` calls are serialised through a per-instance `asyncio.Lock`
   (`_io_lock`) to prevent Windows `FILE_SHARE_DELETE` races between a concurrent
   thread-pool read (holding `state.toml` open) and an `os.replace()` rename in `save()`.
 - `save()` dispatches to `asyncio.to_thread(_save_sync)` for the blocking I/O.
-- `_save_sync` writes to `<path>.tmp`, calls `os.replace(<path>.tmp, <path>)`, then
-  calls `_fsync_dir` on the parent directory. `_fsync_dir` is best-effort; it silently
-  ignores `OSError` on platforms without directory fsync support.
-- `_load_sync` calls `tomllib.loads`; a missing file returns `None`; any parse or I/O
-  error raises `StateError`.
+- `_save_sync` encodes `NodeState` and writes through `ConfigReadWriter.write`.
+- `_load_sync` reads through `ConfigReadWriter.read`; a missing file returns `None`;
+  parse or I/O errors are wrapped as `StateError`.
 
 Higher-level callers that need an atomic load-modify-save cycle (e.g. the rebalance
 applicator) must additionally hold their own lock between `load()` and
@@ -634,23 +634,23 @@ already listed as a primary is never also listed as a handoff target.
    enforced by `Partitioner.__init__` and by `load_config`. Violating either raises
    `ConfigError` before any socket is opened.
 
-8. **`_io_lock` serialises FileStateAdapter I/O.** No concurrent `load()` and `save()`
+8. **`_io_lock` serialises FileStatePersistence I/O.** No concurrent `load()` and `save()`
    calls can interleave on Windows (no `FILE_SHARE_DELETE` races).
 
 ### Sequence / flow — `tourillon node start` (fresh bootstrap)
 
 ```
-1. load_config(config_path) → TourillonConfig  (from proposal 001)
+1. `NodeConfigService.load_config(config_path)` → `TourillonConfig` (from proposal 001)
 2. Build HashSpace(bits=128).
 3. Validate segment_shift < partition_shift < 128 → ConfigError on violation.
-4. Construct FileStateAdapter(data_dir / "state.toml").
+4. Construct `FileStatePersistence(data_dir / "state.toml", config_rw)`.
 5. persisted = await state_port.load()
    a. If persisted is not None:
       - check_node_id_consistency(cfg.node_id, persisted.node_id) → NodeIdMismatchError on mismatch; exit 1.
       - check_tokens_coherence(persisted.phase, persisted.tokens, cfg.node_size) → if False, log error; exit 1.
-6. Dispatch to run_first_node_bootstrap(cfg, state_port, topology_mgr, hash_space).
+6. Dispatch to the first-node bootstrap path in `NodeStarter`.
 
---- INSIDE run_first_node_bootstrap (phase == IDLE path) ---
+--- INSIDE NodeStarter first-node bootstrap (phase == IDLE path) ---
 7.  tokens = tuple(secrets.randbelow(hash_space.max) for _ in range(cfg.node_size.token_count))
 8.  state = NodeState(node_id=cfg.node_id, phase=READY, generation=1, seq=0,
                      tokens=tokens, epoch=1)
@@ -665,8 +665,8 @@ already listed as a primary is never also listed as a handoff target.
 14. Print startup log lines (see CLI contract).
 15. Build ssl_ctx_peer and ssl_ctx_kv from TlsConfig (see proposal 001).
 16. Register all peer-plane handlers on Dispatcher.
-17. Start TcpServer("peer", ssl_ctx_peer) on peer_server.bind → peer listener up.
-18. Start TcpServer("kv", ssl_ctx_kv) on kv_server.bind → KV listener up (READY).
+17. Start TcpServer("peer", ssl_ctx_peer) on `servers.peer.bind` → peer listener up.
+18. Start TcpServer("kv", ssl_ctx_kv) on `servers.kv.bind` → KV listener up (READY).
 19. Run event loop until SIGINT/SIGTERM.
 20. On shutdown: stop KV server; stop peer server; close listeners.
 ```
@@ -674,9 +674,9 @@ already listed as a primary is never also listed as a handoff target.
 ### Sequence / flow — `tourillon node start` (crash-recovery restart)
 
 ```
-Steps 1–6 identical to above; dispatch to run_first_node_bootstrap with phase == READY.
+Steps 1–6 identical to above; dispatch to NodeStarter crash-recovery path with phase == READY.
 
---- INSIDE run_first_node_bootstrap (phase == READY path) ---
+--- INSIDE NodeStarter crash-recovery bootstrap (phase == READY path) ---
 7. No new tokens generated; no state written to disk.
 8. member = Member(node_id, peer_address, generation=state.generation,
                   seq=state.seq, phase=READY, tokens=state.tokens,
@@ -753,7 +753,7 @@ exists would require forward references and premature abstraction. The single-de
 `ProbeManager` API is intentionally a strict subset of the eventual dual-detector API
 so that adding a second detector later will not break existing call sites.
 
-### Decision: Write-before-announce enforced in `run_first_node_bootstrap`
+### Decision: Write-before-announce enforced in first-node bootstrap orchestration
 
 **Alternatives considered:**
 - Apply the `TopologyManager` mutation first, then persist state.
@@ -764,17 +764,16 @@ restart, the node would re-enter the bootstrap path and generate different token
 creating a split-brain situation. Writing to disk first means a crash at any point leaves
 the node in a consistent state that can be fully recovered.
 
-### Decision: `segment_shift` added to `TourillonConfig`
+### Decision: `segment_shift` exposed as a derived `TourillonConfig` property
 
 **Alternatives considered:**
-- Derive `segment_shift` from `partition_shift` (e.g. `partition_shift // 2`).
-- Hard-code `segment_shift=4`.
+- Keep `segment_shift` hidden inside `Partitioner`.
+- Add `segment_shift` as a user-set TOML field.
 
-**Chosen because:** `segment_shift` determines how many segments exist (`2**segment_shift`)
-and therefore the number of `BackendStorage` instances opened. The right
-value depends on the expected partition density and the storage engine's cost to open a
-backend. Exposing it as a config field (with a sensible default of `4`) gives operators
-the knob without making it a derived magic constant.
+**Chosen because:** the current repository model already treats node sizing as the
+single operator knob (`node_size`). Deriving `segment_shift` from that immutable size
+keeps one source of truth, avoids an extra persisted setting, and still guarantees
+`segment_shift < partition_shift` via startup validation.
 
 ### Decision: `state.toml` always includes `[rebalance]` section
 
@@ -790,143 +789,61 @@ the section explicitly so that the on-disk format is predictable.
 
 ## Interfaces (informative)
 
-### `tourillon/core/ring/hashspace.py`
+Repository alignment for this proposal follows the current package layout:
+`core/structure/*` for domain records and pure ring logic,
+`core/services/*` for orchestration/managers,
+`core/machinery/*` for state persistence adapters,
+`bootstrap/*` for CLI wiring.
+
+### `tourillon/core/structure/ring.py` *(new)*
 
 ```python
-class HashSpace:
-    def __init__(self, bits: int = 128) -> None: ...   # ValueError if bits < 1
-    @property
-    def bits(self) -> int: ...
-    @property
-    def max(self) -> int: ...          # 2**bits
-    def hash(self, value: bytes) -> int: ...
-```
+class HashSpace: ...
 
-### `tourillon/core/ring/vnode.py`
-
-```python
 @dataclass(frozen=True)
-class VNode:
-    node_id: str
-    token: int
+class VNode: ...
+
+class Ring: ...
 ```
 
-### `tourillon/core/ring/ring.py`
-
-```python
-class Ring:
-    @classmethod
-    def empty(cls) -> Ring: ...
-    def successor(self, token: int) -> VNode: ...      # ValueError on empty ring
-    def predecessor(self, token: int) -> VNode: ...    # ValueError on empty ring
-    def add_vnodes(self, vnodes: list[VNode]) -> Ring: ...
-    def drop_nodes(self, node_ids: set[str]) -> Ring: ...
-    def iter_from(self, vnode: VNode) -> Iterator[VNode]: ...
-    def __len__(self) -> int: ...
-    def __iter__(self) -> Iterator[VNode]: ...
-```
-
-### `tourillon/core/ring/partitioner.py`
+### `tourillon/core/structure/partition.py` *(new)*
 
 ```python
 @dataclass(frozen=True)
-class LogicalPartition:
-    pid: int
-    start: int
-    end: int
-    def contains(self, h: int) -> bool: ...
+class LogicalPartition: ...
 
 @dataclass(frozen=True)
-class PartitionPlacement:
-    segment: int
-    partition: LogicalPartition
-    vnode: VNode
+class PartitionPlacement: ...
 
 @dataclass(frozen=True)
-class PartitionRange:
-    owner: VNode
-    start_pid: int
-    end_pid: int
-    count: int
-    @property
-    def wraps(self) -> bool: ...
+class PartitionRange: ...
 
-class Partitioner:
-    def __init__(
-        self,
-        hash_space: HashSpace,
-        partition_shift: int,
-        segment_shift: int,
-    ) -> None: ...    # ValueError on invariant violations
-    @property
-    def total_partitions(self) -> int: ...
-    @property
-    def total_segments(self) -> int: ...
-    @property
-    def partition_shift(self) -> int: ...
-    @property
-    def segment_shift(self) -> int: ...
-    @property
-    def pids_per_segment(self) -> int: ...
-    def pid_for_hash(self, h: int) -> int: ...
-    def segment_for(self, pid: int) -> int: ...
-    def partition_for(self, pid: int) -> LogicalPartition: ...
-    def placement_for_token(self, token: int, ring: Ring) -> PartitionPlacement: ...
-    def ranges_for(self, node_id: str, ring: Ring) -> list[PartitionRange]: ...
+class Partitioner: ...
 ```
 
-### `tourillon/core/ring/placement.py`
+### `tourillon/core/services/topology.py` *(new)*
 
 ```python
-_EXCLUDED_PHASES: frozenset[MemberPhase]      # IDLE, JOINING, FAILED
-_ALWAYS_HANDOFF_PHASES: frozenset[MemberPhase]  # DRAINING, PAUSED
+class MemberRegistry: ...
 
 @dataclass(frozen=True)
-class PreferenceEntry:
-    node_id: str
-    readable: bool
-    suspect: bool
-    handoff: str | None
+class Topology: ...
 
-class PlacementStrategy(Protocol):
-    async def preference_list(
-        self,
-        placement: PartitionPlacement,
-        topology: Topology,
-        probe_manager: ProbeManager,
-    ) -> list[PreferenceEntry]: ...
-
-class SimplePreferenceStrategy:
-    def __init__(self, rf: int) -> None: ...
-    async def preference_list(
-        self,
-        placement: PartitionPlacement,
-        topology: Topology,
-        probe_manager: ProbeManager,
-    ) -> list[PreferenceEntry]: ...
+class TopologyManager: ...
 ```
 
-### `tourillon/core/ring/topology.py`
+### `tourillon/core/services/placement.py` *(new)*
 
 ```python
 @dataclass(frozen=True)
-class Topology:
-    epoch: int
-    registry: MemberRegistry
-    ring: Ring
-    def members_in_phase(self, *phases: MemberPhase) -> dict[str, Member]: ...
-    @property
-    def active_node_ids(self) -> frozenset[str]: ...
+class PreferenceEntry: ...
 
-class TopologyManager:
-    def __init__(self) -> None: ...
-    async def snapshot(self) -> Topology: ...
-    async def apply_member(self, member: Member) -> bool: ...
-    async def merge_registry(self, members: Iterable[Member]) -> int: ...
-    async def member_fingerprint(self) -> str: ...
+class PlacementStrategy(Protocol): ...
+
+class SimplePreferenceStrategy: ...
 ```
 
-### `tourillon/core/lifecycle/member.py`
+### `tourillon/core/structure/member.py`
 
 ```python
 class MemberPhase(StrEnum):
@@ -947,23 +864,7 @@ class Member:
     tokens: tuple[int, ...]
     partition_shift: int
     def supersedes(self, other: Member) -> bool: ...
-```
 
-### `tourillon/core/lifecycle/registry.py`
-
-```python
-class MemberRegistry:
-    def upsert(self, member: Member) -> bool: ...
-    def get(self, node_id: str) -> Member | None: ...
-    def members_in_phase(self, *phases: MemberPhase) -> dict[str, Member]: ...
-    def snapshot(self) -> MemberRegistry: ...
-    def __len__(self) -> int: ...
-    def __iter__(self) -> Iterator[Member]: ...
-```
-
-### `tourillon/core/lifecycle/state.py`
-
-```python
 @dataclass(frozen=True)
 class NodeState:
     node_id: str
@@ -976,7 +877,7 @@ class NodeState:
     staging_pids: tuple[int, ...] = ()
 ```
 
-### `tourillon/core/lifecycle/phi.py`
+### `tourillon/core/services/probe.py` *(new)*
 
 ```python
 class FailureDetector:
@@ -985,11 +886,7 @@ class FailureDetector:
     @property
     def has_observations(self) -> bool: ...
     def is_available(self, threshold: float = 8.0) -> bool: ...
-```
 
-### `tourillon/core/lifecycle/probe.py`
-
-```python
 class MemberState(StrEnum):
     LIVE    = "live"
     SUSPECT = "suspect"
@@ -1007,48 +904,33 @@ class ProbeManager:
     async def all_states_with_phi(self) -> list[tuple[str, MemberState, float]]: ...
 ```
 
-### `tourillon/core/lifecycle/bootstrap.py`
+### `tourillon/core/services/starter.py` + `tourillon/core/exceptions.py`
 
 ```python
-class BootstrapError(Exception):
-    exit_code: int
+class BootstrapError(Exception): ...  # defined in core/exceptions.py
 
-async def run_first_node_bootstrap(
-    cfg: TourillonConfig,
-    state_port: StatePort,
-    topology_mgr: TopologyManager,
-    hash_space: HashSpace,
-) -> NodeState: ...
+class NodeStarter:
+    @staticmethod
+    def check_node_id_consistency(config_node_id: str, state_node_id: str) -> None: ...
+    @staticmethod
+    def check_tokens_coherence(
+        phase: MemberPhase,
+        tokens: tuple[int, ...],
+        node_size: NodeSize,
+    ) -> bool: ...
 ```
 
-### `tourillon/core/lifecycle/checks.py`
+### `tourillon/core/machinery/state.py` + `tourillon/core/exceptions.py`
 
 ```python
-class NodeIdMismatchError(Exception): ...
+class StateError(Exception): ...  # defined in core/exceptions.py
 
-def check_node_id_consistency(config_node_id: str, state_node_id: str) -> None: ...
-def check_tokens_coherence(
-    phase: MemberPhase,
-    tokens: tuple[int, ...],
-    node_size: NodeSize,
-) -> bool: ...
-```
-
-### `tourillon/core/ports/state.py`
-
-```python
-class StateError(Exception): ...
-
-class StatePort(Protocol):
+class StatePersistence(Protocol):
     async def load(self) -> NodeState | None: ...
     async def save(self, state: NodeState) -> None: ...
-```
 
-### `tourillon/infra/store/state.py`
-
-```python
-class FileStateAdapter:
-    def __init__(self, path: Path) -> None: ...
+class FileStatePersistence:
+    def __init__(self, path: Path, config_rw: ConfigReadWriter) -> None: ...
     async def load(self) -> NodeState | None: ...
     async def save(self, state: NodeState) -> None: ...
 
@@ -1056,13 +938,14 @@ def _parse_state(raw: dict[str, Any]) -> NodeState: ...
 def _encode_state(state: NodeState) -> dict[str, Any]: ...
 ```
 
-### `tourillon/core/structure/config.py` — new `segment_shift` field
+### `tourillon/core/structure/config.py` — `segment_shift` property
 
 ```python
 @dataclass(frozen=True)
 class TourillonConfig:
     # ... all fields from the previous proposal ...
-    segment_shift: int = 4          # NEW — immutable after cluster bootstrap
+    @property
+    def segment_shift(self) -> int: ...
     # ... remaining unchanged fields ...
 ```
 
@@ -1073,31 +956,26 @@ class TourillonConfig:
 Files **created or modified** by this proposal (in mandatory creation order):
 
 ```
-tourillon/core/structure/config.py               MODIFIED — adds segment_shift: int = 4
-tourillon/core/ring/__init__.py                  CREATE (package marker)
-tourillon/core/ring/hashspace.py                 existing — HashSpace
-tourillon/core/ring/vnode.py                     existing — VNode
-tourillon/core/ring/ring.py                      existing — Ring
-tourillon/core/ring/partitioner.py               existing — Partitioner, LogicalPartition,
+tourillon/core/structure/config.py               MODIFIED — keeps derived segment_shift
+tourillon/core/structure/ring.py                 NEW — HashSpace, VNode, Ring
+tourillon/core/structure/partition.py            NEW — Partitioner, LogicalPartition,
                                                             PartitionPlacement, PartitionRange
-tourillon/core/ring/placement.py                 existing — PlacementStrategy,
+tourillon/core/structure/member.py               MODIFIED — MemberPhase, Member, NodeState
+tourillon/core/services/topology.py              NEW — MemberRegistry, Topology,
+                                                            TopologyManager
+tourillon/core/services/placement.py             NEW — PlacementStrategy,
                                                             SimplePreferenceStrategy,
                                                             PreferenceEntry
-tourillon/core/ring/topology.py                  existing — Topology, TopologyManager
-tourillon/core/lifecycle/__init__.py             CREATE (package marker)
-tourillon/core/lifecycle/member.py               existing — MemberPhase, Member
-tourillon/core/lifecycle/registry.py             existing — MemberRegistry
-tourillon/core/lifecycle/state.py                existing — NodeState
-tourillon/core/lifecycle/phi.py                  existing — FailureDetector
-tourillon/core/lifecycle/probe.py                existing — MemberState, ProbeManager
-tourillon/core/lifecycle/bootstrap.py            MODIFIED — Partitioner now receives
-                                                            segment_shift from cfg
-tourillon/core/lifecycle/checks.py               existing — check_node_id_consistency,
-                                                            check_tokens_coherence
-tourillon/core/ports/state.py                    existing — StatePort, StateError
-tourillon/infra/store/__init__.py                CREATE (package marker)
-tourillon/infra/store/state.py                   existing — FileStateAdapter
-tourillon/infra/cli/node.py                      NEW — tourillon node start command
+tourillon/core/services/probe.py                 NEW — FailureDetector, MemberState,
+                                                            ProbeManager
+tourillon/core/services/starter.py               MODIFIED — startup checks and
+                                                            first-node bootstrap orchestration
+tourillon/core/machinery/state.py                MODIFIED — StatePersistence,
+                                                            FileStatePersistence
+tourillon/core/services/config.py                MODIFIED — config validation for
+                                                            segment_shift constraint
+tourillon/bootstrap/cli/node.py                  MODIFIED — `tourillon node start`
+tourillon/bootstrap/deps.py                      MODIFIED — setup_logging and runtime wiring
 tests/__init__.py                                CREATE (package marker)
 tests/unit/__init__.py                           CREATE (package marker)
 tests/unit/test_hashspace.py                     NEW — scenarios 1–3
@@ -1164,14 +1042,14 @@ E2e tests use `tmp_path` (pytest fixture) and real filesystem / subprocess.
 | 38 | unit | `ProbeManager()` | `await pm.state_of("node1")` | Returns `MemberState.UNKNOWN` (no observations) |
 | 39 | unit | `ProbeManager()` | `await pm.record_heartbeat("node1"); await pm.state_of("node1")` | Returns `MemberState.LIVE` (phi = 0.0 < threshold after first heartbeat) |
 | 40 | unit | `ProbeManager()` | `await pm.all_states_with_phi()` on an empty manager | Returns `[]` |
-| 41 | unit | `FileStateAdapter(tmp_path / "state.toml")` | `await adapter.load()` when file absent | Returns `None` |
-| 42 | unit | `FileStateAdapter(tmp_path / "state.toml")` | `await adapter.save(state); result = await adapter.load()` | `result` equals `state` on all fields: `node_id`, `phase`, `generation`, `seq`, `tokens`, `epoch`, `committed_pids`, `staging_pids` |
-| 43 | unit | `FileStateAdapter(tmp_path / "state.toml")` | `await adapter.save(state)` | No `state.tmp` file remains in `tmp_path` after save completes |
-| 44 | unit | `FileStateAdapter(tmp_path / "state.toml")` with a malformed TOML file | `await adapter.load()` | Raises `StateError` |
-| 45 | unit | `InMemoryStateAdapter()` returning `None`; `TopologyManager()`; `TourillonConfig(node_size=M, ...)` | `await run_first_node_bootstrap(cfg, state_adapter, tm, HashSpace(8))` | Returns `NodeState(phase=READY, generation=1, epoch=1)`; `len(state.tokens) == 4`; topology snapshot has 4 vnodes in ring |
-| 46 | unit | `InMemoryStateAdapter()` pre-seeded with READY `NodeState(tokens=(5,10,15,20), epoch=1)`; `TopologyManager()` | `await run_first_node_bootstrap(cfg, state_adapter, tm, HashSpace(8))` | Returns the same `NodeState`; no new state written; topology has 4 vnodes; `save()` call count is `0` |
-| 47 | unit | `InMemoryStateAdapter()` pre-seeded with `NodeState(phase=JOINING)` | `await run_first_node_bootstrap(cfg, state_adapter, tm, HashSpace(8))` | Raises `BootstrapError` with `exit_code == 1` |
-| 48 | unit | — | `check_node_id_consistency("node-a", "node-b")` | Raises `NodeIdMismatchError` |
+| 41 | unit | `FileStatePersistence(tmp_path / "state.toml", config_rw)` | `await adapter.load()` when file absent | Returns `None` |
+| 42 | unit | `FileStatePersistence(tmp_path / "state.toml", config_rw)` | `await adapter.save(state); result = await adapter.load()` | `result` equals `state` on all fields: `node_id`, `phase`, `generation`, `seq`, `tokens`, `epoch`, `committed_pids`, `staging_pids` |
+| 43 | unit | `FileStatePersistence(tmp_path / "state.toml", config_rw)` | `await adapter.save(state)` | No stray temp file remains in `tmp_path` after save completes |
+| 44 | unit | `FileStatePersistence(tmp_path / "state.toml", config_rw)` with malformed TOML | `await adapter.load()` | Raises `StateError` |
+| 45 | unit | `InMemoryStatePersistence()` returning `None`; `TopologyManager()`; `TourillonConfig(node_size=M, ...)` | first-node bootstrap path in `NodeStarter` | Returns `NodeState(phase=READY, generation=1, epoch=1)`; `len(state.tokens) == 4`; topology snapshot has 4 vnodes in ring |
+| 46 | unit | `InMemoryStatePersistence()` pre-seeded with READY `NodeState(tokens=(5,10,15,20), epoch=1)`; `TopologyManager()` | crash-recovery bootstrap path in `NodeStarter` | Returns the same `NodeState`; no new state written; topology has 4 vnodes; `save()` call count is `0` |
+| 47 | unit | `InMemoryStatePersistence()` pre-seeded with `NodeState(phase=JOINING)` | first-node bootstrap dispatch in `NodeStarter` | Raises `BootstrapError` with `exit_code == 1` |
+| 48 | unit | — | `NodeStarter.check_node_id_consistency("node-a", "node-b")` | Raises `NodeIdMismatchError` |
 | 49 | e2e | `tmp_path`; valid `config.toml` (from proposal 001 generate); node not yet started | `subprocess tourillon node start --config config.toml` (start then SIGINT) | Process exits cleanly; `state.toml` exists in `data_dir`; `phase = "ready"`; `len(tokens) == cfg.node_size.token_count` |
 | 50 | e2e | `tmp_path`; valid `config.toml`; pre-written READY `state.toml` with tokens `T` | `subprocess tourillon node start --config config.toml` (start then SIGINT) | Process exits cleanly; tokens in `state.toml` are unchanged (`T`); no new `state.toml` written during restart |
 
@@ -1183,13 +1061,13 @@ E2e tests use `tmp_path` (pytest fixture) and real filesystem / subprocess.
 - [ ] `uv run pytest --cov=tourillon --cov-fail-under=90` passes.
 - [ ] `uv run ruff check tourillon/ tests/` passes with zero violations.
 - [ ] `uv run black --check tourillon/ tests/` passes.
-- [ ] `TourillonConfig` has a `segment_shift: int = 4` field; `load_config` validates `segment_shift < partition_shift`.
+- [ ] `TourillonConfig.segment_shift` is available as a derived immutable property; config loading validates `segment_shift < partition_shift`.
 - [ ] `Partitioner.__init__` raises `ValueError` when `partition_shift >= hash_space.bits` or `segment_shift >= partition_shift`.
-- [ ] `run_first_node_bootstrap` calls `state_port.save()` before `topology_mgr.apply_member()` on the `IDLE` path (write-before-announce).
-- [ ] `run_first_node_bootstrap` does not call `state_port.save()` on the crash-recovery `READY` path.
-- [ ] `run_first_node_bootstrap` raises `BootstrapError(exit_code=1)` for any phase other than `IDLE` or `READY`.
-- [ ] `FileStateAdapter.save()` leaves no temp file on disk after a successful write.
-- [ ] `FileStateAdapter.load()` returns `None` when `state.toml` is absent.
+- [ ] First-node bootstrap orchestration in `NodeStarter` calls `state.save()` before topology mutation on the `IDLE` path (write-before-announce).
+- [ ] Crash-recovery `READY` startup path does not persist a new state snapshot.
+- [ ] Invalid persisted phases still raise `BootstrapError(exit_code=1)`.
+- [ ] `FileStatePersistence.save()` leaves no temp file on disk after a successful write.
+- [ ] `FileStatePersistence.load()` returns `None` when `state.toml` is absent.
 - [ ] `state.toml` round-trip via `_encode_state` / `_parse_state` preserves all eight `NodeState` fields.
 - [ ] `TopologyManager.apply_member` adds vnodes to ring on `IDLE/JOINING → READY` transition.
 - [ ] `TopologyManager.apply_member` removes vnodes from ring on `DRAINING → IDLE` transition.
@@ -1216,5 +1094,5 @@ E2e tests use `tmp_path` (pytest fixture) and real filesystem / subprocess.
 - `BackendStorage` port and `PartitionStore` implementation — covered by a later proposal.
 - TLS certificate rotation — static for the node lifetime; requires a restart.
 - Heterogeneous `HashSpace.bits` across nodes — detected at gossip time; not reachable via `node start`.
-- `TcpClient` connection pooling — `core/transport/pool.py` exists; wiring deferred to proposals requiring pooled connections.
+- `TcpClient` connection pooling — deferred to proposals that introduce pooled client wiring.
 - Process supervision, systemd unit files, or container entry points.

@@ -14,12 +14,13 @@ dependencies = [
   "rich>=13",
   "tomli-w>=1.1",
   "typer>=0.12",
-  "cryptography==46.0.3"
+  "cryptography==46.0.3",
+  "lmdb>=2.2.1"
 ]
 
 [project.scripts]
-tourillon = "tourillon.infra.cli.main:app"
-tourctl = "tourctl.bootstrap.main:app"
+tourillon = "tourillon.bootstrap:main"
+tourctl = "tourctl.bootstrap:main"
 
 [project.optional-dependencies]
 dev = [
