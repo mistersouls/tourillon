@@ -79,15 +79,10 @@ class RangeSet:
                 yield PartitionTransfer(pid=pid, src=transfer.src, dst=transfer.dst)
 
 
+@dataclass
 class RebalancePlan:
     ranges: tuple[RangeTransfer]
     epoch: int
-    total_partitions: int
-
-    def expand(self) -> Iterator[PartitionTransfer]:
-        for transfer in self.ranges:
-            for pid in transfer.pids(self.total_partitions):
-                yield PartitionTransfer(pid=pid, src=transfer.src, dst=transfer.dst)
 
 
 class TransferState(StrEnum):

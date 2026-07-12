@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import logging
+from collections.abc import Awaitable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -58,6 +59,14 @@ class RebalanceApplicator:
         self._semaphore = asyncio.Semaphore(max_concurrency)
 
     async def apply(self, plan: RebalancePlan) -> None:
+        """Apply a new rebalance plan and manage the lifecycle of transfer tasks.
+
+        This method must be called **sequentially**. Concurrent calls are not safe.
+        The caller is responsible for ensuring that `apply(plan1)` completes before
+        `apply(plan2)` is invoked.
+
+        To await completion of all transfers, call `wait()` after `apply()`.
+        """
         new_epoch = plan.epoch
 
         logger.info(f"applying new rebalance plan epoch={new_epoch}")
@@ -173,7 +182,15 @@ class RebalanceApplicator:
         )
         streams = client.stream(plan_env, timeout=None)
 
-        resp = await anext(streams)
+        resp = await self._next_peer_response(
+            streams,
+            peer_stream=peer_stream,
+            peer=peer,
+            require_response=True,
+        )
+        if resp is None:
+            return
+
         if resp.kind == "rebalance.plan.reject":
             data = self._serializer.decode(resp.payload)
             raise ProcessError(f"plan rejected: {data.get('reason', 'unknown')}")
@@ -196,38 +213,82 @@ class RebalanceApplicator:
             *[handle.queue.put(msg_plan) for handle in peer_stream.handles.values()]
         )
 
-        async for resp in streams:
-            if peer_stream.cancel_event.is_set():
+        while True:
+            resp = await self._next_peer_response(
+                streams,
+                peer_stream=peer_stream,
+                peer=peer,
+            )
+            if resp is None:
                 break
 
-            data = self._serializer.decode(resp.payload)
-            self._validate_stream_epoch(
-                peer=peer, kind=resp.kind, epoch=data.get("epoch")
-            )
-            if "transfer_id" not in data:
-                logger.warning(
-                    f"transfer_id missing in response from "
-                    f"peer={peer}, kind={resp.kind}"
-                )
-                continue
-
-            transfer_id = data["transfer_id"]
-            logger.debug(
-                f"received envelope for transfer_id={transfer_id}, kind={resp.kind}"
-            )
-
-            handle = peer_stream.handles.get(transfer_id)
-            if handle is None:
-                logger.debug(f"transfer_id={transfer_id} is dropped or canceled")
-                continue
-
-            message = TransferMessage(
+            await self._route_peer_response(
+                resp,
+                peer=peer,
+                peer_stream=peer_stream,
                 client=client,
-                kind=resp.kind,
-                payload=data,
                 correlation_id=plan_env.correlation_id,
             )
-            await handle.queue.put(message)
+
+    async def _next_peer_response(
+        self,
+        streams: Any,
+        *,
+        peer_stream: PeerStream,
+        peer: str,
+        require_response: bool = False,
+    ) -> Envelope | None:
+        try:
+            resp = await self._wait_for_result(
+                anext(streams),
+                cancel_event=peer_stream.cancel_event,
+            )
+        except StopAsyncIteration as exc:
+            if require_response:
+                raise ProcessError(
+                    f"peer={peer} stream closed before plan response"
+                ) from exc
+            return None
+
+        if resp is None:
+            logger.info("stream for peer=%s canceled", peer)
+
+        return resp
+
+    async def _route_peer_response(
+        self,
+        resp: Envelope,
+        *,
+        peer: str,
+        peer_stream: PeerStream,
+        client: TcpClient,
+        correlation_id: Any,
+    ) -> None:
+        data = self._serializer.decode(resp.payload)
+        self._validate_stream_epoch(peer=peer, kind=resp.kind, epoch=data.get("epoch"))
+        if "transfer_id" not in data:
+            logger.warning(
+                f"transfer_id missing in response from peer={peer}, kind={resp.kind}"
+            )
+            return
+
+        transfer_id = data["transfer_id"]
+        logger.debug(
+            f"received envelope for transfer_id={transfer_id}, kind={resp.kind}"
+        )
+
+        handle = peer_stream.handles.get(transfer_id)
+        if handle is None:
+            logger.debug(f"transfer_id={transfer_id} is dropped or canceled")
+            return
+
+        message = TransferMessage(
+            client=client,
+            kind=resp.kind,
+            payload=data,
+            correlation_id=correlation_id,
+        )
+        await handle.queue.put(message)
 
     def _validate_stream_epoch(
         self,
@@ -284,7 +345,6 @@ class RebalanceApplicator:
         for peer, stream in self._streams.items():
             if not stream.cancel_event.is_set():
                 stream.cancel_event.set()
-                self._cancel_peer_task(peer)
                 logger.info(
                     f"peer={peer} for stream canceled due to "
                     f"new plan (epoch={new_epoch})"
@@ -329,22 +389,12 @@ class RebalanceApplicator:
         received_commit_ok = False
 
         while not handle.cancel_event.is_set():
-            queue_task = asyncio.create_task(handle.queue.get())
-            cancel_task = asyncio.create_task(handle.cancel_event.wait())
-
-            done, pending = await asyncio.wait(
-                [queue_task, cancel_task],
-                return_when=asyncio.FIRST_COMPLETED,
+            msg = await self._wait_for_result(
+                handle.queue.get(),
+                cancel_event=handle.cancel_event,
             )
-
-            # Cancel pending tasks
-            for task in pending:
-                task.cancel()
-
-            if handle.cancel_event.is_set():
+            if msg is None:
                 break
-
-            msg = await queue_task
 
             if msg.kind == "rebalance.plan.ok":
                 logger.debug(
@@ -395,22 +445,12 @@ class RebalanceApplicator:
         received_commit = False
 
         while not handle.cancel_event.is_set():
-            queue_task = asyncio.create_task(handle.queue.get())
-            cancel_task = asyncio.create_task(handle.cancel_event.wait())
-
-            done, pending = await asyncio.wait(
-                [queue_task, cancel_task],
-                return_when=asyncio.FIRST_COMPLETED,
+            msg = await self._wait_for_result(
+                handle.queue.get(),
+                cancel_event=handle.cancel_event,
             )
-
-            # Cancel pending tasks
-            for task in pending:
-                task.cancel()
-
-            if handle.cancel_event.is_set():
+            if msg is None:
                 break
-
-            msg = await queue_task
 
             if msg.kind == "rebalance.plan.ok":
                 logger.debug(
@@ -527,6 +567,33 @@ class RebalanceApplicator:
             logger.debug(f"transfer={handle.transfer.id} semaphore acquired")
             await self._attempt_transfer(handle)
 
+    @staticmethod
+    async def _wait_for_result[T](
+        awaitable: Awaitable[T],
+        *,
+        cancel_event: asyncio.Event,
+    ) -> T | None:
+        """Wait for an awaitable result or a cancellation signal.
+
+        Returns the awaited result, or ``None`` if cancellation wins the race.
+        This helper is shared by transfer-handle queue reads and peer stream reads.
+        """
+        result_task = asyncio.ensure_future(awaitable)
+        cancel_task = asyncio.create_task(cancel_event.wait())
+
+        done, pending = await asyncio.wait(
+            [result_task, cancel_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        for task in pending:
+            task.cancel()
+
+        if cancel_event.is_set() or result_task not in done:
+            return None
+
+        return result_task.result()
+
     async def _on_cancelled(self, handle: TransferHandle) -> None:
         """Call staging.cleanup() and signal the WaitGroup."""
         pid = handle.transfer.pid
@@ -601,32 +668,44 @@ class RebalanceApplicator:
             dst = range_transfer.dst
             transfer = PartitionTransfer(pid=pid, src=src, dst=dst)
             transfer_id = transfer.id
+            new.add(transfer_id)
+
             if transfer_id not in old_handles:
                 handle = TransferHandle(
                     transfer=transfer,
                     state=TransferState.PENDING,
                     epoch=epoch,
                 )
-                new.add(transfer_id)
                 old_handles[transfer_id] = handle
+                handles[transfer_id] = handle
                 await self._wg.add(1)
                 loop.create_task(self._handle_transfer(handle))
                 logger.debug(f"transfer_id={transfer_id} started")
             else:
                 handle = old_handles[transfer_id]
+                handle.epoch = epoch
+                handles[transfer_id] = handle
                 if handle.state == TransferState.COMMITTED:
                     # Skip terminal handles that already succeeded.
                     logger.debug(
                         f"transfer_id={transfer_id} already committed, skipping"
                     )
+                    handles[transfer_id] = handle
                     continue
 
-                # Reinitialize handle for reuse in new plan.
-                handle.cancel_event.clear()
-                handle.queue = asyncio.Queue()
-                handle.epoch = epoch
-
-            handles[transfer_id] = handle
+                if handle.state in (TransferState.FAILED, TransferState.CANCELLED):
+                    handle = TransferHandle(
+                        transfer=transfer,
+                        state=TransferState.PENDING,
+                        epoch=epoch,
+                    )
+                    old_handles[transfer_id] = handle
+                    await self._wg.add(1)
+                    loop.create_task(self._handle_transfer(handle))
+                    logger.debug(
+                        f"transfer_id={transfer_id} restarted from state={handle.state}"
+                    )
+                    handles[transfer_id] = handle
 
         return handles, new
 
@@ -711,7 +790,12 @@ class RebalanceApplicator:
         digest: Any,
         resume: Key | None,
     ) -> None:
-        """Scan local store and push rebalance.transfer chunks to destination."""
+        """Scan the local store and push rebalance.transfer chunks to the peer.
+
+        ``chunk_bytes`` is tracked as an observability metric and for approximate
+        chunk sizing. The actual on-wire payload is produced later when the
+        records are serialized into the envelope.
+        """
         store = await self._storage.open_by_pid(handle.transfer.pid)
         chunk_buf: list[dict[str, Any]] = []
         chunk_bytes = 0
