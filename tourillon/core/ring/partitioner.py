@@ -228,6 +228,7 @@ class Partitioner:
             if prev is None:
                 prev = ring.predecessor(vnode.token)
 
+            assert prev is not None
             start_pid = self.pid_for_hash(prev.token)
             end_pid = self._pid_successor(vnode.token)
             count = self.range_size(start_pid, end_pid)

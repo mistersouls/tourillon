@@ -3,7 +3,6 @@ import logging
 import secrets
 import ssl
 from dataclasses import dataclass
-from email import message
 from typing import Any
 
 from tourillon.core.exceptions import (
@@ -349,12 +348,14 @@ class NodeStarter:
         self, partitioner: Partitioner, node_id: str
     ) -> None:
         snapshot = await self._topology.snapshot()
-        ranges = partitioner.ranges_for(node_id, snapshot.ring)
         logger.info(
             "Partition ranges owned (%d total partitions):",
             partitioner.total_partitions,
         )
-        for partition_range in ranges:
+        for partition_range in partitioner.ranges_for(snapshot.ring):
+            if partition_range.owner.node_id != node_id:
+                continue
+
             token_prefix = f"{partition_range.owner.token:032x}"[:8]
             token_hex = f"0x{token_prefix}..."
             wrap_marker = "(w)" if partition_range.wraps else ""
@@ -573,7 +574,7 @@ class NodeStarter:
     def _start_bootstrap_task(self, seeds: list[str]) -> asyncio.Task[None]:
         loop = asyncio.get_running_loop()
         return loop.create_task(
-                self._full_resync(seeds),
+            self._full_resync(seeds),
             name="gossip.bootstrap",
         )
 
