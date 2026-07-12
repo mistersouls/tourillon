@@ -32,7 +32,7 @@ class PartitionTransfer:
 class RangeTransfer:
     start_pid: int
     end_pid: int
-    count: int
+    count: int  # deprecated
     src: str
     dst: str
 
@@ -47,6 +47,13 @@ class RangeTransfer:
             "src": self.src,
             "dst": self.dst,
         }
+
+    def size(self, total_partitions: int) -> int:
+        return (
+            (total_partitions - self.start_pid) + self.end_pid + 1
+            if self.start_pid > self.end_pid
+            else self.end_pid - self.start_pid + 1
+        )
 
     def pids(self, total_partitions: int) -> Iterator[int]:
         """Yield all partition ids covered by this range in logical order.
@@ -63,10 +70,11 @@ class RangeTransfer:
 @dataclass(frozen=True, eq=True)
 class RangeSet:
     peer: str
-    transfers: list[RangeTransfer]
+    transfers: dict[str, RangeTransfer]
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def expand(self, total_partitions) -> Iterator[PartitionTransfer]:
-        for transfer in self.transfers:
+        for transfer in self.transfers.values():
             for pid in transfer.pids(total_partitions):
                 yield PartitionTransfer(pid=pid, src=transfer.src, dst=transfer.dst)
 
@@ -92,6 +100,14 @@ class TransferState(StrEnum):
 
 
 @dataclass
+class TransferMessage:
+    client: TcpClient
+    kind: str
+    payload: dict[str, Any]
+    correlation_id: uuid.UUID
+
+
+@dataclass
 class TransferHandle:
     """Mutable tracking record for one in-flight range transfer.
 
@@ -104,13 +120,20 @@ class TransferHandle:
 
     transfer: PartitionTransfer
     state: TransferState
-    client: TcpClient
-    correlation_id: uuid.UUID
-    queue: asyncio.Queue[Envelope] =field(default_factory=asyncio.Queue)
+    queue: asyncio.Queue[TransferMessage] = field(default_factory=asyncio.Queue)
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     chunks_done: int = 0
     chunks_total: int | None = None
     bytes_done: int = 0
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    last_error: str | None = None
+
+
+@dataclass
+class PeerStream:
+    peer: str
+    transfers: list[RangeTransfer] = field(default_factory=list)
+    handles: dict[str, TransferHandle] = field(default_factory=dict)
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     last_error: str | None = None

@@ -105,7 +105,7 @@ class TcpClient:
     async def stream(
         self,
         env: Envelope,
-        timeout: float = RESPONSE_TIMEOUT,
+        timeout: float | None = RESPONSE_TIMEOUT,
     ) -> AsyncIterator[Envelope]:
         """Send *env* and yield every response Envelope sharing its correlation_id.
 
@@ -125,9 +125,13 @@ class TcpClient:
 
         try:
             while True:
-                item = await self._dequeue_with_timeout(
-                    queue, timeout, env.correlation_id
-                )
+                if timeout is not None:
+                    item = await self._dequeue_with_timeout(
+                        queue, timeout, env.correlation_id
+                    )
+                else:
+                    item = await queue.get()
+
                 if item is _STREAM_CLOSED:
                     raise ConnectionClosedError()
                 yield item
