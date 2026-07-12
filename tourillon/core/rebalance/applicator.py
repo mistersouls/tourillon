@@ -1,7 +1,6 @@
 import asyncio
 import hashlib
 import logging
-import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -90,7 +89,7 @@ class RebalanceApplicator:
             stream = streams[peer]
             stream.transfers.append(range_transfer)
             handles, new = await self._resolve_transfer_handles(
-                range_transfer, self._handles
+                range_transfer, self._handles, new_epoch
             )
             stream.handles.update(handles)
             new_transfers.update(new)
@@ -116,6 +115,9 @@ class RebalanceApplicator:
                 f"started rebalance for peer={peer} (epoch={self._epoch}), "
                 f"ranges={len(stream.transfers)}, transfers={len(stream.handles)}"
             )
+
+    async def wait(self) -> tuple[list[str], list[str]]:
+        return await self._wg.wait()
 
     async def _apply_peer(self, peer_stream: PeerStream) -> None:
         peer = peer_stream.peer
@@ -199,7 +201,9 @@ class RebalanceApplicator:
                 break
 
             data = self._serializer.decode(resp.payload)
-            self._validate_stream_epoch(peer=peer, kind=resp.kind, epoch=data.get("epoch"))
+            self._validate_stream_epoch(
+                peer=peer, kind=resp.kind, epoch=data.get("epoch")
+            )
             if "transfer_id" not in data:
                 logger.warning(
                     f"transfer_id missing in response from "
@@ -319,7 +323,7 @@ class RebalanceApplicator:
     async def _do_incoming_transfer(self, handle: TransferHandle) -> None:
         pid = handle.transfer.pid
         store = await self._storage.open_by_pid(pid)
-        staging = store.staging(self._epoch)
+        staging = store.staging(handle.epoch)
         digest = hashlib.sha256()
         is_last_seen = False
         received_commit_ok = False
@@ -350,7 +354,7 @@ class RebalanceApplicator:
                 resume_from = await staging.last_staged_key()
                 resume_payload = self._serializer.encode(
                     {
-                        "epoch": self._epoch,
+                        "epoch": handle.epoch,
                         "transfer_id": handle.transfer.id,
                         "resume_from": resume_from.to_dict() if resume_from else None,
                     }
@@ -453,12 +457,10 @@ class RebalanceApplicator:
             data = msg.payload
             await self._stage_chunk(handle, staging, data, digest)
             is_last_seen = await self._send_commit_if_last(
-                data=data,
+                msg=msg,
+                handle=handle,
                 digest_hex=digest.hexdigest(),
                 is_last_seen=is_last_seen,
-                transfer_id=handle.transfer.id,
-                client=msg.client,
-                correlation_id=msg.correlation_id,
             )
             return False, is_last_seen
         if msg.kind == "rebalance.commit.ok":
@@ -492,7 +494,7 @@ class RebalanceApplicator:
                     Envelope(
                         kind="rebalance.commit.reject",
                         payload=self._serializer.encode(
-                            {"epoch": self._epoch, "transfer_id": transfer_id}
+                            {"epoch": handle.epoch, "transfer_id": transfer_id}
                         ),
                         correlation_id=correlation_id,
                         schema_id=self._serializer.schema_id,
@@ -505,7 +507,7 @@ class RebalanceApplicator:
                 Envelope(
                     kind="rebalance.commit.ok",
                     payload=self._serializer.encode(
-                        {"epoch": self._epoch, "transfer_id": transfer_id}
+                        {"epoch": handle.epoch, "transfer_id": transfer_id}
                     ),
                     correlation_id=correlation_id,
                     schema_id=self._serializer.schema_id,
@@ -529,7 +531,7 @@ class RebalanceApplicator:
         """Call staging.cleanup() and signal the WaitGroup."""
         pid = handle.transfer.pid
         transfer_id = handle.transfer.id
-        epoch = self._epoch
+        epoch = handle.epoch
 
         try:
             store = await self._storage.open_by_pid(pid)
@@ -585,7 +587,10 @@ class RebalanceApplicator:
         logger.debug(f"peer={peer} apply task completed")
 
     async def _resolve_transfer_handles(
-        self, range_transfer: RangeTransfer, old_handles: dict[str, TransferHandle]
+        self,
+        range_transfer: RangeTransfer,
+        old_handles: dict[str, TransferHandle],
+        epoch: int,
     ) -> tuple[dict[str, TransferHandle], set[str]]:
         handles: dict[str, TransferHandle] = {}
         new: set[str] = set()
@@ -597,13 +602,29 @@ class RebalanceApplicator:
             transfer = PartitionTransfer(pid=pid, src=src, dst=dst)
             transfer_id = transfer.id
             if transfer_id not in old_handles:
-                handle = TransferHandle(transfer=transfer, state=TransferState.PENDING)
+                handle = TransferHandle(
+                    transfer=transfer,
+                    state=TransferState.PENDING,
+                    epoch=epoch,
+                )
                 new.add(transfer_id)
+                old_handles[transfer_id] = handle
                 await self._wg.add(1)
                 loop.create_task(self._handle_transfer(handle))
                 logger.debug(f"transfer_id={transfer_id} started")
             else:
                 handle = old_handles[transfer_id]
+                if handle.state == TransferState.COMMITTED:
+                    # Skip terminal handles that already succeeded.
+                    logger.debug(
+                        f"transfer_id={transfer_id} already committed, skipping"
+                    )
+                    continue
+
+                # Reinitialize handle for reuse in new plan.
+                handle.cancel_event.clear()
+                handle.queue = asyncio.Queue()
+                handle.epoch = epoch
 
             handles[transfer_id] = handle
 
@@ -611,36 +632,39 @@ class RebalanceApplicator:
 
     async def _send_commit_if_last(
         self,
-        data: dict[str, Any],
+        handle: TransferHandle,
+        msg: TransferMessage,
         digest_hex: str,
         is_last_seen: bool,
-        transfer_id: str,
-        client: TcpClient,
-        correlation_id: uuid.UUID,
     ) -> bool:
         """Send rebalance.commit when data['is_last'] is True and not yet sent.
 
         Return the updated is_last_seen flag so the caller can suppress any
         duplicate is_last chunks that may arrive on a resumed stream.
         """
+        data = msg.payload
         if not data.get("is_last") or is_last_seen:
             return is_last_seen
 
         commit_env = Envelope(
             kind="rebalance.commit",
             payload=self._serializer.encode(
-                {"epoch": self._epoch, "transfer_id": transfer_id, "digest": digest_hex}
+                {
+                    "epoch": handle.epoch,
+                    "transfer_id": handle.transfer.id,
+                    "digest": digest_hex,
+                }
             ),
-            correlation_id=correlation_id,
+            correlation_id=msg.correlation_id,
             schema_id=self._serializer.schema_id,
         )
-        await client.send(commit_env)
+        await msg.client.send(commit_env)
         return True
 
     async def _send_chunk(
         self,
         msg: TransferMessage,
-        transfer_id: str,
+        handle: TransferHandle,
         seq: int,
         recs: list[dict[str, Any]],
         is_last: bool,
@@ -648,8 +672,8 @@ class RebalanceApplicator:
         """Push one rebalance.transfer chunk to the destination."""
         payload = self._serializer.encode(
             {
-                "epoch": self._epoch,
-                "transfer_id": transfer_id,
+                "epoch": handle.epoch,
+                "transfer_id": handle.transfer.id,
                 "chunk_seq": seq,
                 "is_last": is_last,
                 "records": recs,
@@ -689,7 +713,6 @@ class RebalanceApplicator:
     ) -> None:
         """Scan local store and push rebalance.transfer chunks to destination."""
         store = await self._storage.open_by_pid(handle.transfer.pid)
-        transfer_id = handle.transfer.id
         chunk_buf: list[dict[str, Any]] = []
         chunk_bytes = 0
         chunk_seq = 0
@@ -701,7 +724,9 @@ class RebalanceApplicator:
             encoded_len = len(encoded)
 
             if chunk_buf and chunk_bytes + encoded_len > self._max_chunk_bytes:
-                await self._send_chunk(msg, transfer_id, chunk_seq, chunk_buf, False)
+                await self._send_chunk(
+                    msg, handle, chunk_seq, chunk_buf, False
+                )
                 handle.bytes_done += chunk_bytes
                 chunk_seq += 1
                 handle.chunks_done = chunk_seq
@@ -712,13 +737,13 @@ class RebalanceApplicator:
             chunk_bytes += encoded_len
 
         if chunk_buf:
-            await self._send_chunk(msg, transfer_id, chunk_seq, chunk_buf, True)
+            await self._send_chunk(msg, handle, chunk_seq, chunk_buf, True)
             handle.bytes_done += chunk_bytes
             chunk_seq += 1
             handle.chunks_done = chunk_seq
         else:
             # Explicitly terminate empty scans with a final marker chunk.
-            await self._send_chunk(msg, transfer_id, chunk_seq, [], True)
+            await self._send_chunk(msg, handle, chunk_seq, [], True)
             chunk_seq += 1
             handle.chunks_done = chunk_seq
 

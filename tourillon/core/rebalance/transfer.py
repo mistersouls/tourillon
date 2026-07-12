@@ -6,7 +6,6 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from tourlib.envelope import Envelope
 from tourlib.transport import TcpClient
 
 
@@ -16,6 +15,7 @@ class PartitionTransfer:
 
     Never serialised on the wire. Produced by RangeTransfer.expand().
     """
+
     pid: int
     src: str
     dst: str
@@ -78,6 +78,7 @@ class RangeSet:
             for pid in transfer.pids(total_partitions):
                 yield PartitionTransfer(pid=pid, src=transfer.src, dst=transfer.dst)
 
+
 class RebalancePlan:
     ranges: tuple[RangeTransfer]
     epoch: int
@@ -120,6 +121,7 @@ class TransferHandle:
 
     transfer: PartitionTransfer
     state: TransferState
+    epoch: int
     queue: asyncio.Queue[TransferMessage] = field(default_factory=asyncio.Queue)
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     chunks_done: int = 0
