@@ -31,5 +31,5 @@ class LMDBStorage:
         segment = self._partitioner.segment_for(pid)
         async with self._lock:
             if segment not in self._backends:
-                self._backends[segment] = LmdbBackendStorage(self._conf)
+                self._backends[segment] = LmdbBackendStorage(self._conf, str(segment))
             return self._backends[segment]

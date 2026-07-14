@@ -2,6 +2,8 @@ import logging
 from typing import Any
 
 from tourillon.core.machinery.state import StatePersistence
+from tourillon.core.ports.storage import Storage
+from tourillon.core.ring.partitioner import Partitioner
 from tourillon.core.ring.topology import TopologyManager
 from tourillon.core.services.drainer import NodeDrainer
 from tourillon.core.services.gossiper import Gossiper
@@ -24,6 +26,8 @@ class NodeManager:
         tls_ctx: TlsContext,
         state: StatePersistence,
         serializer: Serializer,
+        partitioner: Partitioner,
+        storage: Storage,
     ) -> None:
         self._cfg = cfg
         self._peer_dispatcher = peer_dispatcher
@@ -32,6 +36,7 @@ class NodeManager:
         self._state = state
         self._serializer = serializer
         self._topology_manager = TopologyManager()
+        self._partitioner = partitioner
 
         self._starter = NodeStarter(
             cfg=cfg,
@@ -40,7 +45,9 @@ class NodeManager:
             tls_ctx=tls_ctx,
             state=state,
             serializer=serializer,
-            topology=self._topology_manager
+            topology=self._topology_manager,
+            partitioner=self._partitioner,
+            storage=storage,
         )
         self._drainer = NodeDrainer(state)
         self._gossiper = Gossiper(

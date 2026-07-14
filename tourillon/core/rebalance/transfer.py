@@ -81,7 +81,7 @@ class RangeSet:
 
 @dataclass
 class RebalancePlan:
-    ranges: tuple[RangeTransfer]
+    ranges: tuple[RangeTransfer, ...]
     epoch: int
 
 

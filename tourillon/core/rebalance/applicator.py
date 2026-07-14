@@ -156,6 +156,9 @@ class RebalanceApplicator:
                     logger.error(
                         f"peer={peer} stream attempt reached max_retries={max_retries}: {exc}"
                     )
+                    for handle in peer_stream.handles.values():
+                        handle.cancel_event.set()
+
                     return
 
                 try:

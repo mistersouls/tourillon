@@ -4,7 +4,7 @@ from pathlib import Path
 
 import typer
 
-from tourillon.bootstrap.deps import get_core, get_state, setup_logging
+from tourillon.bootstrap.deps import get_core, get_state, setup_logging, get_storage
 from tourillon.core.exceptions import (
     BootstrapError,
     ConfigError,
@@ -12,6 +12,8 @@ from tourillon.core.exceptions import (
     StateError,
 )
 from tourillon.core.helpers.utils import scan
+from tourillon.core.ring.hashspace import HashSpace
+from tourillon.core.ring.partitioner import Partitioner
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -31,7 +33,10 @@ def node_start(
         core = get_core()
         cfg = core.config.load_config(config)
         state = get_state(cfg)
-        core.setup(cfg, state)
+        space = HashSpace(bits=128)
+        partitioner = Partitioner(space, cfg.partition_shift, cfg.segment_shift)
+        storage = get_storage(cfg.data_dir, partitioner)
+        core.setup(cfg=cfg, state=state, storage=storage, partitioner=partitioner)
         asyncio.run(core.node.start(seeds=seeds))
     except (BootstrapError, ConfigError, NodeIdMismatchError, StateError) as exc:
         typer.echo(f"Error: {exc}", err=True)

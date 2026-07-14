@@ -1,5 +1,7 @@
 from tourillon.core.machinery.state import StatePersistence
 from tourillon.core.ports.pki import X509CertificateIssuer
+from tourillon.core.ports.storage import Storage
+from tourillon.core.ring.partitioner import Partitioner
 from tourillon.core.services.config import NodeConfigService
 from tourillon.core.services.manager import NodeManager
 from tourillon.core.structure.config import TourillonConfig
@@ -17,7 +19,7 @@ class TourillonCore:
         cert_issuer: X509CertificateIssuer,
         serializer: Serializer,
         peer_dispatcher: Dispatcher,
-        kv_dispatcher: Dispatcher
+        kv_dispatcher: Dispatcher,
     ) -> None:
         self._config_rw = config_rw
         self._tls_ctx = tls_ctx
@@ -31,7 +33,13 @@ class TourillonCore:
         self._state: StatePersistence | None = None
         self._initialized = False
 
-    def setup(self, cfg: TourillonConfig, state: StatePersistence) -> None:
+    def setup(
+        self, *,
+        cfg: TourillonConfig,
+        state: StatePersistence,
+        partitioner: Partitioner,
+        storage: Storage,
+    ) -> None:
         if self._initialized:
             raise RuntimeError("NodeManager already initialized.")
 
@@ -43,6 +51,8 @@ class TourillonCore:
             kv_dispatcher=self._kv_dispatcher,
             state=state,
             serializer=self._serializer,
+            partitioner=partitioner,
+            storage=storage,
         )
         self._state = state
 
@@ -53,7 +63,7 @@ class TourillonCore:
     @property
     def node(self) -> NodeManager:
         if self._node is None:
-            raise RuntimeError("NodeManager not initialized. Call setup_node first.")
+            raise RuntimeError("NodeManager not initialized. Call setup first.")
         return self._node
 
     @property
@@ -63,5 +73,5 @@ class TourillonCore:
     @property
     def state(self) -> StatePersistence:
         if self._state is None:
-            raise RuntimeError("StatePersistence not initialized. Call setup_state first.")
+            raise RuntimeError("StatePersistence not initialized. Call setup first.")
         return self._state

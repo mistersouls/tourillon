@@ -21,9 +21,11 @@ from tourillon.core.helpers.utils import split_host_port
 from tourillon.core.lifecycle.probe import ProbeManager
 from tourillon.core.machinery.config import NodeSize
 from tourillon.core.machinery.state import StatePersistence
-from tourillon.core.ring.hashspace import HashSpace
+from tourillon.core.ports.storage import Storage
+from tourillon.core.rebalance.rebalancer import Rebalancer
 from tourillon.core.ring.partitioner import Partitioner
 from tourillon.core.ring.topology import TopologyManager
+from tourillon.core.ring.vnode import VNode
 from tourillon.core.structure.config import TourillonConfig
 from tourillon.core.structure.member import Member, MemberPhase, NodeState
 from tourillon.core.transport.client import PeerClientPool
@@ -55,7 +57,8 @@ class NodeStarter:
         state: StatePersistence,
         serializer: Serializer,
         topology: TopologyManager,
-        hash_space: HashSpace | None = None,
+        partitioner: Partitioner,
+        storage: Storage,
     ) -> None:
         self._cfg = cfg
         self._peer_dispatcher = peer_dispatcher
@@ -63,9 +66,9 @@ class NodeStarter:
         self._tls_ctx = tls_ctx
         self._state = state
         self._topology = topology or TopologyManager()
-        self._hash_space = hash_space or HashSpace(bits=128)
         self._probe = ProbeManager()
         self._serializer = serializer
+        self._storage = storage
 
         ssl_peer, ssl_kv = self._build_ssl_contexts(cfg)
         self._ssl_client = self._tls_ctx.build_client_ssl_context(
@@ -81,6 +84,16 @@ class NodeStarter:
             ssl_ctx=self._ssl_client,
             connect_timeout=cfg.gossip.bootstrap.connect_timeout,
         )
+        self._partitioner = partitioner
+        self._rebalancer = Rebalancer(
+            partitioner=self._partitioner,
+            node_id=cfg.node_id,
+            replication_factor=cfg.replication_factor,
+            storage=self._storage,
+            peer_pool=self._peer_pool,
+            serializer=self._serializer,
+            topology_mgr=self._topology,
+        )
         self._gossip = GossipEngine(
             node_id=cfg.node_id,
             topology_manager=self._topology,
@@ -91,7 +104,7 @@ class NodeStarter:
             on_failed=self._on_gossip_failed,
         )
         self._gossip_task: asyncio.Task[None] | None = None
-        self._bootstrap_task: asyncio.Task[None] | None = None
+        self._join_task: asyncio.Task[NodeState] | None = None
         self._peer_started = False
         self._kv_started = False
         self._effective_seeds = []
@@ -156,7 +169,10 @@ class NodeStarter:
         await self._topology.apply_member(joining_member)
         await self._ensure_gossip_running()
         await self._gossip.announce(joining_member)
-        self._bootstrap_task = self._start_bootstrap_task(self._effective_seeds)
+        self._join_task = self._trigger_join(
+            seeds=self._effective_seeds,
+            state=joining_state
+        )
         logger.info(
             "Node %s entered JOINING with %d seed(s).",
             self._cfg.node_id,
@@ -198,8 +214,8 @@ class NodeStarter:
         logger.info("KV  listener: %s:%d", kv_host, kv_port)
 
     async def stop_all(self) -> None:
-        if self._bootstrap_task is not None and not self._bootstrap_task.done():
-            self._bootstrap_task.cancel()
+        if self._join_task is not None and not self._join_task.done():
+            self._join_task.cancel()
         if self._gossip_task is not None:
             await self._gossip.stop()
             await asyncio.gather(self._gossip_task, return_exceptions=True)
@@ -258,12 +274,11 @@ class NodeStarter:
         await self._topology.apply_member(self._member_from_state(new_state))
         return new_state
 
-    def _build_partitioner(self) -> Partitioner:
-        return Partitioner(
-            hash_space=self._hash_space,
-            partition_shift=self._cfg.partition_shift,
-            segment_shift=self._cfg.segment_shift,
-        )
+    async def _apply_announce_and_persist(self, state: NodeState) -> None:
+        member = self._member_from_state(state)
+        await self._topology.apply_member(member)
+        await self._gossip.announce(member)
+        await self._state.save(state)
 
     def _build_ssl_contexts(
         self,
@@ -285,7 +300,6 @@ class NodeStarter:
         return ssl_peer, ssl_kv
 
     async def _build_startup_context(self) -> StartupContext:
-        self._build_partitioner()
         persisted = await self._state.load()
         if persisted is not None:
             self.check_node_id_consistency(self._cfg.node_id, persisted.node_id)
@@ -310,7 +324,7 @@ class NodeStarter:
         loop = asyncio.get_running_loop()
         self._gossip_task = loop.create_task(self._gossip.start(), name="gossip.engine")
 
-    async def _full_resync(self, seeds: list[str]) -> None:
+    async def _full_resync(self, seeds: list[str]) -> bool:
         bootstrapper = GossipBootstrapper(
             topology_manager=self._topology,
             config=self._cfg.gossip.bootstrap,
@@ -321,14 +335,16 @@ class NodeStarter:
         try:
             seeds_ok = await bootstrapper.run(seeds)
             self._gossip.stats.bootstrap_ok_total += seeds_ok
+            return True
         except GossipBootstrapError as exc:
             self._gossip.stats.bootstrap_err_total += 1
             logger.warning("Seed bootstrap failed: %s", exc)
+            return False
 
     def _generate_tokens(self, count: int) -> tuple[int, ...]:
         token_set: set[int] = set()
         while len(token_set) < count:
-            token_set.add(secrets.randbelow(self._hash_space.max))
+            token_set.add(secrets.randbelow(self._partitioner.space.max))
         return tuple(token_set)
 
     @staticmethod
@@ -343,6 +359,33 @@ class NodeStarter:
             committed_pids=state.committed_pids,
             epoch=state.epoch,
         )
+
+    async def _joining_to_ready(self, state: NodeState, seeds: list[str]) -> NodeState:
+        resync_ok = await self._full_resync(seeds)
+        snapshot = await self._topology.snapshot()
+        epoch = snapshot.epoch
+        if not resync_ok:
+            failed_state = self._next_state(state, MemberPhase.FAILED, epoch)
+            await self._apply_announce_and_persist(failed_state)
+            return failed_state
+
+        old_ring = snapshot.ring
+        vnodes = [VNode(state.node_id, t) for t in state.tokens]
+        new_ring = old_ring.add_vnodes(vnodes)
+        rebalance_ok = await self._rebalancer.rebalance(
+            old_ring, new_ring, epoch, wait=True
+        )
+        snapshot = await self._topology.snapshot()
+        epoch = snapshot.epoch
+
+        if not rebalance_ok:
+            failed_state = self._next_state(state, MemberPhase.FAILED, epoch)
+            await self._apply_announce_and_persist(failed_state)
+            return failed_state
+
+        ready_state = self._next_state(state, MemberPhase.READY, epoch)
+        await self._apply_announce_and_persist(ready_state)
+        return ready_state
 
     async def _log_partition_ranges(
         self, partitioner: Partitioner, node_id: str
@@ -388,6 +431,23 @@ class NodeStarter:
             phase=state.phase,
             tokens=state.tokens,
             partition_shift=self._cfg.partition_shift,
+        )
+
+    @staticmethod
+    def _next_state(
+        state: NodeState,
+        phase: MemberPhase,
+        epoch: int,
+    ) -> NodeState:
+        return NodeState(
+            node_id=state.node_id,
+            phase=phase,
+            generation=state.generation,
+            seq=state.seq + 1,
+            tokens=state.tokens,
+            epoch=epoch,
+            committed_pids=state.committed_pids,
+            staging_pids=state.staging_pids,
         )
 
     async def _on_gossip_failed(self) -> None:
@@ -459,8 +519,7 @@ class NodeStarter:
                 state.seq,
                 state.generation,
             )
-            partitioner = self._build_partitioner()
-            await self._log_partition_ranges(partitioner, state.node_id)
+            await self._log_partition_ranges(self._partitioner, state.node_id)
             await self.start_kv()
             await shutdown_event.wait()
         except asyncio.CancelledError:
@@ -479,19 +538,22 @@ class NodeStarter:
 
         match phase:
             case MemberPhase.JOINING:
-                ready_state = NodeState(
-                    node_id=state.node_id,
-                    phase=MemberPhase.READY,
-                    generation=state.generation,
-                    seq=state.seq + 1,
-                    epoch=state.epoch,
-                    tokens=state.tokens,
-                    committed_pids=state.committed_pids,
-                    staging_pids=state.staging_pids,
-                )
-                await self._run_transition_with_seeds(stop_event, seeds, ready_state)
+                await self.start_peer()
+                await self._log_partition_ranges(self._partitioner, state.node_id)
+                await self._joining_to_ready(state, seeds)
+                await self.start_kv()
+                await stop_event.wait()
             case MemberPhase.READY | MemberPhase.DRAINING:
                 await self._run_transition_with_seeds(stop_event, seeds, state)
+                await self.start_peer()
+                await self._log_partition_ranges(self._partitioner, state.node_id)
+                await self._full_resync(seeds)
+                await self._ensure_gossip_running()
+                member = self._member_from_state(state)
+                await self._topology.apply_member(member)
+                await self._gossip.announce(member)
+                await self.start_kv()
+                await stop_event.wait()
             case _:
                 await self._run_only_peer_with_seeds(stop_event, seeds, phase)
 
@@ -500,7 +562,7 @@ class NodeStarter:
         shutdown_event: asyncio.Event,
         state: NodeState
     ) -> None:
-        partitioner = self._build_partitioner()
+        partitioner = self._partitioner
 
         try:
             await self.start_peer()
@@ -529,7 +591,7 @@ class NodeStarter:
         shutdown_event: asyncio.Event,
         state: NodeState
     ) -> None:
-        partitioner = self._build_partitioner()
+        partitioner = self._partitioner
 
         try:
             await self.start_peer()
@@ -571,10 +633,20 @@ class NodeStarter:
                     exit_code=1,
                 )
 
-    def _start_bootstrap_task(self, seeds: list[str]) -> asyncio.Task[None]:
+    def _trigger_join(
+        self,
+        seeds: list[str],
+        state: NodeState
+    ) -> asyncio.Task[NodeState]:
         loop = asyncio.get_running_loop()
-        return loop.create_task(
-            self._full_resync(seeds),
-            name="gossip.bootstrap",
-        )
 
+        def on_done(t: asyncio.Task) -> None:
+            if exc := t.exception():
+                logger.error("Error during transition to ready", exc_info=exc)
+
+        task = loop.create_task(
+            self._joining_to_ready(state, seeds),
+            name="join-to-ready",
+        )
+        task.add_done_callback(on_done)
+        return task

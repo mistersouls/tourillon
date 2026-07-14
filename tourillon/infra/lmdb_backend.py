@@ -26,22 +26,22 @@ class LmdbConfig:
     writemap: bool = False
     sync: bool = True
     lock: bool = True
-    subdir: bool = True
     max_readers: int = 4
     max_writers: int = 1
 
 
 class LmdbBackendStorage:
-    def __init__(self, cfg: LmdbConfig) -> None:
+    def __init__(self, cfg: LmdbConfig, bucket: str) -> None:
         self._env: lmdb.Environment = lmdb.open(
-            str(cfg.path),
+            str(cfg.path / bucket),
             map_size=cfg.map_size,
             lock=cfg.lock,
             writemap=cfg.writemap,
             sync=cfg.sync,
             readahead=cfg.readahead,
-            subdir=cfg.subdir,
             max_readers=cfg.max_readers,
+            subdir=True,
+            max_dbs=2
         )
         self._dbi_log = self._env.open_db(Namespace.LOG.encode())
         self._dbi_tag = self._env.open_db(Namespace.TAGS.encode())
