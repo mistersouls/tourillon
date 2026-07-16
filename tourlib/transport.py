@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import logging
 import ssl
+import time
 import uuid
 from collections.abc import AsyncIterator
 
@@ -36,6 +37,12 @@ class TcpClient:
     background read loop runs as a task inside the caller's TaskGroup or
     event loop. Call close() to tear down the connection gracefully; all
     pending callers receive ConnectionClosedError.
+
+    The client keeps three pieces of correlation state:
+
+    - ``_pending`` for one-shot request/response exchanges.
+    - ``_streams`` for long-lived streaming exchanges.
+    - ``_stream_last_activity`` for timeout handling on streams.
     """
 
     def __init__(self) -> None:
@@ -44,10 +51,12 @@ class TcpClient:
         self._read_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
         self._addr: str = ""
-        # correlation_id bytes → Future[Envelope] for request()
+        # correlation_id bytes → Future[Envelope] for request().
         self._pending: dict[bytes, asyncio.Future[Envelope]] = {}
-        # correlation_id bytes → Queue[Envelope] for stream()
+        # correlation_id bytes → Queue[Envelope] for stream().
         self._streams: dict[bytes, asyncio.Queue[Envelope]] = {}
+        # correlation_id bytes → last activity time for stream().
+        self._stream_last_activity: dict[bytes, float] = {}
         self._closed = False
 
     async def connect(
@@ -79,6 +88,8 @@ class TcpClient:
         Raise ResponseTimeoutError if no matching response arrives within
         *timeout* seconds; the connection remains open. Raise
         ConnectionClosedError if the connection is lost before the response.
+
+        The request is matched by ``env.correlation_id``.
         """
         if self._closed or self._writer is None:
             raise ConnectionClosedError()
@@ -105,14 +116,15 @@ class TcpClient:
     async def stream(
         self,
         env: Envelope,
-        timeout: float | None = RESPONSE_TIMEOUT,
+        timeout: float = RESPONSE_TIMEOUT,
     ) -> AsyncIterator[Envelope]:
-        """Send *env* and yield every response Envelope sharing its correlation_id.
+        """
+        Send *env* and yield matching response Envelopes until
+        the stream ends.
 
-        *timeout* applies individually to each Envelope in the sequence. The
-        caller detects the terminal Envelope (e.g. kind ending in '.done') and
-        breaks the iteration. Raise ResponseTimeoutError or ConnectionClosedError
-        on failure.
+        The stream is keyed by ``env.correlation_id`` and closed when the
+        peer sends the private ``_STREAM_CLOSED`` sentinel or when the
+        connection is terminated.
         """
         if self._closed or self._writer is None:
             raise ConnectionClosedError()
@@ -120,39 +132,41 @@ class TcpClient:
         queue: asyncio.Queue[Envelope] = asyncio.Queue()
         key = env.correlation_id.bytes
         self._streams[key] = queue
+        self._stream_last_activity[key] = time.monotonic()
 
         await self._send(env)
 
         try:
             while True:
-                if timeout is not None:
-                    item = await self._dequeue_with_timeout(
-                        queue, timeout, env.correlation_id
-                    )
-                else:
-                    item = await queue.get()
+                item = await self._dequeue_with_timeout(
+                    queue, timeout, env.correlation_id
+                )
 
                 if item is _STREAM_CLOSED:
                     raise ConnectionClosedError()
                 yield item
         finally:
             self._streams.pop(key, None)
+            self._stream_last_activity.pop(key, None)
 
     async def send(self, env: Envelope) -> None:
-        """Send *env* without registering any response handler (fire-and-forget).
+        """Send *env* without registering a response future.
 
-        Use this to push rebalance.transfer chunks or a rebalance.commit back to
-        the peer on a correlation_id already open via a concurrent stream() call.
-        The caller is responsible for consuming any response envelopes via the
-        active stream() queue on that correlation_id.
-
-        Raise ConnectionClosedError when the connection is already closed.
+        This is a fire-and-forget helper for envelopes that belong to an
+        already-open stream. If the correlation id is currently tracked as an
+        active stream, the method refreshes that stream's last-activity time so
+        timeout handling reflects outgoing traffic too.
         """
         if self._closed or self._writer is None:
             raise ConnectionClosedError()
+
+        key = env.correlation_id.bytes
+        if key in self._streams:
+            self._stream_last_activity[key] = time.monotonic()
         await self._send(env)
 
     async def close(self) -> None:
+        """Shut down the connection and fail every pending request/stream."""
         if self._closed:
             return
         self._closed = True
@@ -171,22 +185,43 @@ class TcpClient:
         """Return True while the underlying connection is up."""
         return not self._closed and self._writer is not None
 
-    @staticmethod
     async def _dequeue_with_timeout(
+        self,
         queue: asyncio.Queue[Envelope],
         timeout: float,
         correlation_id: uuid.UUID,
-    ) -> Envelope:
-        """Get the next item from *queue* or raise ResponseTimeoutError."""
-        try:
-            async with asyncio.timeout(timeout):
-                return await queue.get()
-        except TimeoutError:
-            raise ResponseTimeoutError(
-                f"Stream timeout after {timeout}s for {correlation_id}"
-            ) from None
+    ) -> Envelope:  # type: ignore[arg-type]
+        """Get the next item from *queue* or raise ResponseTimeoutError.
+
+        The timeout is soft: if the stream has seen recent activity, the method
+        rechecks rather than failing immediately. This avoids expiring a stream
+        while there is still evidence that the peer is active.
+        """
+        key = correlation_id.bytes
+
+        while True:
+            try:
+                async with asyncio.timeout(timeout):
+                    item = await queue.get()
+                    self._stream_last_activity[key] = time.monotonic()
+                    return item
+            except TimeoutError:
+                last = self._stream_last_activity.get(key)
+                now = time.monotonic()
+
+                if last is not None and (now - last) < timeout:
+                    logger.debug(
+                        "cid=%s stream timeout internal but activity recent → continue",
+                        correlation_id,
+                    )
+                    continue
+
+                raise ResponseTimeoutError(
+                    f"Stream timeout after {timeout}s for {correlation_id}"
+                ) from None
 
     async def _send(self, env: Envelope) -> None:
+        """Serialize and write *env* under the write lock."""
         assert self._writer is not None
         logger.debug(
             "→ %s  cid=%.8s  addr=%s", env.kind, env.correlation_id, self._addr
@@ -197,6 +232,7 @@ class TcpClient:
             await self._writer.drain()
 
     async def _read_loop(self) -> None:
+        """Continuously read envelopes and route them by correlation id."""
         assert self._reader is not None
         try:
             while True:
@@ -216,6 +252,7 @@ class TcpClient:
                 elif key in self._streams:
                     await self._streams[key].put(env)
                 else:
+                    # Unsolicited messages are logged and intentionally ignored.
                     logger.debug(
                         "← unsolicited %s  cid=%.8s  addr=%s",
                         env.kind,
@@ -231,6 +268,7 @@ class TcpClient:
             self._fail_pending()
 
     def _fail_pending(self) -> None:
+        """Wake every waiter with ConnectionClosedError and clear local state."""
         exc = ConnectionClosedError()
         for fut in list(self._pending.values()):
             if not fut.done():
@@ -239,5 +277,5 @@ class TcpClient:
         for queue in list(self._streams.values()):
             queue.put_nowait(_STREAM_CLOSED)
         self._streams.clear()
-
+        self._stream_last_activity.clear()
 
