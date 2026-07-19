@@ -17,13 +17,10 @@ All infrastructure constants are defined here so that the core layer can
 reference them without importing ssl, asyncio, or any third-party library.
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator
 from typing import Protocol
 
 from tourlib.envelope import Envelope
-
-type ReceiveEnvelope = Callable[[], Awaitable[Envelope]]
-type SendEnvelope = Callable[[Envelope], Awaitable[None]]
 
 
 class ConnectionHandler(Protocol):
@@ -39,9 +36,5 @@ class ConnectionHandler(Protocol):
     error.* Envelope before returning.
     """
 
-    async def __call__(
-        self,
-        receive: ReceiveEnvelope,
-        send: SendEnvelope,
-    ) -> None:
+    def __call__(self, envelope: Envelope) -> AsyncIterator[Envelope]:
         """Process one request and emit response Envelope(s)."""

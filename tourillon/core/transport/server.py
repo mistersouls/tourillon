@@ -22,9 +22,10 @@ import asyncio
 import contextlib
 import logging
 import ssl
-from collections.abc import Callable
-from dataclasses import dataclass
+import uuid
+from collections.abc import AsyncIterator
 
+from tourillon.core.transport.conn import ConnectionHandler
 from tourillon.core.transport.dispatcher import Dispatcher
 from tourlib.envelope import Envelope
 from tourlib.exceptions import ProtocolError
@@ -33,18 +34,36 @@ from tourlib.framing import MAX_IN_FLIGHT_PER_CONN, MAX_PAYLOAD_DEFAULT, read_en
 logger = logging.getLogger(__name__)
 
 
-@dataclass(slots=True)
-class InFlightStream:
-    kind: str
-    queue: asyncio.Queue[Envelope]
-
-
 class _ConnectionSession:
-    """Manage the lifecycle of a single accepted connection.
+    """
+    Manage the lifecycle of a single accepted TCP connection.
 
-    Encapsulates the write lock, in-flight set, and handler task set so that
-    TcpServer._handle_connection and the dispatch loop remain simple. Call
-    run() to start reading; it returns when the connection should be closed.
+    This session implements the concurrency and routing model for a framed,
+    half‑duplex protocol using correlation IDs (cid). Its responsibilities are:
+
+      • read Envelopes sequentially from the wire,
+      • validate and dispatch them to the correct handler,
+      • ensure that at most one handler task runs per cid,
+      • route additional Envelopes for the same cid to the existing handler
+        via a per‑cid queue,
+      • serialize all writes under a lock,
+      • enforce MAX_IN_FLIGHT_PER_CONN,
+      • cancel and clean up all handler tasks on shutdown.
+
+    ## Intention
+
+    The design guarantees that bursts of Envelopes for the same cid are never
+    lost: the first Envelope spawns a handler task, and subsequent Envelopes
+    for that cid are queued and drained by that same task. When the handler
+    finishes, it removes the cid from `_in_flight`, ensuring that the next
+    Envelope for that cid spawns a fresh handler.
+
+    Because `_dispatch_loop` checks membership in `_in_flight` before routing,
+    it cannot enqueue into a stale queue. This prevents race conditions between
+    handler termination and dispatch.
+
+    All writes to the wire are serialized under `_write_lock`, ensuring correct
+    framing and preventing interleaving of responses.
     """
 
     def __init__(
@@ -62,7 +81,7 @@ class _ConnectionSession:
         self._write_lock = asyncio.Lock()
         # correlation_id bytes → receive queue for a running handler.
         # Presence in this dict also serves as the in-flight membership check.
-        self._in_flight: dict[bytes, InFlightStream] = {}
+        self._in_flight: dict[bytes, asyncio.Queue[AsyncIterator[Envelope]]] = {}
         self._handler_tasks: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
@@ -79,7 +98,7 @@ class _ConnectionSession:
             logger.debug("Closed connection from %s.", self._peer)
 
     async def send(self, env: Envelope) -> None:
-        """Write *env* to the wire, serialised under the write lock."""
+        """Write *env* to the wire, serialized under the write lock."""
         logger.debug(
             "→ %s  cid=%.8s  peer=%s", env.kind, env.correlation_id, self._peer
         )
@@ -106,23 +125,6 @@ class _ConnectionSession:
                 "← %s  cid=%.8s  peer=%s", env.kind, env.correlation_id, self._peer
             )
 
-            # Route to an already-running streaming handler when cid matches.
-            cid_key = env.correlation_id.bytes
-            stream = self._in_flight.get(cid_key)
-            if stream is not None:
-                if env.kind != stream.kind:
-                    logger.warning(
-                        "Correlation conflict from %s: cid=%s existing_kind=%s incoming_kind=%s",
-                        self._peer,
-                        env.correlation_id,
-                        stream.kind,
-                        env.kind,
-                    )
-                    break
-
-                await stream.queue.put(env)
-                continue
-
             handler = self._dispatcher.lookup(env.kind)
             if handler is None:
                 logger.debug(
@@ -132,7 +134,13 @@ class _ConnectionSession:
                 )
                 break
 
-            self._spawn_handler(env, handler)
+            # Route to an already-running streaming handler when cid matches.
+            cid_key = env.correlation_id.bytes
+            if cid_key in self._in_flight:
+                await self._in_flight[cid_key].put(handler(env))
+                continue
+
+            self._spawn_session(env, handler)
 
     async def _read_next(self) -> Envelope | None:
         """Read one Envelope from the stream; return None on any terminal condition."""
@@ -153,41 +161,38 @@ class _ConnectionSession:
             )
             return None
 
-    def _spawn_handler(self, env: Envelope, handler: Callable) -> None:
-        """Create a task for *handler* and track it for clean cancellation."""
+    def _spawn_session(self, env: Envelope, handler: ConnectionHandler) -> None:
         cid_key = env.correlation_id.bytes
-        queue: asyncio.Queue[Envelope] = asyncio.Queue()
-        queue.put_nowait(env)
-        self._in_flight[cid_key] = InFlightStream(kind=env.kind, queue=queue)
+        queue: asyncio.Queue[AsyncIterator[Envelope]] = asyncio.Queue()
+        queue.put_nowait(handler(env))
+        self._in_flight[cid_key] = queue
         task: asyncio.Task[None] = asyncio.get_running_loop().create_task(
-            self._run_handler(env, handler, queue)
+            self._run_session(env.correlation_id, queue)
         )
         self._handler_tasks.add(task)
         task.add_done_callback(self._handler_tasks.discard)
 
-    async def _run_handler(
-        self, env: Envelope, handler: Callable, queue: asyncio.Queue[Envelope]
+    async def _run_session(
+        self, cid: uuid.UUID, queue: asyncio.Queue[AsyncIterator[Envelope]]
     ) -> None:  # noqa: ANN001
         """Invoke *handler* then remove *env* from in-flight tracking."""
 
-        async def receive() -> Envelope:
-            return await queue.get()
-
         try:
-            await handler(receive, self.send)
+            while not queue.empty():
+                envelopes = queue.get_nowait()
+                async for envelope in envelopes:
+                    await self.send(envelope)
         except asyncio.CancelledError:
             raise
         except Exception as ex:
             logger.exception(
-                "Handler %r raised an unhandled exception (peer %s).",
-                env.kind,
+                "cid=%.8s handler raised an unhandled exception (peer %s).",
+                cid,
                 self._peer,
                 exc_info=ex,
             )
         finally:
-            self._in_flight.pop(env.correlation_id.bytes, None)
-            while not queue.empty():
-                logger.warning("Dropping envelope from %s: %r", self._peer, queue.get_nowait())
+            self._in_flight.pop(cid.bytes, None)
 
     async def _close(self) -> None:
         """Cancel all handler tasks and close the writer."""

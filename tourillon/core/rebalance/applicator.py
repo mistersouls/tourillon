@@ -224,15 +224,8 @@ class RebalanceApplicator:
                 peer_stream=peer_stream,
                 peer=peer,
             )
-            payload = self._serializer.decode(resp.payload)
-            logger.debug(f"*** transfer={payload['transfer_id']}, kind={resp.kind}")
             if resp is None:
                 break
-
-            if not peer_stream.handles:
-                break
-            else:
-                logger.debug(f"remaining handles: {len(peer_stream.handles)}")
 
             await self._route_peer_response(
                 resp,
@@ -241,6 +234,11 @@ class RebalanceApplicator:
                 client=client,
                 correlation_id=plan_env.correlation_id,
             )
+
+            if not peer_stream.handles:
+                break
+            else:
+                logger.debug(f"remaining transfer: {len(peer_stream.handles)}")
 
     async def _next_peer_response(
         self,
