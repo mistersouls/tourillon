@@ -1,8 +1,9 @@
 import logging
-from typing import Any
+from typing import Any, AsyncIterator
 
 from tourillon.core.machinery.state import StatePersistence
 from tourillon.core.ports.storage import Storage
+from tourillon.core.rebalance.transfer import RangeTransfer
 from tourillon.core.ring.partitioner import Partitioner
 from tourillon.core.ring.topology import TopologyManager
 from tourillon.core.services.drainer import NodeDrainer
@@ -57,22 +58,43 @@ class NodeManager:
             serializer=serializer,
             max_digest_entries=cfg.gossip.max_digest_entries
         )
-        self._rebalancer = NodeRebalancer(state)
+        self._rebalancer = NodeRebalancer(
+            node_id=cfg.node_id,
+            state_persistence=state,
+            topology_mgr=self._topology_manager,
+            partitioner=self._partitioner,
+            storage=storage
+        )
 
-    async def start(self, stop_event=None, seeds=None):
+    async def start(self, stop_event=None, seeds=None) -> None:
         return await self._starter.start(stop_event=stop_event, seeds=seeds)
 
-    async def join(self, seeds_override: list[str] | None = None):
+    async def join(self, seeds_override: list[str] | None = None) -> dict[str, Any]:
         return await self._starter.join(seeds_override)
 
-    async def drain(self):
+    async def drain(self) -> None:
         return await self._drainer.drain()
 
-    async def rebalance(self):
-        return await self._rebalancer.rebalance()
-
-    async def stop(self):
+    async def stop(self) -> None:
         return await self._starter.stop_all()
+
+    async def accept_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._rebalancer.accept_plan(payload)
+
+    async def resume_transfer(
+        self,
+        epoch: int,
+        range_transfer: RangeTransfer
+    ) -> AsyncIterator[dict[str, Any]]:
+        async for resum_payload in self._rebalancer.resume(epoch, range_transfer):
+            yield resum_payload
+
+    async def transfer(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+        async for transfer_payload in self._rebalancer.transfer(payload):
+            yield transfer_payload
+
+    async def commit_transfer(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._rebalancer.commit(payload)
 
     async def handle_gossip_push(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._gossiper.update_memberships(payload)

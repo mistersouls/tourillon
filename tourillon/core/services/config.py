@@ -2,11 +2,9 @@ from pathlib import Path
 from typing import Any
 
 from tourillon.core.exceptions import ConfigError
-from tourlib.exceptions import TlsValidationError
 from tourillon.core.helpers.utils import b64
 from tourillon.core.machinery.config import NodeSize
 from tourillon.core.ports.pki import X509CertificateIssuer
-from tourlib.ports.tls import TlsContext
 from tourillon.core.structure.cert import CaRequest, CertRequest
 from tourillon.core.structure.config import (
     ConfigRequest,
@@ -18,8 +16,10 @@ from tourillon.core.structure.config import (
     TourillonConfig,
 )
 from tourlib.contexts import ContextConfigurer
+from tourlib.exceptions import TlsValidationError
 from tourlib.models import ContextsFile
 from tourlib.ports.loader import ConfigReadWriter
+from tourlib.ports.tls import TlsContext
 
 
 class NodeConfigService:

@@ -68,3 +68,9 @@ class JoinError(Exception):
 
 class ProcessError(Exception):
     """Non-retryable protocol-level error"""
+
+
+class RebalanceError(Exception):
+    def __init__(self, reason: str, data: dict[str, Any] | None = None) -> None:
+        self.reason = reason
+        self.data = data or {}

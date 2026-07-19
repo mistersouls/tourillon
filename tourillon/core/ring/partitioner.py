@@ -223,6 +223,7 @@ class Partitioner:
         """
         prev: VNode | None = None
         total = 0
+        last_end = -1
 
         for vnode in ring:
             if prev is None:
@@ -232,17 +233,22 @@ class Partitioner:
             start_pid = self.pid_for_hash(prev.token)
             end_pid = self._pid_successor(vnode.token)
             count = self.range_size(start_pid, end_pid)
-            total += count
 
-            yield PartitionRange(
-                owner=vnode,
-                pred=prev,
-                start_pid=start_pid,
-                end_pid=end_pid,
-                count=count,
-            )
+            if end_pid != last_end:
+                # should check if overlap between previous range
+                # and current range but to make simple, we just
+                # check if different, > is not ok due to wrap-around.
+                total += count
+                yield PartitionRange(
+                    owner=vnode,
+                    pred=prev,
+                    start_pid=start_pid,
+                    end_pid=end_pid,
+                    count=count,
+                )
 
             prev = vnode
+            last_end = end_pid
             if total == self._total_partitions:
                 break
 

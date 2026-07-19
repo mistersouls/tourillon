@@ -50,3 +50,8 @@ class ProtocolError(Exception):
 
 class TlsValidationError(Exception):
     """Raised when TLS credentials (certificate, key, CA) fail validation."""
+
+
+class ClosedError(RuntimeError):
+    """Raised when a closeable is closed before a response arrives."""
+

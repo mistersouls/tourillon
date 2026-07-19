@@ -40,12 +40,17 @@ class RangeTransfer:
     def id(self) -> str:
         return f"{self.src}->{self.dst}:{self.start_pid}-{self.end_pid}"
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RangeTransfer":
+        return cls(**data)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "start_pid": self.start_pid,
             "end_pid": self.end_pid,
             "src": self.src,
             "dst": self.dst,
+            "count": self.count,
         }
 
     def size(self, total_partitions: int) -> int:

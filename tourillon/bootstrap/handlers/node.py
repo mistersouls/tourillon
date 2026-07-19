@@ -7,7 +7,7 @@ dispatcher = peer_dispatcher()
 
 
 @dispatcher.on("node.join")
-async def node_join(receive: ReceiveEnvelope, send: SendEnvelope) -> None:  # noqa: ANN001
+async def node_join(receive: ReceiveEnvelope, send: SendEnvelope) -> None:
     env = await receive()
     core = get_core()
     req = core.serializer.decode(env.payload)

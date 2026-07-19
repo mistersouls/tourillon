@@ -48,7 +48,7 @@ class RebalanceApplicator:
         self._topology_mgr = topology_mgr
         self._serializer = serializer
         self._storage = storage
-        self._backoff = backoff or Backoff()
+        self._backoff = backoff or Backoff(max_retries=0)
         self._max_chunk_bytes = max_chunk_bytes
 
         self._epoch = 0
@@ -151,6 +151,7 @@ class RebalanceApplicator:
                 logger.warning(
                     f"peer={peer} transfer attempt {attempt + 1}/{max_retries} failed: {exc}"
                 )
+                logger.error(f"peer={peer}, handles={peer_stream.handles}")
                 peer_stream.last_error = str(exc)
                 if attempt >= max_retries:
                     logger.error(
@@ -183,7 +184,8 @@ class RebalanceApplicator:
             payload=self._serializer.encode(plan_payload),
             schema_id=self._serializer.schema_id,
         )
-        streams = client.stream(plan_env, timeout=None)
+        streams = client.stream(plan_env)
+        logger.debug(f"peer={peer} sent rebalance.plan {plan_payload}")
 
         resp = await self._next_peer_response(
             streams,
@@ -222,8 +224,15 @@ class RebalanceApplicator:
                 peer_stream=peer_stream,
                 peer=peer,
             )
+            payload = self._serializer.decode(resp.payload)
+            logger.debug(f"*** transfer={payload['transfer_id']}, kind={resp.kind}")
             if resp is None:
                 break
+
+            if not peer_stream.handles:
+                break
+            else:
+                logger.debug(f"remaining handles: {len(peer_stream.handles)}")
 
             await self._route_peer_response(
                 resp,
@@ -284,6 +293,9 @@ class RebalanceApplicator:
         if handle is None:
             logger.debug(f"transfer_id={transfer_id} is dropped or canceled")
             return
+
+        if resp.kind in ("rebalance.commit.ok", "rebalance.commit.reject"):
+            peer_stream.handles.pop(transfer_id)
 
         message = TransferMessage(
             client=client,
@@ -409,6 +421,7 @@ class RebalanceApplicator:
                     {
                         "epoch": handle.epoch,
                         "transfer_id": handle.transfer.id,
+                        "pid": handle.transfer.pid,
                         "resume_from": resume_from.to_dict() if resume_from else None,
                     }
                 )

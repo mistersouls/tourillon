@@ -23,6 +23,7 @@ import contextlib
 import logging
 import ssl
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from tourillon.core.transport.dispatcher import Dispatcher
 from tourlib.envelope import Envelope
@@ -30,6 +31,12 @@ from tourlib.exceptions import ProtocolError
 from tourlib.framing import MAX_IN_FLIGHT_PER_CONN, MAX_PAYLOAD_DEFAULT, read_envelope
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class InFlightStream:
+    kind: str
+    queue: asyncio.Queue[Envelope]
 
 
 class _ConnectionSession:
@@ -55,7 +62,7 @@ class _ConnectionSession:
         self._write_lock = asyncio.Lock()
         # correlation_id bytes → receive queue for a running handler.
         # Presence in this dict also serves as the in-flight membership check.
-        self._in_flight: dict[bytes, asyncio.Queue[Envelope]] = {}
+        self._in_flight: dict[bytes, InFlightStream] = {}
         self._handler_tasks: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
@@ -101,8 +108,19 @@ class _ConnectionSession:
 
             # Route to an already-running streaming handler when cid matches.
             cid_key = env.correlation_id.bytes
-            if cid_key in self._in_flight:
-                await self._in_flight[cid_key].put(env)
+            stream = self._in_flight.get(cid_key)
+            if stream is not None:
+                if env.kind != stream.kind:
+                    logger.warning(
+                        "Correlation conflict from %s: cid=%s existing_kind=%s incoming_kind=%s",
+                        self._peer,
+                        env.correlation_id,
+                        stream.kind,
+                        env.kind,
+                    )
+                    break
+
+                await stream.queue.put(env)
                 continue
 
             handler = self._dispatcher.lookup(env.kind)
@@ -140,7 +158,7 @@ class _ConnectionSession:
         cid_key = env.correlation_id.bytes
         queue: asyncio.Queue[Envelope] = asyncio.Queue()
         queue.put_nowait(env)
-        self._in_flight[cid_key] = queue
+        self._in_flight[cid_key] = InFlightStream(kind=env.kind, queue=queue)
         task: asyncio.Task[None] = asyncio.get_running_loop().create_task(
             self._run_handler(env, handler, queue)
         )
@@ -168,6 +186,8 @@ class _ConnectionSession:
             )
         finally:
             self._in_flight.pop(env.correlation_id.bytes, None)
+            while not queue.empty():
+                logger.warning("Dropping envelope from %s: %r", self._peer, queue.get_nowait())
 
     async def _close(self) -> None:
         """Cancel all handler tasks and close the writer."""
