@@ -1,15 +1,15 @@
 import logging
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 from tourillon.core.machinery.state import StatePersistence
 from tourillon.core.ports.storage import Storage
 from tourillon.core.rebalance.transfer import RangeTransfer
 from tourillon.core.ring.partitioner import Partitioner
 from tourillon.core.ring.topology import TopologyManager
-from tourillon.core.services.drainer import NodeDrainer
 from tourillon.core.services.gossiper import Gossiper
+from tourillon.core.services.lifecycle import NodeLifecycle
 from tourillon.core.services.rebalancer import NodeRebalancer
-from tourillon.core.services.starter import NodeStarter
 from tourillon.core.structure.config import TourillonConfig
 from tourillon.core.transport.dispatcher import Dispatcher
 from tourlib.ports.serializer import Serializer
@@ -39,7 +39,7 @@ class NodeManager:
         self._topology_manager = TopologyManager()
         self._partitioner = partitioner
 
-        self._starter = NodeStarter(
+        self._lifecycle = NodeLifecycle(
             cfg=cfg,
             peer_dispatcher=peer_dispatcher,
             kv_dispatcher=kv_dispatcher,
@@ -50,7 +50,6 @@ class NodeManager:
             partitioner=self._partitioner,
             storage=storage,
         )
-        self._drainer = NodeDrainer(state)
         self._gossiper = Gossiper(
             node_id=cfg.node_id,
             partition_shift=cfg.partition_shift,
@@ -67,16 +66,16 @@ class NodeManager:
         )
 
     async def start(self, stop_event=None, seeds=None) -> None:
-        return await self._starter.start(stop_event=stop_event, seeds=seeds)
+        return await self._lifecycle.start(stop_event=stop_event, seeds=seeds)
 
     async def join(self, seeds_override: list[str] | None = None) -> dict[str, Any]:
-        return await self._starter.join(seeds_override)
+        return await self._lifecycle.join(seeds_override)
 
     async def drain(self) -> None:
-        return await self._drainer.drain()
+        return await self._lifecycle.drain()
 
     async def stop(self) -> None:
-        return await self._starter.stop_all()
+        return await self._lifecycle.stop_all()
 
     async def accept_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._rebalancer.accept_plan(payload)

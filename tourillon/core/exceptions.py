@@ -66,6 +66,12 @@ class JoinError(Exception):
         self.message = message
 
 
+class DrainError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+
+
 class ProcessError(Exception):
     """Non-retryable protocol-level error"""
 
