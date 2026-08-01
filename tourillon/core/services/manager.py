@@ -25,7 +25,7 @@ class NodeManager:
         peer_dispatcher: Dispatcher,
         kv_dispatcher: Dispatcher,
         tls_ctx: TlsContext,
-        state: StatePersistence,
+        state_persistence: StatePersistence,
         serializer: Serializer,
         partitioner: Partitioner,
         storage: Storage,
@@ -34,7 +34,7 @@ class NodeManager:
         self._peer_dispatcher = peer_dispatcher
         self._kv_dispatcher = kv_dispatcher
         self._tls_ctx = tls_ctx
-        self._state = state
+        self._state_persistence = state_persistence
         self._serializer = serializer
         self._topology_manager = TopologyManager()
         self._partitioner = partitioner
@@ -44,7 +44,7 @@ class NodeManager:
             peer_dispatcher=peer_dispatcher,
             kv_dispatcher=kv_dispatcher,
             tls_ctx=tls_ctx,
-            state=state,
+            state=state_persistence,
             serializer=serializer,
             topology=self._topology_manager,
             partitioner=self._partitioner,
@@ -55,11 +55,11 @@ class NodeManager:
             partition_shift=cfg.partition_shift,
             topology_manager=self._topology_manager,
             serializer=serializer,
-            max_digest_entries=cfg.gossip.max_digest_entries
+            max_digest_entries=cfg.gossip.max_digest_entries,
         )
         self._rebalancer = NodeRebalancer(
             node_id=cfg.node_id,
-            state_persistence=state,
+            state_persistence=state_persistence,
             topology_mgr=self._topology_manager,
             partitioner=self._partitioner,
             storage=storage
@@ -71,8 +71,8 @@ class NodeManager:
     async def join(self, seeds_override: list[str] | None = None) -> dict[str, Any]:
         return await self._lifecycle.join(seeds_override)
 
-    async def drain(self) -> None:
-        return await self._lifecycle.drain()
+    async def drain(self, seeds_override: list[str] | None = None) -> dict[str, Any]:
+        return await self._lifecycle.drain(seeds_override)
 
     async def stop(self) -> None:
         return await self._lifecycle.stop_all()

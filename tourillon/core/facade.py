@@ -49,7 +49,7 @@ class TourillonCore:
             tls_ctx=self._tls_ctx,
             peer_dispatcher=self._peer_dispatcher,
             kv_dispatcher=self._kv_dispatcher,
-            state=state,
+            state_persistence=state,
             serializer=self._serializer,
             partitioner=partitioner,
             storage=storage,

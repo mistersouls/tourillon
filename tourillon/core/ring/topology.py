@@ -142,7 +142,7 @@ class TopologyManager:
         async with self._lock:
             if self._fingerprint is None:
                 self._fingerprint = self._compute_fingerprint()
-            return self._fingerprint
+            return self._fingerprint    # type: ignore[return-value]
 
     def _apply(self, member: Member) -> bool:
         """Apply member under the already-held lock; return True if modified."""

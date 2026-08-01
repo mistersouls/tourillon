@@ -70,14 +70,13 @@ class Gossiper:
             and data.get("fingerprint") == fingerprint
             and data.get("member_count") == member_count
         )
-        pong_payload = {
+        return {
             "sender": self._node_id,
             "epoch": topo.epoch,
             "fingerprint": fingerprint,
             "member_count": member_count,
             "same": same,
         }
-        return pong_payload
 
     async def update_memberships(self, data: dict[str, Any]) -> dict[str, Any]:
         members_raw: list[dict[str, Any]] = data.get("members", [])

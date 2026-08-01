@@ -4,7 +4,7 @@ from pathlib import Path
 
 import typer
 
-from tourillon.bootstrap.deps import get_core, get_state, setup_logging, get_storage
+from tourillon.bootstrap.deps import get_core, get_state, get_storage, setup_logging
 from tourillon.core.exceptions import (
     BootstrapError,
     ConfigError,

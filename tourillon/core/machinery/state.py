@@ -14,6 +14,7 @@
 """State adapter backed by state.toml."""
 
 import asyncio
+import dataclasses
 import os
 from pathlib import Path
 from typing import Any, Protocol
@@ -32,6 +33,19 @@ class StatePersistence(Protocol):
     async def save(self, state: NodeState) -> None:
         """Save state"""
 
+    async def patch(self, **fields: Any) -> None:
+        """Atomically load, replace the given NodeState fields, and save.
+
+        Holds the I/O lock for the entire read-modify-write sequence so that
+        a concurrent save() (e.g. a phase transition) cannot be lost between
+        the load and the save.  No-op when no state file exists yet.
+
+        Example::
+
+            await state.patch(epoch=7)
+            await state.patch(committed_pids=(0, 1, 3), staging_pids=())
+        """
+
 
 class FileStatePersistence:
     def __init__(self, path: Path, config_rw: ConfigReadWriter) -> None:
@@ -46,6 +60,13 @@ class FileStatePersistence:
     async def save(self, state: NodeState) -> None:
         async with self._io_lock:
             await asyncio.to_thread(self._save_sync, state)
+
+    async def patch(self, **fields: Any) -> None:
+        async with self._io_lock:
+            state = await asyncio.to_thread(self._load_sync)
+            if state is None:
+                return
+            await asyncio.to_thread(self._save_sync, dataclasses.replace(state, **fields))
 
     def _load_sync(self) -> NodeState | None:
         if not self._path.exists():
@@ -125,3 +146,8 @@ class InMemoryStatePersistence:
 
     async def save(self, state: NodeState) -> None:
         self._state = state
+
+    async def patch(self, **fields: Any) -> None:
+        if self._state is None:
+            return
+        self._state = dataclasses.replace(self._state, **fields)
