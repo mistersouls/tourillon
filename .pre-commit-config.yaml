@@ -1,0 +1,71 @@
+# All hooks use language: system so they run against the tools installed in the
+# project's uv-managed virtual environment (.venv).  Run `uv sync --extra dev`
+# before `pre-commit run` or `pre-commit install`.
+repos:
+  - repo: local
+    hooks:
+      # -----------------------------------------------------------------------
+      # Formatting
+      # -----------------------------------------------------------------------
+      - id: black
+        name: black (formatter)
+        entry: black
+        language: system
+        types: [python]
+        require_serial: false
+
+      # -----------------------------------------------------------------------
+      # Linting / import sorting / code upgrades
+      # -----------------------------------------------------------------------
+      - id: ruff
+        name: ruff (linter + auto-fix)
+        entry: ruff check --fix
+        language: system
+        types: [python]
+        require_serial: false
+
+      # -----------------------------------------------------------------------
+      # Unused imports / variables removal
+      # -----------------------------------------------------------------------
+      - id: autoflake
+        name: autoflake (remove unused imports / variables)
+        entry: autoflake --remove-all-unused-imports --remove-unused-variables --in-place
+        language: system
+        types: [python]
+        require_serial: false
+
+      # -----------------------------------------------------------------------
+      # General file hygiene  (scripts from the pre-commit-hooks package)
+      # -----------------------------------------------------------------------
+      - id: trailing-whitespace
+        name: trailing whitespace
+        entry: trailing-whitespace-fixer
+        language: system
+        types: [text]
+
+      - id: end-of-file-fixer
+        name: end of file fixer
+        entry: end-of-file-fixer
+        language: system
+        types: [text]
+
+      - id: check-yaml
+        name: check yaml syntax
+        entry: check-yaml
+        language: system
+        types: [yaml]
+
+      - id: check-toml
+        name: check toml syntax
+        entry: check-toml
+        language: system
+        types: [toml]
+
+      # -----------------------------------------------------------------------
+      # License header enforcement
+      # -----------------------------------------------------------------------
+      - id: check-license-header
+        name: Apache 2.0 license header
+        entry: python scripts/check_license_header.py
+        language: system
+        types: [python]
