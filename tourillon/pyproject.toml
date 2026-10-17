@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tourillon"
+version = "0.1.0.dev1"
+description = "Leaderless peer-to-peer distributed key-value database runtime."
+requires-python = ">=3.14"
+dependencies = [
+    "lmdb>=2.3.0",
+    "opentelemetry-api>=1.36",
+    "opentelemetry-exporter-otlp-proto-http>=1.36",
+    "opentelemetry-sdk>=1.36",
+    "tourlib",
+]
+
+[project.scripts]
+tourillon = "tourillon.bootstrap.main:app"
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+tourlib = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+only-include = []
+dev-mode-dirs = [".."]
+
+[tool.hatch.build.targets.wheel.force-include]
+"." = "tourillon"
+"../tourlib" = "tourlib"

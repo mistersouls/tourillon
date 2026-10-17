@@ -3,27 +3,12 @@ requires = ["hatchling>=1"]
 build-backend = "hatchling.build"
 
 [project]
-name = "tourillon"
-version = "0.1.0"
+name = "tourproject"
+version = "0.1.0.dev1"
 description = "Leaderless peer-to-peer distributed key-value database."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.14"
-dependencies = [
-    "cyclopts>=4.22.3",
-    "cryptography==46.0.3", # >46 requires openssl for rust compilation that is not available on all platforms
-    "msgpack>=1.1",
-    "opentelemetry-api>=1.36",
-    "opentelemetry-exporter-otlp-proto-http>=1.36",
-    "opentelemetry-sdk>=1.36",
-    "tomli-w>=1.2",
-    "lmdb>=2.3.0",
-    "blake3>=1.0.9",
-]
-
-[project.scripts]
-tourillon = "tourillon.bootstrap.main:app"
-tourctl = "tourctl.bootstrap.main:app"
 
 [project.optional-dependencies]
 dev = [
@@ -48,8 +33,20 @@ dev = [
     "radon>=6",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["tourillon", "tourctl", "tourlib", "tourclient"]
+[dependency-groups]
+workspace = ["tourillon", "tourctl"]
+
+[tool.uv.workspace]
+members = ["tourillon", "tourctl", "tourlib"]
+
+[tool.uv]
+default-groups = ["workspace"]
+package = false
+
+[tool.uv.sources]
+tourillon = { workspace = true }
+tourctl = { workspace = true }
+tourlib = { workspace = true }
 
 # ---------------------------------------------------------------------------
 # Black

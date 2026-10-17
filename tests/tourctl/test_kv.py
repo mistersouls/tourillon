@@ -231,7 +231,9 @@ async def test_kv_put_reports_invalid_base64_value() -> None:
 
 
 @pytest.mark.tourctl
-def test_tourctl_kv_cli_forwards_typed_options(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tourctl_kv_cli_forwards_typed_options(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     captured: dict[str, Any] = {}
 
     async def fake_kv_get(**kwargs: Any) -> str:
@@ -279,8 +281,9 @@ def test_tourctl_kv_cli_forwards_typed_options(monkeypatch: pytest.MonkeyPatch) 
         result_action="return_value",
     )
 
-    assert get_result == "ok-get"
-    assert delete_result == "ok-delete"
+    assert get_result is None
+    assert delete_result is None
+    assert capsys.readouterr().out == "ok-get\nok-delete\n"
     assert captured["get"]["key"] == "my-key"
     assert captured["get"]["namespace"] == "space-1"
     assert captured["get"]["key_type"] == "auto"
@@ -354,4 +357,3 @@ async def test_kv_get_reports_rejected_request(monkeypatch: pytest.MonkeyPatch) 
         "KV request failed: read quorum not met: successes=1, required=2 "
         "(no response from node-b within 30.0s)"
     )
-

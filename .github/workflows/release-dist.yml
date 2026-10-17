@@ -1,0 +1,155 @@
+name: Release distributions
+
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: Product to build
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - tourillon
+          - tourctl
+  push:
+    tags:
+      - "tourillon-v*"
+      - "tourctl-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.product }} / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        product: >-
+          ${{ fromJSON(
+            (startsWith(github.ref, 'refs/tags/tourillon-v') || inputs.product == 'tourillon')
+              && '["tourillon"]' ||
+            (startsWith(github.ref, 'refs/tags/tourctl-v') || inputs.product == 'tourctl')
+              && '["tourctl"]' ||
+            '["tourillon","tourctl"]'
+          ) }}
+        target:
+          - windows-arm64
+          - windows-x86_64
+          - linux-arm64
+          - linux-x86_64
+          - macos-arm64
+          - macos-x86_64
+        include:
+          - target: windows-arm64
+            runner: windows-11-arm
+          - target: windows-x86_64
+            runner: windows-2025
+          - target: linux-arm64
+            runner: ubuntu-22.04-arm
+          - target: linux-x86_64
+            runner: ubuntu-22.04
+          - target: macos-arm64
+            runner: macos-15
+          - target: macos-x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Install CPython 3.14
+        run: uv python install 3.14
+
+      - name: Install locked build and test dependencies
+        run: uv sync --locked --extra dev --python 3.14
+
+      - name: Build, audit, and smoke-test native bundle
+        run: >-
+          uv run --no-sync python scripts/bundle/build.py
+          --product "${{ matrix.product }}"
+          --release-tag "${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}"
+          --strict-no-py --zip-output
+
+      - name: Verify Windows ZIP installation with real-process E2E
+        if: startsWith(matrix.target, 'windows-')
+        shell: pwsh
+        env:
+          E2E_REPORT_DIR: ${{ runner.temp }}/e2e-reports
+        run: |
+          $product = "${{ matrix.product }}"
+          $archive = Get-Item "dist\$product-exe-${{ matrix.target }}\$product-*.zip"
+          $extractDir = Join-Path $env:RUNNER_TEMP "$product Extracted ZIP"
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $extractDir
+          $bundle = Join-Path $extractDir $product
+          $installDir = Join-Path $env:RUNNER_TEMP "$product Portable Install"
+          $originalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          $originalProcessPath = $env:PATH
+          try {
+            & "$bundle\install.ps1" -InstallDir $installDir
+            if ($LASTEXITCODE -ne 0) { throw "ZIP installer failed: $LASTEXITCODE" }
+            & "$bundle\install.ps1" -InstallDir $installDir -Update
+            if ($LASTEXITCODE -ne 0) { throw "ZIP installer update failed: $LASTEXITCODE" }
+            uv run --no-sync pytest tests/e2e/test_user_journey_e2e_bdd.py --no-cov "--$product-bin" "$installDir\current\dist\$product.exe" --journey-artifacts "$env:E2E_REPORT_DIR"
+            if ($LASTEXITCODE -ne 0) { throw "Installed ZIP user journey failed: $LASTEXITCODE" }
+          } finally {
+            [Environment]::SetEnvironmentVariable("Path", $originalUserPath, "User")
+            $env:PATH = $originalProcessPath
+            if (Test-Path $installDir) { Remove-Item -LiteralPath $installDir -Recurse -Force }
+            if (Test-Path $extractDir) { Remove-Item -LiteralPath $extractDir -Recurse -Force }
+          }
+
+      - name: Verify Linux and macOS ZIP installation with real-process E2E
+        if: startsWith(matrix.target, 'linux-') || startsWith(matrix.target, 'macos-')
+        shell: bash
+        env:
+          E2E_REPORT_DIR: ${{ runner.temp }}/e2e-reports
+        run: |
+          set -euo pipefail
+          product="${{ matrix.product }}"
+          extract_dir="$RUNNER_TEMP/${product}-extracted-zip-${{ matrix.target }}"
+          bundle="$extract_dir/$product"
+          install_dir="$RUNNER_TEMP/${product}-portable-install-${{ matrix.target }}"
+          bin_dir="$RUNNER_TEMP/${product}-exe-${{ matrix.target }}"
+          trap 'rm -rf "$install_dir" "$bin_dir" "$extract_dir"' EXIT
+          unzip -q "dist/${product}-exe-${{ matrix.target }}/"${product}-*.zip -d "$extract_dir"
+          sh "$bundle/install.sh" --install-dir "$install_dir" --bin-dir "$bin_dir"
+          sh "$bundle/install.sh" --install-dir "$install_dir" --bin-dir "$bin_dir" --update
+          uv run --no-sync pytest tests/e2e/test_user_journey_e2e_bdd.py --no-cov "--${product}-bin" "$bin_dir/$product" --journey-artifacts "$E2E_REPORT_DIR"
+
+      - name: Upload E2E reports and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-${{ matrix.product }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/e2e-reports
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload native bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.product }}-${{ matrix.target }}
+          path: dist/${{ matrix.product }}-exe-${{ matrix.target }}/${{ matrix.product }}-*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish release assets
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: "*-*"
+          path: release-assets
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: release-assets/*.zip

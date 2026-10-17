@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright 2026 Tourillon Contributors
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="Tourillon"
+           Manufacturer="Tourillon Contributors"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="$(var.UpgradeCode)"
+           Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Tourillon is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Feature Id="Main" Title="Tourillon" Level="1">
+      <ComponentGroupRef Id="BundleFiles" />
+      <ComponentRef Id="AddToPath" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Tourillon" />
+    </StandardDirectory>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="BundleFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.BundleDir)\**" />
+    </ComponentGroup>
+
+    <Component Id="AddToPath" Directory="INSTALLFOLDER" Guid="*">
+      <util:Environment Id="TourillonPath"
+                        Name="PATH"
+                        Value="[INSTALLFOLDER]dist"
+                        Part="last"
+                        Action="set"
+                        System="yes" />
+    </Component>
+  </Fragment>
+</Wix>

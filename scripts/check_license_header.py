@@ -20,8 +20,6 @@ Usage (called automatically by pre-commit)::
 Exit code 1 if any file is missing the header; 0 otherwise.
 """
 
-from __future__ import annotations
-
 import sys
 
 # These two markers must both appear somewhere in the first 20 lines.

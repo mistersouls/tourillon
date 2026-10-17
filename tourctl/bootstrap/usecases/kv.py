@@ -29,10 +29,10 @@ async def put(
     namespace_type: TypeName = "auto",
     json: bool = False,
     opts: GlobalOptions | None = None,
-) -> str:
-    """Write a key/value pair and return the resulting Version."""
+) -> None:
+    """Write a key/value pair and print the resulting Version."""
     opts = opts or GlobalOptions()
-    return await kv_put(
+    resp = await kv_put(
         key=key,
         value=value,
         namespace=namespace,
@@ -43,6 +43,7 @@ async def put(
         tourconf=opts.tourconf,
         context_name=opts.context,
     )
+    print(resp)
 
 
 async def get(
@@ -52,10 +53,10 @@ async def get(
     namespace_type: TypeName = "auto",
     json: bool = False,
     opts: GlobalOptions | None = None,
-) -> str:
-    """Read a key and return the latest Version, if any."""
+) -> None:
+    """Read a key and print the latest Version, if any."""
     opts = opts or GlobalOptions()
-    return await kv_get(
+    resp = await kv_get(
         key=key,
         namespace=namespace,
         key_type=key_type,
@@ -64,6 +65,7 @@ async def get(
         tourconf=opts.tourconf,
         context_name=opts.context,
     )
+    print(resp)
 
 
 async def delete(
@@ -73,10 +75,10 @@ async def delete(
     namespace_type: TypeName = "auto",
     json: bool = False,
     opts: GlobalOptions | None = None,
-) -> str:
-    """Delete a key and return the resulting tombstone Version."""
+) -> None:
+    """Delete a key and print the resulting tombstone Version."""
     opts = opts or GlobalOptions()
-    return await kv_delete(
+    resp = await kv_delete(
         key=key,
         namespace=namespace,
         key_type=key_type,
@@ -85,6 +87,7 @@ async def delete(
         tourconf=opts.tourconf,
         context_name=opts.context,
     )
+    print(resp)
 
 
 
