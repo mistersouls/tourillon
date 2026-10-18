@@ -45,7 +45,7 @@ Design pillars actually implemented today:
 | `tourctl/` | Operator / user CLI built on `tourclient`. Ships the `tourctl` CLI. |
 | `tests/` | Mirrors the package layout; `tests/e2e/` drives real processes. |
 | `scripts/` | License-header check and the native bundle builder / installers. |
-| `docs/` | `ARCHITECTURE.md` (deep reference) and `BACKLOG.md` (known gaps and bugs). |
+| `docs/` | `architecture.md` (deep reference) and `backlog.md` (known gaps and bugs). |
 
 uv workspace members are `tourillon`, `tourctl`, `tourlib`.
 `tourclient` has no `pyproject.toml` of its own — it is force-included into the `tourctl` wheel (`tourctl/pyproject.toml`).
@@ -221,7 +221,7 @@ Both CLIs use **cyclopts** (not click/typer/argparse).
 
 **Before changing code**
 
-- Read `docs/ARCHITECTURE.md` for the subsystem you are touching, and `docs/BACKLOG.md` to check the item is not already characterised.
+- Read `docs/architecture.md` for the subsystem you are touching, and `docs/backlog.md` to check the item is not already characterised.
 - Locate the existing pattern and follow it. This codebase is highly consistent; consistency beats cleverness.
 
 **While changing code**
@@ -242,7 +242,7 @@ Both CLIs use **cyclopts** (not click/typer/argparse).
 **Commits and PRs**
 
 - Imperative, scoped subject lines: `store: enforce write quorum before acking`.
-- Explain *why* in the body, reference the `docs/BACKLOG.md` item when applicable.
+- Explain *why* in the body, reference the `docs/backlog.md` item when applicable.
 - Include the trailer when the change was authored with an assistant:
   ```
   Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

@@ -404,6 +404,44 @@ def test_hint_request_roundtrip() -> None:
 
 
 @pytest.mark.tourillon
+@pytest.mark.parametrize("operation", ["get", "put", "delete"])
+async def test_omitted_quorum_requires_a_replica(operation: str) -> None:
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    with pytest.raises(StoreOperationError):
+        if operation == "get":
+            await store.get(GetRequest(namespace=b"ns", key=b"key"))
+        elif operation == "put":
+            await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+        else:
+            await store.delete(DeleteRequest(namespace=b"ns", key=b"key"))
+
+
+@pytest.mark.tourillon
+async def test_omitted_quorums_record_one_and_allow_absent_reads() -> None:
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(Preference(node_id="node-a", readable=True, handoff=None),),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    assert await store.get(GetRequest(namespace=b"ns", key=b"key")) is None
+    version = await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+    assert version is not None
+    assert version.meta.quorum_write == 1
+    deleted = await store.delete(DeleteRequest(namespace=b"ns", key=b"key"))
+    assert deleted is not None
+    assert deleted.meta.quorum_write == 1
+    await store.close()
+
+
+@pytest.mark.tourillon
 @pytest.mark.asyncio
 async def test_get_elects_freshest_version_even_when_outnumbered() -> None:
     """Freshness decides: a plurality of replicas never outvotes a newer write.
@@ -520,7 +558,7 @@ async def test_put_coordinates_and_uses_handoff_target() -> None:
     assert version is not None
     assert version.address == addr
     assert version.data == b"value"
-    assert version.meta.quorum_write == 0
+    assert version.meta.quorum_write == 1
     assert storage.open_calls == [7]
     assert [request.kind for request in client.requests] == [
         "replication.write",
@@ -591,7 +629,7 @@ async def test_delete_returns_unique_versions() -> None:
     assert version is not None
     assert version.address == addr
     assert version.data == b""
-    assert version.meta.quorum_write == 0
+    assert version.meta.quorum_write == 1
     assert storage.open_calls == [7]
     assert [request.kind for request in client.requests] == [
         "replication.write",

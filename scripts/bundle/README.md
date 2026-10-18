@@ -1,4 +1,9 @@
-# Portable Tourillon and Tourctl bundles
+# Building portable Tourillon and Tourctl bundles
+
+This guide is for contributors building and validating release artifacts.
+To install a downloaded release, use the
+[user installation guide](../../docs/installation.md). For a local trial,
+use the [Docker Compose example](../../examples/docker/README.md).
 
 The repository is a uv workspace: the root project is for development and
 testing, while `tourillon/pyproject.toml` and `tourctl/pyproject.toml` define
@@ -68,7 +73,7 @@ Application packages are compiled to optimized bytecode and stored in
 `python314.zip`. Third-party packages remain extracted under `dist/`, since
 native extensions such as LMDB and cryptography must be loaded from files.
 
-## Release matrix
+## Release matrix and installer validation
 
 `.github/workflows/release-dist.yml` builds the selected product on all six
 native GitHub Actions runners with CPython 3.14. In GitHub Actions, run
@@ -132,7 +137,7 @@ To run directly without changing PATH, invoke the executable in the installed
 `current/dist` directory. For example, after installing on Windows:
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\Tourctl\v2\current\dist\tourctl.exe" --help
+& "$env:LOCALAPPDATA\Programs\Tourctl\current\dist\tourctl.exe" --help
 ```
 
 Native artifacts must be built on their target platform: cryptographic
@@ -142,6 +147,11 @@ across operating systems or architectures. Linux bundles are built on Ubuntu
 supported. The builder rejects missing glibc, musl, and glibc versions below
 2.35, and warns when building against a newer glibc because that can reduce
 compatibility with older Linux distributions.
+
+"Self-contained" refers to the application runtime and dependencies, not the
+entire operating system. The Linux builder checks shared-library resolution
+with `ldd` on the build host; it does not collect every system library or the
+ELF loader. The ZIP alone is therefore not a `FROM scratch` container image.
 
 ## Verification
 

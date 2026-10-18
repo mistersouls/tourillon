@@ -12,14 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import AsyncIterator, Callable
+from typing import Any
+
 import pytest
 
 import tourillon.bootstrap.handlers.kv as kv_handler
 from tests.helpers import make_envelope
-from tourillon.core.exceptions import StoreOperationError, VersionNotFoundError
+from tourillon.core.exceptions import (
+    InvalidQuorumError,
+    StoreOperationError,
+    VersionNotFoundError,
+)
 from tourillon.core.models.repair import RepairIssue, RepairResult
 from tourlib.adapter import MsgPackSerializer
-from tourlib.models.kv import RepairRequest
+from tourlib.envelope import Envelope
+from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest, RepairRequest
 from tourlib.models.version import Version
 
 
@@ -28,18 +36,22 @@ class _StoreSpy:
         self.put_error: StoreOperationError | None = None
         self.get_error: StoreOperationError | None = None
         self.delete_error: StoreOperationError | None = None
+        self.requests: list[GetRequest | PutRequest | DeleteRequest] = []
 
     async def put(self, request) -> Version | None:
+        self.requests.append(request)
         if self.put_error is not None:
             raise self.put_error
         return None
 
     async def get(self, request) -> Version | None:
+        self.requests.append(request)
         if self.get_error is not None:
             raise self.get_error
         return None
 
     async def delete(self, request) -> Version | None:
+        self.requests.append(request)
         if self.delete_error is not None:
             raise self.delete_error
         return None
@@ -144,6 +156,77 @@ async def test_kv_delete_handler_returns_reject_for_aggregate_error(
     assert len(payload["errors"]) == 2
 
 
+@pytest.mark.tourillon
+@pytest.mark.parametrize(
+    ("handler", "kind", "data", "expected"),
+    [
+        (
+            kv_handler.put,
+            "kv.put",
+            {"namespace": b"ns", "key": b"key", "value": b"value"},
+            PutRequest(namespace=b"ns", key=b"key", value=b"value"),
+        ),
+        (
+            kv_handler.get,
+            "kv.get",
+            {"namespace": b"ns", "key": b"key", "quorum_read": None},
+            GetRequest(namespace=b"ns", key=b"key"),
+        ),
+        (
+            kv_handler.delete,
+            "kv.delete",
+            {"namespace": b"ns", "key": b"key"},
+            DeleteRequest(namespace=b"ns", key=b"key"),
+        ),
+    ],
+)
+async def test_kv_handlers_default_omitted_or_null_quorum_to_one(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[Envelope], AsyncIterator[Envelope]],
+    kind: str,
+    data: dict[str, Any],
+    expected: GetRequest | PutRequest | DeleteRequest,
+) -> None:
+    manager = _ManagerStub()
+    monkeypatch.setattr(kv_handler, "get_manager", lambda: manager)
+    request = make_envelope(kind=kind, payload=manager.serializer.encode(data))
+
+    responses = [response async for response in handler(request)]
+
+    assert responses[0].kind == f"{kind}.accept"
+    assert manager.store.requests == [expected]
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_kv_put_handler_preserves_invalid_zero_quorum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _ManagerStub()
+    manager.store.put_error = InvalidQuorumError("write", 0)
+    monkeypatch.setattr(kv_handler, "get_manager", lambda: manager)
+    request = make_envelope(
+        kind="kv.put",
+        payload=manager.serializer.encode(
+            {
+                "namespace": b"ns",
+                "key": b"key",
+                "value": b"value",
+                "quorum_write": 0,
+            }
+        ),
+    )
+
+    responses = [response async for response in kv_handler.put(request)]
+    payload = manager.serializer.decode(responses[0].payload)
+
+    assert responses[0].kind == "kv.put.reject"
+    assert manager.store.requests == [
+        PutRequest(namespace=b"ns", key=b"key", value=b"value", quorum_write=0)
+    ]
+    assert payload["code"] == "invalid_quorum"
+
+
 class _RepairSpy:
     def __init__(self, result: RepairResult | None = None) -> None:
         self.result = result
@@ -203,3 +286,4 @@ async def test_kv_repair_handler_returns_reject_for_an_unknown_version(
     assert responses[0].kind == "kv.repair.reject"
     assert payload["code"] == "version_not_found"
     assert payload["token"] == "tok"
+    assert spy.requests == [RepairRequest(token="tok")]

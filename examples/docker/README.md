@@ -4,6 +4,9 @@ This example runs one Tourillon node and a Tourctl container for client commands
 It requires Docker and Docker Compose and uses the Linux ARM64 or x86_64
 bundles published on GitHub.
 
+This is a local single-node example, not a production deployment. See
+[current capabilities and limitations](../../docs/status.md).
+
 ## Start
 
 From this directory:
@@ -24,6 +27,19 @@ run. Node data and configuration are stored in a persistent volume. Tourctl
 stays running with `cat` so you can use `exec` to run client commands.
 
 ## Use the client
+
+Open a shell in the client container, as shown in the README animation:
+
+```sh
+docker-compose exec tourctl sh
+export TOURCONF=/example/tourconf.toml
+tourctl put greeting "Hello, Tourillon!"
+tourctl get greeting
+tourctl delete greeting
+exit
+```
+
+Alternatively, run each command from the host:
 
 ```sh
 docker-compose exec tourctl tourctl put greeting "Hello, Tourillon!" --tourconf /example/tourconf.toml

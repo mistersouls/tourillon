@@ -36,7 +36,7 @@ production deployment.
 
 Tourillon's longer-term product objectives—including multi-tenancy,
 failure-domain-aware placement, and very large clusters—are described in
-[Product objectives and principles](docs/PRINCIPLES.md). Those are design
+[Product vision](docs/principles.md). Those are design
 goals, not a claim that every capability is available today.
 
 ## Choose how to try Tourillon
@@ -52,7 +52,7 @@ goals, not a claim that every capability is available today.
 
 Visit [GitHub Releases](https://github.com/mistersouls/tourillon/releases) and
 download the ZIP matching your **product**, **operating system**, and
-**processor architecture**. Each release contains separate downloads for:
+**processor architecture**. The two products have separate releases:
 
 | Product | Choose it when you want to… |
 | --- | --- |
@@ -98,7 +98,7 @@ tourctl --help
 
 Each command is installed only if you installed its corresponding product.
 For custom install locations, updating an existing installation, and platform
-troubleshooting, see the [installation guide](scripts/bundle/README.md).
+troubleshooting, see the [installation guide](docs/installation.md).
 
 ## Your first node and first value
 
@@ -147,8 +147,9 @@ tourctl get greeting --tourconf ./tourconf.toml
 
 Use `tourctl delete greeting --tourconf ./tourconf.toml` to delete it. The
 default namespace is `default`; use `--namespace` to select another namespace.
-For a remote or multi-node setup, use the command help and the
-[architecture guide](docs/ARCHITECTURE.md) before exposing node endpoints.
+This walkthrough is local-only. It is not a remote or multi-node deployment
+guide; review the [current limitations](docs/status.md) before moving beyond
+local evaluation.
 
 **Protect the generated files.** The CA private key can issue trusted
 certificates. Node and client configuration files contain private key material
@@ -166,18 +167,22 @@ incomplete. In particular, namespaces currently label data but **do not
 provide tenant isolation**; there are no namespace ACLs or quotas, and
 placement does not yet enforce rack/zone/region anti-affinity. The 10,000-node
 scale is an objective, not a benchmarked or supported deployment size.
-Review the [architecture guide](docs/ARCHITECTURE.md) for implementation
-details and the [backlog](docs/BACKLOG.md) for known gaps before evaluating
-Tourillon for a real workload.
+Read [current capabilities and limitations](docs/status.md) for the
+user-facing boundaries of this preview.
 
 ## Learn more
 
-- [Product objectives and principles](docs/PRINCIPLES.md) — product vision and
-  architectural direction.
-- [Architecture](docs/ARCHITECTURE.md) — how nodes, clients, and storage work.
-- [Installation guide](scripts/bundle/README.md) — platform options and
+- [Installation guide](docs/installation.md) — platform options and
   troubleshooting.
-- [Development guide](docs/DEVELOPMENT.md) — contributing, tests, and releases.
+- [Current capabilities and limitations](docs/status.md) — what the preview
+  supports and where to be cautious.
+- [Product vision](docs/principles.md) — long-term goals, not current guarantees.
+
+### For contributors
+
+- [Architecture reference](docs/architecture.md) — implementation and design.
+- [Development guide](docs/development.md) — contributing, tests, and releases.
+- [Internal backlog](docs/backlog.md) — known gaps and engineering work items.
 
 ## License
 

@@ -5,7 +5,7 @@ See AGENTS.md for the working agreement.
 
 ## What and why
 
-<!-- What changes, and what problem it solves. Link the docs/BACKLOG.md item if there is one. -->
+<!-- What changes, and what problem it solves. Link the docs/backlog.md item if there is one. -->
 
 ## How
 
@@ -21,7 +21,7 @@ See AGENTS.md for the working agreement.
 - [ ] Envelope changes updated in all four places: handler, `tourlib/models/`, client service, service registry
 - [ ] No other database product is named anywhere in the change
 - [ ] No secrets, certificates or key material committed
-- [ ] `docs/BACKLOG.md` updated if this fixes or introduces a known gap
+- [ ] `docs/backlog.md` updated if this fixes or introduces a known gap
 
 ## Distributed-systems impact
 

@@ -46,4 +46,4 @@ Document the *contract*: what it guarantees, what it raises, and any concurrency
 ## Comments
 
 Comment only what is non-obvious: protocol invariants, ordering guarantees, why a branch exists. Do not narrate code.
-Mark deliberate follow-ups as `# todo(<handle>): <what and why>` — matching the existing convention — and add a corresponding entry to `docs/BACKLOG.md`.
+Mark deliberate follow-ups as `# todo(<handle>): <what and why>` — matching the existing convention — and add a corresponding entry to `docs/backlog.md`.

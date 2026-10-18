@@ -6,8 +6,8 @@ reviewed as product-level decisions.
 
 These objectives describe the intended design and long-term goals; they are
 not a claim that every capability is already implemented or production-ready.
-See the [architecture reference](ARCHITECTURE.md) for mechanisms currently
-implemented and the [backlog](BACKLOG.md) for known gaps and open questions.
+See the [architecture reference](architecture.md) for mechanisms currently
+implemented and the [backlog](backlog.md) for known gaps and open questions.
 
 ## Core objectives
 

@@ -40,7 +40,7 @@ class KvService:
         namespace: Any,
         key: Any,
         value: Any,
-        quorum_write: int | None = None,
+        quorum_write: int = 1,
     ) -> Version | None:
         request = PutRequest(
             namespace=self._serializer.encode(namespace),
@@ -55,7 +55,7 @@ class KvService:
         *,
         namespace: Any,
         key: Any,
-        quorum_read: int | None = None,
+        quorum_read: int = 1,
     ) -> Version | None:
         request = GetRequest(
             namespace=self._serializer.encode(namespace),
@@ -69,7 +69,7 @@ class KvService:
         *,
         namespace: Any,
         key: Any,
-        quorum_write: int | None = None,
+        quorum_write: int = 1,
     ) -> Version | None:
         request = DeleteRequest(
             namespace=self._serializer.encode(namespace),
@@ -82,7 +82,7 @@ class KvService:
         self,
         *,
         token: str,
-        quorum_write: int | None = None,
+        quorum_write: int = 1,
     ) -> Mapping[str, Any]:
         """Resume a write that was persisted without reaching its quorum.
 

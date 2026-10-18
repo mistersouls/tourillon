@@ -50,7 +50,7 @@ async with provider.session(write=True) as session:
 ## Replication, quorums and conflicts
 
 - `StoreService` coordinates: it resolves the preference list, fans out `replication.read` / `replication.write` to peers, and applies locally.
-- Quorums are optional per-request integers (`quorum_read`, `quorum_write`). Absent means "no explicit quorum requirement" — do not silently invent a default.
+- Request models use non-optional integer quorums (`quorum_read`, `quorum_write`) defaulting to 1, including write repair. Explicit values remain validated; handlers treat legacy explicit `null` values as omitted. Configurable defaults tied to replication factor are deferred.
 - Conflict resolution is HLC-based last-writer-wins with deterministic tie-breaks. Any change to the comparison order must keep it a **total order** and be identical on every node, otherwise replicas diverge. Test with shuffled input.
 - Deletes are tombstones, not removals. Preserve tombstone visibility semantics when touching read paths.
 - Unwritable replicas get hinted writes, replayed later by the hint replayer. Keep hint payload shape and its tombstone detection in sync.

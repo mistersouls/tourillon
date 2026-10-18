@@ -27,9 +27,7 @@ async def put(
     key_type: TypeName = "str",
     value_type: TypeName | None = None,
     namespace_type: TypeName = "auto",
-    quorum_write: Annotated[
-        int | None, Parameter(name=("--quorum-write", "-w"))
-    ] = None,
+    quorum_write: Annotated[int, Parameter(name=("--quorum-write", "-w"))] = 1,
     json: bool = False,
     opts: GlobalOptions | None = None,
 ) -> None:
@@ -55,7 +53,7 @@ async def get(
     namespace: Annotated[str, Parameter(name=("--namespace", "-n"))] = "default",
     key_type: TypeName = "str",
     namespace_type: TypeName = "auto",
-    quorum_read: Annotated[int | None, Parameter(name=("--quorum-read", "-r"))] = None,
+    quorum_read: Annotated[int, Parameter(name=("--quorum-read", "-r"))] = 1,
     json: bool = False,
     opts: GlobalOptions | None = None,
 ) -> None:
@@ -79,9 +77,7 @@ async def delete(
     namespace: Annotated[str, Parameter(name=("--namespace", "-n"))] = "default",
     key_type: TypeName = "str",
     namespace_type: TypeName = "auto",
-    quorum_write: Annotated[
-        int | None, Parameter(name=("--quorum-write", "-w"))
-    ] = None,
+    quorum_write: Annotated[int, Parameter(name=("--quorum-write", "-w"))] = 1,
     json: bool = False,
     opts: GlobalOptions | None = None,
 ) -> None:
@@ -102,9 +98,7 @@ async def delete(
 
 async def repair(
     token: str,
-    quorum_write: Annotated[
-        int | None, Parameter(name=("--quorum-write", "-w"))
-    ] = None,
+    quorum_write: Annotated[int, Parameter(name=("--quorum-write", "-w"))] = 1,
     json: bool = False,
     opts: GlobalOptions | None = None,
 ) -> None:

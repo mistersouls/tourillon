@@ -19,7 +19,7 @@ from dataclasses import dataclass
 class GetRequest:
     namespace: bytes
     key: bytes
-    quorum_read: int | None = None
+    quorum_read: int = 1
 
 
 @dataclass(frozen=True)
@@ -27,14 +27,14 @@ class PutRequest:
     namespace: bytes
     key: bytes
     value: bytes
-    quorum_write: int | None = None
+    quorum_write: int = 1
 
 
 @dataclass(frozen=True)
 class DeleteRequest:
     namespace: bytes
     key: bytes
-    quorum_write: int | None = None
+    quorum_write: int = 1
 
 
 @dataclass(frozen=True)
@@ -47,4 +47,4 @@ class RepairRequest:
     """
 
     token: str
-    quorum_write: int | None = None
+    quorum_write: int = 1

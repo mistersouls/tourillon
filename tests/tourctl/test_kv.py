@@ -111,6 +111,7 @@ async def test_tourctl_kv_core_supports_typed_inputs_and_json_output(
 
     async def put_handler(request: Envelope) -> AsyncIterator[Envelope]:
         document = serializer.decode(request.payload)
+        assert document["quorum_write"] == 1
         key = (document["namespace"], document["key"])
         store[key] = document["value"]
         yield replay_envelope(
@@ -121,6 +122,7 @@ async def test_tourctl_kv_core_supports_typed_inputs_and_json_output(
 
     async def get_handler(request: Envelope) -> AsyncIterator[Envelope]:
         document = serializer.decode(request.payload)
+        assert document["quorum_read"] == 1
         key = (document["namespace"], document["key"])
         value = store.get(key)
         payload = None if value is None else _version_document(*key, value)
@@ -132,6 +134,7 @@ async def test_tourctl_kv_core_supports_typed_inputs_and_json_output(
 
     async def delete_handler(request: Envelope) -> AsyncIterator[Envelope]:
         document = serializer.decode(request.payload)
+        assert document["quorum_write"] == 1
         key = (document["namespace"], document["key"])
         store.pop(key, None)
         yield replay_envelope(
@@ -290,11 +293,13 @@ def test_tourctl_kv_cli_forwards_typed_options(
     assert captured["get"]["namespace"] == "space-1"
     assert captured["get"]["key_type"] == "auto"
     assert captured["get"]["namespace_type"] == "str"
+    assert captured["get"]["quorum_read"] == 1
     assert captured["get"]["as_json"] is True
     assert captured["delete"]["key"] == "my-key"
     assert captured["delete"]["namespace"] == "space-1"
     assert captured["delete"]["key_type"] == "auto"
     assert captured["delete"]["namespace_type"] == "str"
+    assert captured["delete"]["quorum_write"] == 1
 
 
 @pytest.mark.asyncio
