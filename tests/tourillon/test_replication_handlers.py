@@ -181,3 +181,83 @@ async def test_replication_write_handler_returns_reject_for_aggregate_error(monk
 
 
 
+
+
+class _LookupSpy(_StoreSpy):
+    def __init__(self, record: Record | None) -> None:
+        super().__init__()
+        self.record = record
+        self.lookups: list[Key] = []
+        self.lookup_error: StoreOperationError | None = None
+
+    async def read_at(self, key: Key) -> Record | None:
+        if self.lookup_error is not None:
+            raise self.lookup_error
+        self.lookups.append(key)
+        return self.record
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_replication_lookup_handler_returns_the_exact_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _ManagerStub()
+    record = _record()
+    manager.store = _LookupSpy(record)
+    monkeypatch.setattr(replication_handler, "get_manager", lambda: manager)
+
+    request = make_envelope(
+        kind="replication.lookup",
+        payload=manager.serializer.encode({"key": record.key.to_dict()}),
+    )
+
+    responses = [response async for response in replication_handler.lookup(request)]
+    payload = manager.serializer.decode(responses[0].payload)
+
+    assert responses[0].kind == "replication.lookup.accept"
+    assert Record.from_dict(payload) == record
+    assert manager.store.lookups == [record.key]
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_replication_lookup_handler_answers_none_when_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _ManagerStub()
+    manager.store = _LookupSpy(None)
+    monkeypatch.setattr(replication_handler, "get_manager", lambda: manager)
+
+    request = make_envelope(
+        kind="replication.lookup",
+        payload=manager.serializer.encode({"key": _record().key.to_dict()}),
+    )
+
+    responses = [response async for response in replication_handler.lookup(request)]
+
+    assert responses[0].kind == "replication.lookup.accept"
+    assert manager.serializer.decode(responses[0].payload) is None
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_replication_lookup_handler_returns_reject_on_store_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _ManagerStub()
+    spy = _LookupSpy(None)
+    spy.lookup_error = _replication_error("read")
+    manager.store = spy
+    monkeypatch.setattr(replication_handler, "get_manager", lambda: manager)
+
+    request = make_envelope(
+        kind="replication.lookup",
+        payload=manager.serializer.encode({"key": _record().key.to_dict()}),
+    )
+
+    responses = [response async for response in replication_handler.lookup(request)]
+    payload = manager.serializer.decode(responses[0].payload)
+
+    assert responses[0].kind == "replication.lookup.reject"
+    assert payload["operation"] == "read"

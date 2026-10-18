@@ -24,9 +24,14 @@ Tourillon is a leaderless, peer-to-peer distributed key-value database in Python
 ```bash
 uv sync --extra dev   # setup
 uv run pytest         # full suite + 90% coverage gate
+uv run pytest -m "not e2e" --no-cov -q   # fast loop while iterating
 uv run black <files>  # format only what you touched
 uv run ruff check <files>
 ```
+
+**Iterate without the end-to-end tests.** They spawn real node processes and account for most of the
+runtime (~60 s without them, ~230 s with). Use `-m "not e2e" --no-cov` while you work, then run the
+full `uv run pytest` once before declaring the change done.
 
 **Do not run `black .` or `ruff check --fix .`.** The repository has pre-existing, repo-wide formatting debt; a global run creates a huge unrelated diff. Lint and format only the files you changed, and ignore pre-existing violations elsewhere.
 

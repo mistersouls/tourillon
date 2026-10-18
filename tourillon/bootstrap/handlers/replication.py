@@ -17,7 +17,7 @@ from typing import Any
 
 from tourillon.bootstrap.deps import get_manager, peer_dispatcher
 from tourillon.core.exceptions import StoreOperationError
-from tourillon.core.models.storageschema import PartitionAddress, Record
+from tourillon.core.models.storageschema import Key, PartitionAddress, Record
 from tourlib.envelope import Envelope, replay_envelope
 
 dispatcher = peer_dispatcher()
@@ -34,6 +34,29 @@ async def read(request: Envelope) -> AsyncIterator[Envelope]:
         payload = None if record is None else record.to_dict()
         yield replay_envelope(
             kind="replication.read.accept",
+            request=request,
+            payload=serializer.encode(payload),
+        )
+    except StoreOperationError as exc:
+        yield replay_envelope(
+            kind=f"{request.kind}.reject",
+            request=request,
+            payload=serializer.encode(exc.to_dict()),
+        )
+
+
+@dispatcher.on("replication.lookup")
+async def lookup(request: Envelope) -> AsyncIterator[Envelope]:
+    """Answer whether this node holds one exact version of an address."""
+    manager = get_manager()
+    serializer = manager.serializer
+    try:
+        data: dict[str, Any] = serializer.decode(request.payload)
+        key = Key.from_dict(data["key"])
+        record = await manager.store.read_at(key)
+        payload = None if record is None else record.to_dict()
+        yield replay_envelope(
+            kind="replication.lookup.accept",
             request=request,
             payload=serializer.encode(payload),
         )

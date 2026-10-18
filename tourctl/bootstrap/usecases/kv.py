@@ -1,4 +1,4 @@
-# Copyright 2026 Tourillon Contributors
+﻿# Copyright 2026 Tourillon Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ from typing import Annotated
 from cyclopts import Parameter
 
 from tourctl.bootstrap.usecases.common import GlobalOptions
-from tourctl.core.kv import TypeName, kv_delete, kv_get, kv_put
+from tourctl.core.kv import TypeName, kv_delete, kv_get, kv_put, kv_repair
 
 
 async def put(
@@ -27,6 +27,7 @@ async def put(
     key_type: TypeName = "str",
     value_type: TypeName | None = None,
     namespace_type: TypeName = "auto",
+    quorum_write: Annotated[int | None, Parameter(name=("--quorum-write", "-w"))] = None,
     json: bool = False,
     opts: GlobalOptions | None = None,
 ) -> None:
@@ -39,6 +40,7 @@ async def put(
         key_type=key_type,
         value_type=value_type,
         namespace_type=namespace_type,
+        quorum_write=quorum_write,
         as_json=json,
         tourconf=opts.tourconf,
         context_name=opts.context,
@@ -51,6 +53,7 @@ async def get(
     namespace: Annotated[str, Parameter(name=("--namespace", "-n"))] = "default",
     key_type: TypeName = "str",
     namespace_type: TypeName = "auto",
+    quorum_read: Annotated[int | None, Parameter(name=("--quorum-read", "-r"))] = None,
     json: bool = False,
     opts: GlobalOptions | None = None,
 ) -> None:
@@ -61,6 +64,7 @@ async def get(
         namespace=namespace,
         key_type=key_type,
         namespace_type=namespace_type,
+        quorum_read=quorum_read,
         as_json=json,
         tourconf=opts.tourconf,
         context_name=opts.context,
@@ -73,6 +77,7 @@ async def delete(
     namespace: Annotated[str, Parameter(name=("--namespace", "-n"))] = "default",
     key_type: TypeName = "str",
     namespace_type: TypeName = "auto",
+    quorum_write: Annotated[int | None, Parameter(name=("--quorum-write", "-w"))] = None,
     json: bool = False,
     opts: GlobalOptions | None = None,
 ) -> None:
@@ -83,6 +88,7 @@ async def delete(
         namespace=namespace,
         key_type=key_type,
         namespace_type=namespace_type,
+        quorum_write=quorum_write,
         as_json=json,
         tourconf=opts.tourconf,
         context_name=opts.context,
@@ -90,6 +96,19 @@ async def delete(
     print(resp)
 
 
-
-
-
+async def repair(
+    token: str,
+    quorum_write: Annotated[int | None, Parameter(name=("--quorum-write", "-w"))] = None,
+    json: bool = False,
+    opts: GlobalOptions | None = None,
+) -> None:
+    """Resume an under-replicated write from the handle its failure returned."""
+    opts = opts or GlobalOptions()
+    resp = await kv_repair(
+        token=token,
+        quorum_write=quorum_write,
+        as_json=json,
+        tourconf=opts.tourconf,
+        context_name=opts.context,
+    )
+    print(resp)

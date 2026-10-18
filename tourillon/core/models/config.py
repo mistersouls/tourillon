@@ -23,6 +23,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from tourillon.core.models.retry import BackoffRetry
 from tourillon.core.models.validator import (
     quantity_bytes,
     validate_group_size,
@@ -375,6 +376,7 @@ class GossipConfig:
     hop_limit: int = 3
     ae_interval: float = 30.0
     stop_drain_timeout: float = 5.0
+    bootstrap_retry: BackoffRetry = field(default_factory=BackoffRetry)
 
     def to_document(self) -> dict[str, Any]:
         return {
@@ -382,6 +384,7 @@ class GossipConfig:
             "hop_limit": self.hop_limit,
             "ae_interval": self.ae_interval,
             "stop_drain_timeout": self.stop_drain_timeout,
+            "bootstrap_retry": self.bootstrap_retry.to_document(),
         }
 
     @classmethod
@@ -407,6 +410,10 @@ class GossipConfig:
             hop_limit=hop_limit,
             ae_interval=float(ae_interval),
             stop_drain_timeout=float(stop_drain_timeout),
+            bootstrap_retry=BackoffRetry.from_document(
+                document.get("bootstrap_retry") or {},
+                prefix="gossip.bootstrap_retry.",
+            ),
         )
 
 
@@ -478,14 +485,74 @@ class TransportConfig:
 
 
 @dataclass(frozen=True)
+class ReadRepairConfig:
+    """Read repair runtime options."""
+
+    enabled: bool = True
+    concurrency: int = 16
+    sample_rate: float = 1.0
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "concurrency": self.concurrency,
+            "sample_rate": self.sample_rate,
+        }
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> "ReadRepairConfig":
+        enabled = document.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValidationError("placement.read_repair.enabled must be a boolean")
+        concurrency = document.get("concurrency", 16)
+        if not isinstance(concurrency, int) or isinstance(concurrency, bool) or concurrency < 1:
+            raise ValidationError("placement.read_repair.concurrency must be an integer >= 1")
+        sample_rate = document.get("sample_rate", 1.0)
+        if isinstance(sample_rate, bool) or not isinstance(sample_rate, (int, float)):
+            raise ValidationError("placement.read_repair.sample_rate must be a number in [0.0, 1.0]")
+        if not 0.0 <= float(sample_rate) <= 1.0:
+            raise ValidationError("placement.read_repair.sample_rate must be a number in [0.0, 1.0]")
+        return cls(enabled=enabled, concurrency=concurrency, sample_rate=float(sample_rate))
+
+
+@dataclass(frozen=True)
+class RepairConfig:
+    """Client-driven repair runtime options.
+
+    Repair is the most expensive client verb — up to one read *and* one write
+    per replica — so it gets a ceiling of its own, lower than the general
+    in-flight limit, to keep a burst of repairs from crowding out reads and
+    writes.
+    """
+
+    concurrency: int = 4
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "concurrency": self.concurrency,
+        }
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> "RepairConfig":
+        concurrency = document.get("concurrency", 4)
+        if not isinstance(concurrency, int) or isinstance(concurrency, bool) or concurrency < 1:
+            raise ValidationError("placement.repair.concurrency must be an integer >= 1")
+        return cls(concurrency=concurrency)
+
+
+@dataclass(frozen=True)
 class PlacementConfig:
     """Placement runtime options."""
 
     replication_factor: int = 3
+    read_repair: ReadRepairConfig = field(default_factory=ReadRepairConfig)
+    repair: RepairConfig = field(default_factory=RepairConfig)
 
     def to_document(self) -> dict[str, Any]:
         return {
             "replication_factor": self.replication_factor,
+            "read_repair": self.read_repair.to_document(),
+            "repair": self.repair.to_document(),
         }
 
     @classmethod
@@ -493,7 +560,17 @@ class PlacementConfig:
         replication_factor = document.get("replication_factor", 3)
         if not isinstance(replication_factor, int) or replication_factor < 1:
             raise ValidationError("placement.replication_factor must be an integer >= 1")
-        return cls(replication_factor=replication_factor)
+        read_repair_doc = document.get("read_repair", {})
+        if not isinstance(read_repair_doc, Mapping):
+            raise ValidationError("placement.read_repair must be a table")
+        repair_doc = document.get("repair", {})
+        if not isinstance(repair_doc, Mapping):
+            raise ValidationError("placement.repair must be a table")
+        return cls(
+            replication_factor=replication_factor,
+            read_repair=ReadRepairConfig.from_document(read_repair_doc),
+            repair=RepairConfig.from_document(repair_doc),
+        )
 
 @dataclass(frozen=True)
 class TourillonConfig:

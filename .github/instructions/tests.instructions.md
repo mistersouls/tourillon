@@ -47,4 +47,4 @@ applyTo: "tests/**/*.py"
 
 - Gate is **90%** across `tourillon`, `tourctl` and `tourlib` (`--cov-fail-under=90`). `tourclient` is not measured yet — still test it.
 - Chase meaningful coverage: error branches, retry paths, cancellation and shutdown. Do not add assertion-free tests to move the number.
-- Run targeted tests while iterating, then the full `uv run pytest` before declaring done.
+- Run targeted tests while iterating (`-m "not e2e" --no-cov` for a full-but-fast pass), then the full `uv run pytest` before declaring done.

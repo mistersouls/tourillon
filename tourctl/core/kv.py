@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn
 
 from tourclient import KvService, client
-from tourclient.exception import UnknownServiceError
+from tourclient.exception import RequestRejectedError, UnknownServiceError
 from tourctl.core.error import KV_ERROR_PROFILE, handle_error
 from tourlib.adapter import MsgPackSerializer
 from tourlib.models.version import Version
@@ -42,7 +42,23 @@ def _raise_user_error(message: str) -> NoReturn:
 def _kv_error_message(exc: Exception, context_name: str | None) -> str:
     if isinstance(exc, UnknownServiceError):
         return str(exc)
-    return handle_error(exc, context_name, KV_ERROR_PROFILE)
+    message = handle_error(exc, context_name, KV_ERROR_PROFILE)
+    return f"{message}{_resume_hint(exc)}"
+
+
+def _resume_hint(exc: Exception) -> str:
+    """Surface the handle that makes a partial write resumable.
+
+    A quorum failure means the version is written somewhere and stays there.
+    Hiding the handle would leave the operator with a failure they cannot act
+    on, and tempt them into a second write under a new timestamp.
+    """
+    if not isinstance(exc, RequestRejectedError):
+        return ""
+    token = exc.details.get("token")
+    if not isinstance(token, str) or not token:
+        return ""
+    return f"\nThe version is written but under-replicated. Resume it with:\n  tourctl repair {token}"
 
 
 def _parse_bool(value: str) -> bool:
@@ -280,13 +296,16 @@ async def _run_put(
     key: Any,
     value: Any,
     namespace: Any,
+    quorum_write: int | None,
     tourconf: str | Path | None,
     context_name: str | None,
 ) -> dict[str, Any] | None:
     async with client("kv", endpoint="client", tourconf=tourconf, context_name=context_name) as kv_service:
         if not isinstance(kv_service, KvService):
             raise UnknownServiceError("Unknown service: kv")
-        version = await kv_service.put(namespace=namespace, key=key, value=value)
+        version = await kv_service.put(
+            namespace=namespace, key=key, value=value, quorum_write=quorum_write
+        )
         return None if version is None else _version_to_render_dict(version)
 
 
@@ -294,13 +313,14 @@ async def _run_get(
     *,
     key: Any,
     namespace: Any,
+    quorum_read: int | None,
     tourconf: str | Path | None,
     context_name: str | None,
 ) -> dict[str, Any] | None:
     async with client("kv", endpoint="client", tourconf=tourconf, context_name=context_name) as kv_service:
         if not isinstance(kv_service, KvService):
             raise UnknownServiceError("Unknown service: kv")
-        response = await kv_service.get(namespace=namespace, key=key)
+        response = await kv_service.get(namespace=namespace, key=key, quorum_read=quorum_read)
         return None if response is None else _version_to_render_dict(response)
 
 
@@ -308,14 +328,31 @@ async def _run_delete(
     *,
     key: Any,
     namespace: Any,
+    quorum_write: int | None,
     tourconf: str | Path | None,
     context_name: str | None,
 ) -> dict[str, Any] | None:
     async with client("kv", endpoint="client", tourconf=tourconf, context_name=context_name) as kv_service:
         if not isinstance(kv_service, KvService):
             raise UnknownServiceError("Unknown service: kv")
-        version = await kv_service.delete(namespace=namespace, key=key)
+        version = await kv_service.delete(
+            namespace=namespace, key=key, quorum_write=quorum_write
+        )
         return None if version is None else _version_to_render_dict(version)
+
+
+async def _run_repair(
+    *,
+    token: str,
+    quorum_write: int | None,
+    tourconf: str | Path | None,
+    context_name: str | None,
+) -> dict[str, Any]:
+    async with client("kv", endpoint="client", tourconf=tourconf, context_name=context_name) as kv_service:
+        if not isinstance(kv_service, KvService):
+            raise UnknownServiceError("Unknown service: kv")
+        result = await kv_service.repair(token=token, quorum_write=quorum_write)
+        return dict(result)
 
 
 async def kv_put(
@@ -326,6 +363,7 @@ async def kv_put(
     key_type: TypeName = "str",
     value_type: TypeName | None = None,
     namespace_type: TypeName = "auto",
+    quorum_write: int | None = None,
     as_json: bool = False,
     tourconf: str | Path | None = None,
     context_name: str | None = None,
@@ -342,6 +380,7 @@ async def kv_put(
             key=typed_key,
             value=typed_value,
             namespace=typed_namespace,
+            quorum_write=quorum_write,
             tourconf=tourconf,
             context_name=context_name,
         )
@@ -357,6 +396,7 @@ async def kv_get(
     namespace: str,
     key_type: TypeName = "str",
     namespace_type: TypeName = "auto",
+    quorum_read: int | None = None,
     as_json: bool = False,
     tourconf: str | Path | None = None,
     context_name: str | None = None,
@@ -371,6 +411,7 @@ async def kv_get(
         version = await _run_get(
             key=typed_key,
             namespace=typed_namespace,
+            quorum_read=quorum_read,
             tourconf=tourconf,
             context_name=context_name,
         )
@@ -386,6 +427,7 @@ async def kv_delete(
     namespace: str,
     key_type: TypeName = "str",
     namespace_type: TypeName = "auto",
+    quorum_write: int | None = None,
     as_json: bool = False,
     tourconf: str | Path | None = None,
     context_name: str | None = None,
@@ -400,6 +442,7 @@ async def kv_delete(
         version = await _run_delete(
             key=typed_key,
             namespace=typed_namespace,
+            quorum_write=quorum_write,
             tourconf=tourconf,
             context_name=context_name,
         )
@@ -407,5 +450,47 @@ async def kv_delete(
         _raise_user_error(_kv_error_message(exc, context_name))
 
     return _render(version, as_json)
+
+
+async def kv_repair(
+    *,
+    token: str,
+    quorum_write: int | None = None,
+    as_json: bool = False,
+    tourconf: str | Path | None = None,
+    context_name: str | None = None,
+) -> str:
+    if not token.strip():
+        _raise_user_error("Invalid KV input: repair token must not be empty")
+
+    try:
+        result = await _run_repair(
+            token=token.strip(),
+            quorum_write=quorum_write,
+            tourconf=tourconf,
+            context_name=context_name,
+        )
+    except Exception as exc:
+        _raise_user_error(_kv_error_message(exc, context_name))
+
+    if as_json:
+        return json.dumps(_json_safe(result), ensure_ascii=False, indent=2, sort_keys=True)
+    return _render_repair(result)
+
+
+def _render_repair(result: Mapping[str, Any]) -> str:
+    issue = result.get("issue")
+    replicas = result.get("replicas")
+    summary = {
+        "repaired": "Repaired.",
+        "already_durable": "Already durable, nothing to copy.",
+    }.get(str(issue), str(issue))
+    return "\n".join(
+        [
+            _format_labeled_block("Issue:", summary),
+            _format_labeled_block("Replicas:", replicas),
+            _format_labeled_block("Token:", result.get("token")),
+        ]
+    )
 
 

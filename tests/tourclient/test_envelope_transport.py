@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ssl
 import asyncio
+import ssl
 from collections.abc import AsyncIterator
 
 import pytest
@@ -145,3 +145,55 @@ async def test_envelope_transport_keeps_other_in_flight_request_alive_after_tran
         "key": "ok",
     }
 
+
+@pytest.mark.asyncio
+async def test_envelope_transport_connect_times_out_on_silent_peer(
+    mtls_contexts: tuple[ssl.SSLContext, ssl.SSLContext],
+) -> None:
+    """A peer accepting TCP but never completing the handshake must not hang the caller."""
+    _, client_ssl = mtls_contexts
+
+    async def stall(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.read()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(stall, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+    transport = Transport(
+        bind=f"{host}:{port}",
+        ssl_context=client_ssl,
+        serializer=MsgPackSerializer(),
+        connection_timeout=0.2,
+    )
+
+    try:
+        with pytest.raises(TimeoutError):
+            await transport.connect()
+    finally:
+        await transport.close()
+        server.close()
+        server.close_clients()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_envelope_transport_connect_succeeds_within_timeout(
+    mtls_contexts: tuple[ssl.SSLContext, ssl.SSLContext],
+) -> None:
+    server_ssl, client_ssl = mtls_contexts
+    server = await start_envelope_server({}, server_ssl)
+
+    try:
+        host, port = server.endpoint
+        transport = Transport(
+            bind=f"{host}:{port}",
+            ssl_context=client_ssl,
+            serializer=MsgPackSerializer(),
+            connection_timeout=10.0,
+        )
+        await transport.connect()
+        await transport.close()
+    finally:
+        await server.stop()

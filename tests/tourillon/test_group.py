@@ -28,7 +28,11 @@ from tourillon.core.models.storageschema import (
     TagPayload,
     Value,
 )
-from tourillon.core.storage.group import PartitionGroupHint, PartitionGroupStaging
+from tourillon.core.storage.group import (
+    PartitionGroupHint,
+    PartitionGroupStaging,
+    PartitionGroupStore,
+)
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
 
@@ -508,3 +512,58 @@ def test_partition_group_staging_rejects_segment_outside_its_group() -> None:
         _staging(_FakeStore(), segment=(8, 7))
 
 
+
+
+def _store_over(store: _FakeStore) -> PartitionGroupStore:
+    return PartitionGroupStore(_FakeSessionProvider(store))  # type: ignore[arg-type]
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_get_at_returns_the_version_stored_at_that_exact_timestamp() -> None:
+    store = _FakeStore()
+    older = _record(7, 1)
+    newer = _record(7, 1)
+    newer = Record(
+        key=Key(pid=newer.key.pid, address=newer.key.address, ts=HLCTimestamp(900, 0, "n")),
+        value=Value(data=b"newer", quorum_write=1),
+        tag=newer.tag,
+    )
+    _seed_record(store, older)
+    _seed_record(store, newer)
+
+    found = await _store_over(store).get_at(older.key)
+
+    # `get` would answer the newest version; `get_at` answers the one asked for.
+    assert found == older
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_get_at_returns_none_for_a_timestamp_never_written() -> None:
+    store = _FakeStore()
+    record = _record(7, 1)
+    _seed_record(store, record)
+    absent = Key(
+        pid=record.key.pid,
+        address=record.key.address,
+        ts=HLCTimestamp(wall_ms=1, counter=0, node_id="n"),
+    )
+
+    assert await _store_over(store).get_at(absent) is None
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_get_at_returns_none_when_the_tag_is_missing() -> None:
+    store = _FakeStore()
+    record = _record(7, 1)
+    store.put(
+        KVPair(
+            key=record.key.to_bytes(Keyspace.LOGS),
+            value=record.value.to_bytes(),
+            keyspace=Keyspace.LOGS,
+        )
+    )
+
+    assert await _store_over(store).get_at(record.key) is None

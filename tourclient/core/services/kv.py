@@ -19,7 +19,7 @@ from tourclient.core.transport import Transport
 from tourclient.exception import RequestRejectedError
 from tourlib import Serializer
 from tourlib.exceptions import ResponseError
-from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest
+from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest, RepairRequest
 from tourlib.models.version import Version
 
 
@@ -77,6 +77,29 @@ class KvService:
             quorum_write=quorum_write,
         )
         return await self._request_and_decode("kv.delete", "kv.delete.accept", request)
+
+    async def repair(
+        self,
+        *,
+        token: str,
+        quorum_write: int | None = None,
+    ) -> Mapping[str, Any]:
+        """Resume a write that was persisted without reaching its quorum.
+
+        `token` is the handle carried by the quorum failure. It designates the
+        version already written, so repair copies it to the replicas that lack
+        it instead of writing a new one — retrying is therefore safe.
+        """
+        request = RepairRequest(token=token, quorum_write=quorum_write)
+        response = await self._transport.request(kind="kv.repair", document=request)
+        if response.kind == "kv.repair.reject":
+            raise self._rejected("kv.repair", response.payload)
+        if response.kind != "kv.repair.accept":
+            raise ResponseError(f"unexpected kv.repair response kind: {response.kind}")
+        document = self._serializer.decode(response.payload)
+        if not isinstance(document, Mapping):
+            raise ResponseError("invalid kv.repair response payload")
+        return document
 
     async def _request_and_decode(
         self,

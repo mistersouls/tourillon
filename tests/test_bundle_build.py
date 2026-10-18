@@ -342,11 +342,21 @@ def test_bundle_and_installers_agree_on_supported_versions(version, valid):
 @pytest.mark.parametrize("system", ["linux", "darwin"])
 def test_unix_bundle_contains_executable_install_script(tmp_path, monkeypatch, system):
     monkeypatch.setattr(bundle.sys, "platform", system)
+    chmod_modes = []
+    original_chmod = bundle.Path.chmod
+
+    def record_chmod(path, mode, *args, **kwargs):
+        chmod_modes.append(mode)
+        return original_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(bundle.Path, "chmod", record_chmod)
 
     bundle.write_platform_installer(tmp_path)
 
     installer = tmp_path / "install.sh"
     assert installer.is_file()
+    assert len(chmod_modes) == 1
+    assert chmod_modes[0] & 0o111 == 0o111
     if bundle.os.name != "nt":
         assert installer.stat().st_mode & 0o111
 

@@ -20,6 +20,30 @@ import pytest
 from tests.helpers import create_mtls_contexts
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Declare end-to-end options here so they are accepted by any invocation.
+
+    pytest only collects `pytest_addoption` from the *initial* conftest files;
+    declaring them in `tests/e2e/conftest.py` made them usable only when
+    `tests/e2e` was passed explicitly on the command line.
+    """
+    group = parser.getgroup("general-e2e")
+    group.addoption(
+        "--journey-artifacts",
+        default=None,
+        help="Export user-journey reports and logs to this directory.",
+    )
+    for name in ("tourillon", "tourctl"):
+        group.addoption(
+            f"--{name}-bin",
+            default=None,
+            help=(
+                f"Test this standalone {name} executable without Python environment "
+                "variables or PATH; otherwise resolve it on PATH."
+            ),
+        )
+
+
 @pytest.fixture
 def mtls_contexts(tmp_path: Path) -> tuple[ssl.SSLContext, ssl.SSLContext]:
     """Shared mTLS contexts for transport tests."""

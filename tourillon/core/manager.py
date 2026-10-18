@@ -95,6 +95,8 @@ class Manager:
             clock=self._clock,
             serializer=serializer,
             peer_pool=self._peer_pool,
+            read_repair=config.placement.read_repair,
+            repair=config.placement.repair,
         )
         self._lifecycle = NodeLifecycle(
             config=config,
@@ -193,6 +195,9 @@ class Manager:
         logger.info("Stopping manager for node '%s'", self.node_id)
         for step in (
             self._lifecycle.stop,
+            # Detached replications must settle while the peer pool and the
+            # storage they depend on are still open.
+            self._store.close,
             self._peer_pool.shutdown,
             self._storage.close,
             self._telemetry.close,

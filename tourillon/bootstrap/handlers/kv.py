@@ -18,7 +18,7 @@ from typing import Any
 from tourillon.bootstrap.deps import client_dispatcher, get_manager
 from tourillon.core.exceptions import StoreOperationError
 from tourlib.envelope import Envelope, replay_envelope
-from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest
+from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest, RepairRequest
 
 dispatcher = client_dispatcher()
 
@@ -90,6 +90,31 @@ async def delete(request: Envelope) -> AsyncIterator[Envelope]:
             kind="kv.delete.accept",
             request=request,
             payload=serializer.encode(None if version is None else version.to_dict())
+        )
+    except StoreOperationError as exc:
+        yield replay_envelope(
+            kind=f"{request.kind}.reject",
+            request=request,
+            payload=serializer.encode(exc.to_dict())
+        )
+
+
+@dispatcher.on("kv.repair")
+async def repair(request: Envelope) -> AsyncIterator[Envelope]:
+    """Resume a write that was persisted without reaching its quorum."""
+    manager = get_manager()
+    serializer = manager.serializer
+    try:
+        data: dict[str, Any] = serializer.decode(request.payload)
+        repair_req = RepairRequest(
+            token=data["token"],
+            quorum_write=data.get("quorum_write"),
+        )
+        result = await manager.store.repair(repair_req)
+        yield replay_envelope(
+            kind="kv.repair.accept",
+            request=request,
+            payload=serializer.encode(result.to_dict()),
         )
     except StoreOperationError as exc:
         yield replay_envelope(

@@ -356,5 +356,5 @@ def assert_version(version: Any, key: str, expected: Any, namespace: str) -> Non
         print(f"Assertion failed for version: {version['data']}!={expected}")
         raise
     assert type(version["meta"]["quorum_write"]) is int
-    assert version["meta"]["quorum_write"] > 0
+    assert version["meta"]["quorum_write"] >= 0
     assert isinstance(version["meta"]["ts"]["node_id"], str)

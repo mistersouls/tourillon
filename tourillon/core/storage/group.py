@@ -35,6 +35,53 @@ logger = _logger.storage()
 
 SCAN_BATCH_SIZE = 128
 COMMIT_BATCH_SIZE = 256
+_HINT_KINDS = frozenset({TagKind.HINT})
+
+
+def _decode_tag_kv(kv: KVPair, kinds: frozenset[TagKind] | None) -> tuple[Key, Tag] | None:
+    """Decode a TAGS entry and drop it unless its kind is wanted.
+
+    Filtering here, on the tag alone, is what keeps a scan proportional to the
+    number of matching entries: the LOGS payload is only fetched for survivors.
+    """
+    try:
+        tag = Tag.from_bytes(kv.value)
+        if kinds is not None and tag.kind not in kinds:
+            return None
+        return Key.from_bytes(kv.key, Keyspace.TAGS), tag
+    except ValueError as exc:
+        logger.warning("Skipping unreadable tag entry %s: %s", kv.key.hex(), exc)
+        return None
+
+
+def _build_record(key: Key, tag: Tag, kv_log: KVPair | None) -> Record | None:
+    if kv_log is None:
+        logger.warning("Skipping tag entry without value: pid=%d key=%s", key.pid.value, key)
+        return None
+    try:
+        value = Value.from_bytes(kv_log.value)
+    except (ValueError, OverflowError) as exc:
+        logger.warning("Skipping unreadable value: pid=%d key=%s: %s", key.pid.value, key, exc)
+        return None
+    return Record(key=key, tag=tag, value=value)
+
+
+async def _load_records(session: Session, selected: Sequence[tuple[Key, Tag]]) -> list[Record]:
+    """Batch-load the LOGS payloads of already-selected tags."""
+    if not selected:
+        return []
+
+    async with session.batch() as batch:
+        for key, _ in selected:
+            batch.get(KVRef(key=key.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS))
+    logs = await batch.result()
+
+    records: list[Record] = []
+    for (key, tag), kv_log in zip(selected, logs, strict=True):
+        record = _build_record(key, tag, kv_log)
+        if record is not None:
+            records.append(record)
+    return records
 
 
 class PartitionGroupStore:
@@ -73,6 +120,28 @@ class PartitionGroupStore:
             tag = Tag.from_bytes(kv_tag.value)
             value = Value.from_bytes(kv_log.value)
             return Record(key=key, tag=tag, value=value)
+
+    async def get_at(self, key: Key) -> Record | None:
+        """Read the version stored at one exact timestamp.
+
+        `get` answers "what is current for this address"; repair needs "do you
+        hold this particular version". The physical key already spells out
+        `pid|address|ts`, so the lookup is a point read, not a scan.
+        """
+        async with self._session_provider.session(write=False) as session:
+            kv_log = await session.get(KVRef(key=key.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS))
+            if kv_log is None:
+                return None
+
+            kv_tag = await session.get(KVRef(key=key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS))
+            if kv_tag is None:
+                return None
+
+            return Record(
+                key=key,
+                tag=Tag.from_bytes(kv_tag.value),
+                value=Value.from_bytes(kv_log.value),
+            )
 
 
 class PartitionGroupStaging:
@@ -194,7 +263,7 @@ class PartitionGroupStaging:
         async with self._session_provider.session(write=False) as session:
             kvs = await self._list_tags(session, position, limit)
             selected, next_position = self._select_page(kvs, jumps, kinds, limit)
-            records = await self._load_records(session, selected)
+            records = await _load_records(session, selected)
         return records, next_position
 
     def _select_page(
@@ -218,33 +287,13 @@ class PartitionGroupStaging:
             jump = jumps.get(pid)
             if jump is not None and kv.key <= jump:
                 return selected, jump
-            item = self._decode_tag_kv(kv, kinds)
+            item = _decode_tag_kv(kv, kinds)
             if item is not None:
                 selected.append(item)
 
         if len(kvs) < limit:
             return selected, None
         return selected, kvs[-1].key
-
-    async def _load_records(
-        self,
-        session: Session,
-        selected: Sequence[tuple[Key, Tag]],
-    ) -> list[Record]:
-        if not selected:
-            return []
-
-        async with session.batch() as batch:
-            for key, _ in selected:
-                batch.get(KVRef(key=key.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS))
-        logs = await batch.result()
-
-        records: list[Record] = []
-        for (key, tag), kv_log in zip(selected, logs, strict=True):
-            record = self._build_record(key, tag, kv_log)
-            if record is not None:
-                records.append(record)
-        return records
 
     async def _commit_page(
         self,
@@ -317,32 +366,6 @@ class PartitionGroupStaging:
         except ValueError:
             return True
 
-    @staticmethod
-    def _decode_tag_kv(
-        kv: KVPair,
-        kinds: frozenset[TagKind] | None,
-    ) -> tuple[Key, Tag] | None:
-        try:
-            tag = Tag.from_bytes(kv.value)
-            if kinds is not None and tag.kind not in kinds:
-                return None
-            return Key.from_bytes(kv.key, Keyspace.TAGS), tag
-        except ValueError as exc:
-            logger.warning("Skipping unreadable tag entry %s: %s", kv.key.hex(), exc)
-            return None
-
-    @staticmethod
-    def _build_record(key: Key, tag: Tag, kv_log: KVPair | None) -> Record | None:
-        if kv_log is None:
-            logger.warning("Skipping tag entry without value: pid=%d key=%s", key.pid.value, key)
-            return None
-        try:
-            value = Value.from_bytes(kv_log.value)
-        except (ValueError, OverflowError) as exc:
-            logger.warning("Skipping unreadable value: pid=%d key=%s: %s", key.pid.value, key, exc)
-            return None
-        return Record(key=key, tag=tag, value=value)
-
     def _unstage_owned_kv(self, kv: KVPair) -> KVPair | None:
         if not self._is_owner(kv):
             return None
@@ -412,15 +435,31 @@ class PartitionGroupHint:
     def __init__(self, session_provider: SessionProvider) -> None:
         self._session_provider = session_provider
 
-    async def iter(self, batch_size: int = 32) -> AsyncIterator[Record]:
-        async with self._session_provider.session(write=False) as session:
-            async for kv in session.iter(keyspace=Keyspace.TAGS, batch_size=batch_size):
-                record = await self._record(kv, session)
-                if record is None or record.tag.kind != TagKind.HINT:
-                    continue
+    async def iter(self, batch_size: int = SCAN_BATCH_SIZE) -> AsyncIterator[Record]:
+        """Yield every pending hint, reading LOGS only for actual hints.
 
+        The replayer runs this on every partition group a few times a second,
+        so the cost must track the number of hints, not the total amount of
+        stored data. Tags carry their own kind, which lets a non-hint entry be
+        discarded without a LOGS lookup; survivors are then fetched in batches
+        rather than one random read at a time.
+        """
+        async with self._session_provider.session(write=False) as session:
+            page: list[tuple[Key, Tag]] = []
+            async for kv in session.iter(keyspace=Keyspace.TAGS, batch_size=batch_size):
+                item = _decode_tag_kv(kv, _HINT_KINDS)
+                if item is None:
+                    continue
+                page.append(item)
+                if len(page) < batch_size:
+                    continue
+                for record in await _load_records(session, page):
+                    yield record
+                page = []
+
+            for record in await _load_records(session, page):
                 yield record
-    
+
     async def satisfy(self, records: Sequence[Record]) -> bool:
         """Restore satisfied hints to their original tags and return whether any changed.
 
@@ -476,25 +515,3 @@ class PartitionGroupHint:
             value=restored.to_bytes(),
             keyspace=Keyspace.TAGS,
         )
-
-    @staticmethod
-    async def _record(kv: KVPair, session: Session) -> Record | None:
-        try:
-            key = Key.from_bytes(kv.key, Keyspace.TAGS)
-            tag = Tag.from_bytes(kv.value)
-        except ValueError as exc:
-            logger.warning("Skipping unreadable tag entry %s: %s", kv.key.hex(), exc)
-            return None
-
-        kv_log = await session.get(KVRef(key=key.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS))
-        if kv_log is None:
-            logger.warning("Skipping tag entry without value: pid=%d key=%s", key.pid.value, key)
-            return None
-
-        try:
-            value = Value.from_bytes(kv_log.value)
-        except (ValueError, OverflowError) as exc:
-            logger.warning("Skipping unreadable value: pid=%d key=%s: %s", key.pid.value, key, exc)
-            return None
-
-        return Record(key=key, tag=tag, value=value)

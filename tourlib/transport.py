@@ -22,8 +22,8 @@ from contextlib import suppress
 
 from tourlib.constant import (
     ENVELOPE_RESPONSE_TIMEOUT,
+    TRANSPORT_ERROR_KIND,
 )
-from tourlib.constant import TRANSPORT_ERROR_KIND
 from tourlib.envelope import Envelope, read_envelope
 from tourlib.exceptions import ProtocolError, ResponseTimeoutError
 from tourlib.helpers import parse_bind
@@ -197,6 +197,30 @@ class EnvelopeClient:
         if queue is not None:
             queue.put_nowait(error)
 
+    def _route(self, envelope: Envelope) -> None:
+        """Deliver *envelope* to its pending future, stream queue, or drop it."""
+        key = envelope.correlation_id.bytes
+        if envelope.kind == TRANSPORT_ERROR_KIND:
+            message = envelope.payload.decode("utf-8", errors="replace")
+            self._reject(key, ProtocolError(f"transport error: {message}"))
+            return
+
+        future = self._pending.pop(key, None)
+        if future is not None:
+            if not future.done():
+                future.set_result(envelope)
+            return
+
+        queue = self._streams.get(key)
+        if queue is not None:
+            queue.put_nowait(envelope)
+            return
+
+        self._logger.warning(
+            "Received unsolicited %s with cid=%.8s bind=%s; ignoring.",
+            envelope.kind, envelope.correlation_id, self._bind
+        )
+
     async def _read_loop(self) -> None:
         reader = self._reader
         if reader is None:
@@ -211,22 +235,7 @@ class EnvelopeClient:
                     "Received kind=%s cid=%.8s bind=%s",
                     envelope.kind, envelope.correlation_id.bytes, self._bind
                 )
-
-                key = envelope.correlation_id.bytes
-                if envelope.kind == TRANSPORT_ERROR_KIND:
-                    message = envelope.payload.decode("utf-8", errors="replace")
-                    self._reject(key, ProtocolError(f"transport error: {message}"))
-                elif key in self._pending:
-                    future = self._pending.pop(key)
-                    if not future.done():
-                        future.set_result(envelope)
-                elif key in self._streams:
-                    await self._streams[key].put(envelope)
-                else:
-                    self._logger.warning(
-                        "Received unsolicited %s with cid=%.8s bind=%s; ignoring.",
-                        envelope.kind, envelope.correlation_id, self._bind
-                    )
+                self._route(envelope)
         except (EOFError, OSError) as exc:
             failure = ConnectionError("Connection closed by peer")
             raise failure from exc

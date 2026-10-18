@@ -16,8 +16,10 @@ import pytest
 
 import tourillon.bootstrap.handlers.kv as kv_handler
 from tests.helpers import make_envelope
-from tourillon.core.exceptions import StoreOperationError
+from tourillon.core.exceptions import StoreOperationError, VersionNotFoundError
+from tourillon.core.models.repair import RepairIssue, RepairResult
 from tourlib.adapter import MsgPackSerializer
+from tourlib.models.kv import RepairRequest
 from tourlib.models.version import Version
 
 
@@ -135,3 +137,62 @@ async def test_kv_delete_handler_returns_reject_for_aggregate_error(monkeypatch:
     assert payload["message"] == "write quorum not met"
     assert len(payload["errors"]) == 2
 
+
+
+class _RepairSpy:
+    def __init__(self, result: RepairResult | None = None) -> None:
+        self.result = result
+        self.error: StoreOperationError | None = None
+        self.requests: list[RepairRequest] = []
+
+    async def repair(self, request: RepairRequest) -> RepairResult:
+        self.requests.append(request)
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_kv_repair_handler_returns_the_repair_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _ManagerStub()
+    spy = _RepairSpy(RepairResult(issue=RepairIssue.REPAIRED, replicas=3, token="tok"))
+    manager.store = spy
+    monkeypatch.setattr(kv_handler, "get_manager", lambda: manager)
+
+    request = make_envelope(
+        kind="kv.repair",
+        payload=manager.serializer.encode({"token": "tok", "quorum_write": 2}),
+    )
+
+    responses = [response async for response in kv_handler.repair(request)]
+    payload = manager.serializer.decode(responses[0].payload)
+
+    assert responses[0].kind == "kv.repair.accept"
+    assert payload == {"issue": "repaired", "replicas": 3, "token": "tok"}
+    assert spy.requests == [RepairRequest(token="tok", quorum_write=2)]
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_kv_repair_handler_returns_reject_for_an_unknown_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _ManagerStub()
+    spy = _RepairSpy()
+    spy.error = VersionNotFoundError("tok")
+    manager.store = spy
+    monkeypatch.setattr(kv_handler, "get_manager", lambda: manager)
+
+    request = make_envelope(
+        kind="kv.repair",
+        payload=manager.serializer.encode({"token": "tok"}),
+    )
+
+    responses = [response async for response in kv_handler.repair(request)]
+    payload = manager.serializer.decode(responses[0].payload)
+
+    assert responses[0].kind == "kv.repair.reject"
+    assert payload["code"] == "version_not_found"
+    assert payload["token"] == "tok"

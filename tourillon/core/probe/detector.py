@@ -45,7 +45,6 @@ class PeerFailureDetector:
         self._threshold = threshold
         self._probe_interval = probe_interval
         self._probe_jitter = probe_jitter
-        self._lock = asyncio.Lock()
         self._active: bool = False
         self._phi_accrual = PhiAccrual(threshold=self._threshold)
         self._client: EnvelopeClient | None = None

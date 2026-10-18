@@ -17,9 +17,9 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import Any
 
-from tourillon.core.utils.buffer import BytesWalker
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
+from tourlib.utils.buffer import BytesWalker
 
 PID_SIZE = 4
 MAX_QUORUM_WRITE = 255

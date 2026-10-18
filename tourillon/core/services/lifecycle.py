@@ -24,7 +24,6 @@ from tourillon.core.gossip.gossiper import Gossiper, GossipStats
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.log import logger
 from tourillon.core.models.member import Member, MemberPhase
-from tourillon.core.models.retry import BackoffRetry
 from tourillon.core.models.state import NodeState
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer.pool import PeerPool
@@ -175,7 +174,7 @@ class NodeLifecycle:
             )
 
     async def leave(self) -> None:
-        ...
+        raise NotImplementedError("Leave operation is not implemented yet.")
 
     def _generate_tokens(self) -> tuple[str, ...]:
         count = self._config.node.size.to_value()
@@ -429,7 +428,7 @@ class NodeLifecycle:
             serializer=self._serializer,
             tls_client=self._tls_client,
             topologymgr=self._topologymgr,
-            backoff=BackoffRetry(),    # todo(souls): make configurable
+            backoff=self._config.gossip.bootstrap_retry,
         )
         try:
             ok = await bootstrapper.run(state.seeds)

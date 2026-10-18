@@ -14,6 +14,7 @@
 
 import base64
 import hashlib
+import re
 import shutil
 import socket
 import time
@@ -306,6 +307,45 @@ def isolated(journey: Journey) -> None:
     journey.check(a, "shared", None, namespace="tenant-one")
     journey.check(a, "shared", "second", namespace="tenant-two")
     journey.check(a, "shared", None, namespace="default")
+
+
+@when("I write a value demanding more replicas than the database holds")
+def under_replicated(journey: Journey) -> None:
+    journey.observations["under-replicated"] = journey.ctl_result(
+        journey.nodes["A"],
+        "put",
+        "fragile",
+        "kept",
+        "--namespace",
+        "journey",
+        "--namespace-type",
+        "str",
+        "--value-type",
+        "str",
+        "-w",
+        "2",
+    )
+
+
+@then("the write fails but the value is readable and the handle resumes it")
+def resumed(journey: Journey) -> None:
+    node = journey.nodes["A"]
+    result = journey.observations["under-replicated"]
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    match = re.search(r"tourctl repair (\S+)", output)
+    assert match is not None, output
+
+    # The write is never rolled back: the quorum it asked for was not reached,
+    # the version it produced still exists.
+    journey.check(node, "fragile", "kept")
+
+    outcome = journey.ctl(node, "repair", match.group(1), "--json")
+    assert outcome == {
+        "issue": "already_durable",
+        "replicas": 1,
+        "token": match.group(1),
+    }, outcome
 
 
 @when("I start the node with an invalid configuration")

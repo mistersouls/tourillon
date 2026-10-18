@@ -18,24 +18,6 @@ from pathlib import Path
 import pytest
 
 
-def pytest_addoption(parser: pytest.Parser) -> None:
-    group = parser.getgroup("general-e2e")
-    group.addoption(
-        "--journey-artifacts",
-        default=None,
-        help="Export user-journey reports and logs to this directory.",
-    )
-    for name in ("tourillon", "tourctl"):
-        group.addoption(
-            f"--{name}-bin",
-            default=None,
-            help=(
-                f"Test this standalone {name} executable without Python environment "
-                "variables or PATH; otherwise resolve it on PATH."
-            ),
-        )
-
-
 @pytest.fixture(scope="session")
 def journey_executables(pytestconfig: pytest.Config) -> dict[str, str]:
     executables = {}

@@ -190,7 +190,3 @@ class CryptographyMtlsAdapter:
         parts.append(x509.NameAttribute(NameOID.COMMON_NAME, common_name))
         return x509.Name(parts)
 
-
-
-__all__ = ["CryptographyMtlsAdapter"]
-

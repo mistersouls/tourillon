@@ -44,6 +44,14 @@ MAX_NAMESPACE_LEN = 63
 # Max raw byte length for a key in Address encoding.
 MAX_KEY_LEN = 128
 
+# Max quorum a request may ask for. A stored version records the durability it
+# was written for in a single byte, which bounds what a request can mean.
+MAX_QUORUM = 255
+
+# How far ahead of local wall time a timestamp submitted by a client may be
+# before it is treated as fabricated rather than as clock drift.
+MAX_CLOCK_SKEW_MS = 60_000
+
 # Max concurrently in-flight RPCs handled per connection/session.
 MAX_IN_FLIGHT = 32
 

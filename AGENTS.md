@@ -59,6 +59,7 @@ Python **3.14+** is required. All commands run through `uv`.
 ```bash
 uv sync --extra dev            # install workspace + dev tools
 uv run pytest                  # full suite, coverage gate (>= 90%)
+uv run pytest -m "not e2e" --no-cov -q              # fast loop, skips e2e
 uv run pytest tests/tourillon/test_store.py          # one file
 uv run pytest tests/tourillon/test_store.py::test_x  # one test
 uv run ruff check .            # lint
@@ -67,7 +68,12 @@ uv run pre-commit run --all-files                    # all hooks
 uv build                       # build distributions
 ```
 
-Baseline you can rely on: **the test suite is green** (622 tests, ~93% coverage).
+The end-to-end tests spawn real node processes and dominate the runtime (~60 s without them,
+~230 s with). Iterate with `-m "not e2e" --no-cov`, then run the full `uv run pytest` once before
+you hand the change over — `--no-cov` is required on a partial run because the coverage gate is
+computed over the whole suite.
+
+Baseline you can rely on: **the test suite is green** (705 tests, ~93.9% coverage).
 
 ### Formatting debt — read before running a formatter
 

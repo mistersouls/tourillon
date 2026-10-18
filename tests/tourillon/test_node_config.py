@@ -14,6 +14,7 @@
 
 import asyncio
 import base64
+import re
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,8 @@ from tourillon.core.config import (
     NodeSize,
     PeerServerConfig,
     PlacementConfig,
+    ReadRepairConfig,
+    RepairConfig,
     StorageConfig,
     TelemetryConfig,
     TlsConfig,
@@ -37,6 +40,7 @@ from tourillon.core.config import (
     TransportPoolConfig,
 )
 from tourillon.core.models import config as config_model
+from tourillon.core.models.retry import BackoffRetry
 from tourlib.adapter import CryptographyMtlsAdapter, TomlPersistence
 from tourlib.exceptions import ValidationError
 
@@ -1006,3 +1010,124 @@ async def test_node_config_generate_rejects_data_dir_that_is_an_existing_file(
         )
 
 
+@pytest.mark.tourillon
+def test_gossip_config_parses_bootstrap_retry_overrides() -> None:
+    config = GossipConfig.from_document(
+        {
+            "max_fan_out": 2,
+            "bootstrap_retry": {
+                "initial_delay": 1.5,
+                "max_delay": 20,
+                "max_retries": 3,
+                "factor": 3.0,
+                "jitter": 0,
+            },
+        }
+    )
+
+    assert config.bootstrap_retry == BackoffRetry(
+        initial_delay=1.5,
+        max_delay=20.0,
+        max_retries=3,
+        factor=3.0,
+        jitter=0.0,
+    )
+    assert config.to_document()["bootstrap_retry"]["max_retries"] == 3
+
+
+@pytest.mark.tourillon
+def test_gossip_config_defaults_bootstrap_retry_when_missing() -> None:
+    assert GossipConfig.from_document({}).bootstrap_retry == BackoffRetry()
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        ({"initial_delay": -1}, "gossip.bootstrap_retry.initial_delay must be a number >= 0"),
+        ({"factor": "fast"}, "gossip.bootstrap_retry.factor must be a number >= 0"),
+        ({"max_retries": 0}, "gossip.bootstrap_retry.max_retries must be an integer >= 1"),
+        ({"max_retries": 1.5}, "gossip.bootstrap_retry.max_retries must be an integer >= 1"),
+    ],
+)
+def test_gossip_config_rejects_invalid_bootstrap_retry(document: dict, message: str) -> None:
+    with pytest.raises(ValidationError, match=re.escape(message)):
+        GossipConfig.from_document({"bootstrap_retry": document})
+
+
+@pytest.mark.tourillon
+def test_read_repair_config_roundtrips_through_its_document() -> None:
+    config = ReadRepairConfig(enabled=False, concurrency=4, sample_rate=0.25)
+
+    assert ReadRepairConfig.from_document(config.to_document()) == config
+
+
+@pytest.mark.tourillon
+def test_read_repair_config_defaults_to_enabled_full_sampling() -> None:
+    config = ReadRepairConfig.from_document({})
+
+    assert config == ReadRepairConfig(enabled=True, concurrency=16, sample_rate=1.0)
+
+
+@pytest.mark.tourillon
+def test_placement_config_parses_a_nested_read_repair_table() -> None:
+    config = PlacementConfig.from_document(
+        {"replication_factor": 5, "read_repair": {"sample_rate": 0.5}}
+    )
+
+    assert config.replication_factor == 5
+    assert config.read_repair.sample_rate == 0.5
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        ({"enabled": "yes"}, "placement.read_repair.enabled must be a boolean"),
+        ({"concurrency": 0}, "placement.read_repair.concurrency must be an integer >= 1"),
+        ({"concurrency": True}, "placement.read_repair.concurrency must be an integer >= 1"),
+        ({"sample_rate": 1.5}, r"placement.read_repair.sample_rate must be a number"),
+        ({"sample_rate": "half"}, r"placement.read_repair.sample_rate must be a number"),
+    ],
+)
+def test_read_repair_config_rejects_unusable_values(document: dict, message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        ReadRepairConfig.from_document(document)
+
+
+@pytest.mark.tourillon
+def test_placement_config_rejects_a_non_table_read_repair() -> None:
+    with pytest.raises(ValidationError, match="placement.read_repair must be a table"):
+        PlacementConfig.from_document({"read_repair": True})
+
+
+@pytest.mark.tourillon
+def test_repair_config_roundtrips_through_its_document() -> None:
+    config = RepairConfig(concurrency=9)
+
+    assert RepairConfig.from_document(config.to_document()) == config
+
+
+@pytest.mark.tourillon
+def test_repair_config_defaults_to_a_bounded_concurrency() -> None:
+    assert RepairConfig.from_document({}) == RepairConfig(concurrency=4)
+
+
+@pytest.mark.tourillon
+def test_placement_config_parses_a_nested_repair_table() -> None:
+    config = PlacementConfig.from_document({"repair": {"concurrency": 2}})
+
+    assert config.repair.concurrency == 2
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("document", [{"concurrency": 0}, {"concurrency": True}, {"concurrency": "4"}])
+def test_repair_config_rejects_unusable_concurrencies(document: dict) -> None:
+    with pytest.raises(ValidationError, match="placement.repair.concurrency must be an integer >= 1"):
+        RepairConfig.from_document(document)
+
+
+@pytest.mark.tourillon
+def test_placement_config_rejects_a_non_table_repair() -> None:
+    with pytest.raises(ValidationError, match="placement.repair must be a table"):
+        PlacementConfig.from_document({"repair": 4})

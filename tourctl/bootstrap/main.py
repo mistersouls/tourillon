@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from cyclopts import App
-from tourctl.bootstrap.usecases.kv import delete, get, put
+from tourctl.bootstrap.usecases.kv import delete, get, put, repair
 from tourctl.bootstrap.usecases.node import node_app
 from tourctl.bootstrap.usecases.probe import probe_app
 
@@ -27,6 +27,7 @@ app.command(node_app, name="node")
 app.command(put, name="put")
 app.command(get, name="get")
 app.command(delete, name="delete")
+app.command(repair, name="repair")
 
 
 if __name__ == "__main__":

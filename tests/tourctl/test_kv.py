@@ -24,7 +24,7 @@ import pytest
 from tests.helpers import generate_ca, start_envelope_server
 from tourclient.exception import RequestRejectedError
 from tourctl.bootstrap.main import app
-from tourctl.core.kv import kv_delete, kv_get, kv_put
+from tourctl.core.kv import kv_delete, kv_get, kv_put, kv_repair
 from tourillon.core.config import ClientConfigGenerator
 from tourlib.adapter import CryptographyMtlsAdapter, MsgPackSerializer, TomlPersistence
 from tourlib.envelope import Envelope, replay_envelope
@@ -357,3 +357,101 @@ async def test_kv_get_reports_rejected_request(monkeypatch: pytest.MonkeyPatch) 
         "KV request failed: read quorum not met: successes=1, required=2 "
         "(no response from node-b within 30.0s)"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.tourctl
+async def test_kv_repair_renders_the_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    async def fake_run_repair(**kwargs: Any) -> dict[str, Any]:
+        seen.update(kwargs)
+        return {"issue": "repaired", "replicas": 3, "token": "tok"}
+
+    monkeypatch.setattr("tourctl.core.kv._run_repair", fake_run_repair)
+
+    output = await kv_repair(token="  tok  ", quorum_write=2)
+
+    assert seen["token"] == "tok"
+    assert seen["quorum_write"] == 2
+    lines = output.splitlines()
+    assert lines[0].startswith("Issue:")
+    assert "Repaired." in lines[0]
+    assert "3" in lines[1]
+    assert "tok" in lines[2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.tourctl
+async def test_kv_repair_renders_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_run_repair(**kwargs: Any) -> dict[str, Any]:
+        _ = kwargs
+        return {"issue": "already_durable", "replicas": 3, "token": "tok"}
+
+    monkeypatch.setattr("tourctl.core.kv._run_repair", fake_run_repair)
+
+    output = await kv_repair(token="tok", as_json=True)
+
+    assert json.loads(output) == {"issue": "already_durable", "replicas": 3, "token": "tok"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.tourctl
+async def test_kv_repair_rejects_an_empty_token() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        await kv_repair(token="   ")
+
+    assert "repair token must not be empty" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.tourctl
+async def test_kv_put_suggests_resuming_an_under_replicated_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_run_put(**kwargs: Any) -> dict[str, Any] | None:
+        _ = kwargs
+        raise RequestRejectedError(
+            "kv.put",
+            {
+                "operation": "write",
+                "code": "quorum_not_met",
+                "message": "write quorum not met: successes=1, required=2",
+                "token": "tok-123",
+                "errors": [],
+            },
+        )
+
+    monkeypatch.setattr("tourctl.core.kv._run_put", fake_run_put)
+
+    with pytest.raises(SystemExit) as exc_info:
+        await kv_put(key="k", value="v", namespace="n", quorum_write=2)
+
+    assert str(exc_info.value).endswith("tourctl repair tok-123")
+
+
+@pytest.mark.tourctl
+def test_tourctl_repair_cli_forwards_the_token_and_quorum(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_kv_repair(**kwargs: Any) -> str:
+        captured.update(kwargs)
+        return "ok-repair"
+
+    monkeypatch.setattr("tourctl.bootstrap.usecases.kv.kv_repair", fake_kv_repair)
+
+    result = app(
+        ["repair", "tok-123", "-w", "2", "--json"],
+        exit_on_error=False,
+        print_error=False,
+        help_on_error=False,
+        result_action="return_value",
+    )
+
+    assert result is None
+    assert capsys.readouterr().out == "ok-repair\n"
+    assert captured["token"] == "tok-123"
+    assert captured["quorum_write"] == 2
+    assert captured["as_json"] is True

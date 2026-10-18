@@ -39,7 +39,6 @@ _ALWAYS_HANDOFF_PHASES = frozenset({MemberPhase.DRAINING, MemberPhase.PAUSED})
 class Preference:
     node_id: str
     readable: bool
-    alive: bool
     handoff: str | None
 
 
@@ -116,7 +115,6 @@ class SimplePlacementStrategy:
                 Preference(
                     node_id=member.node_id,
                     readable=readable,
-                    alive=self._is_alive(member.node_id),
                     handoff=handoff,
                 )
             )

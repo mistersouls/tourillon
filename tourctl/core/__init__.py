@@ -13,8 +13,8 @@
 # limitations under the License.
 
 from tourctl.core.inspect import inspect_node
-from tourctl.core.kv import kv_delete, kv_get, kv_put
+from tourctl.core.kv import kv_delete, kv_get, kv_put, kv_repair
 from tourctl.core.probe import ping_probe
 
-__all__ = ["ping_probe", "inspect_node", "kv_put", "kv_get", "kv_delete"]
+__all__ = ["ping_probe", "inspect_node", "kv_put", "kv_get", "kv_delete", "kv_repair"]
 

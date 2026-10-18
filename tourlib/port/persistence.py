@@ -40,6 +40,3 @@ class Persistence(Protocol):
     async def write(self, path: Path, document: Mapping[str, Any]) -> None:
         """Atomically persist *document* to *path* under an exclusive lock."""
 
-
-__all__ = ["Persistence"]
-

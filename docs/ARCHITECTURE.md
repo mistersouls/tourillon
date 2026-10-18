@@ -135,8 +135,20 @@ Deletes are **tombstones**, never physical removals, so a delete can win over a 
 3. A winner is selected by a **total order**: replica count, then HLC timestamp, then namespace, key, data, and quorum marker as deterministic tie-breaks.
 4. If `quorum_read` was requested, the count is verified.
 5. A tombstone winner is returned to the caller as "absent".
+6. Replicas that answered with a missing or older version are healed in the background (**read repair**), bounded by a semaphore and deduplicated per address and node. Repair never blocks the answer.
 
 > The ordering function must be a total order and identical on every node. If two nodes order the same candidate set differently, replicas diverge permanently.
+
+### Resuming an under-replicated write (`kv.repair`)
+
+A write that misses its requested `quorum_write` is **not rolled back**: the version exists wherever it landed. Rather than hide that, the failure carries an opaque **handle** designating the exact version.
+
+1. The client hands the handle back through `kv.repair`.
+2. The receiving node decodes it, recomputes the partition id from the address and refuses a mismatch or an implausibly distant timestamp — all local, before any RPC.
+3. `replication.lookup` asks each replica whether it holds that exact version; a copy surviving only as a hint can serve as the source but never counts as its owner's durability.
+4. Missing owners receive the version, and the requested quorum is verified again — so a repair may itself report a quorum failure, with the same handle, and be retried.
+
+The handle makes a partial write resumable instead of pushing the operator towards a second write under a new timestamp.
 
 ### Hinted handoff replay
 
@@ -211,13 +223,13 @@ Handlers are async generators registered once per kind on the peer or client dis
 | Service | Endpoints | Kinds |
 | --- | --- | --- |
 | `probe` | client, peer | `probe.ping` → `probe.pong` |
-| `kv` | client, peer | `kv.put` / `kv.get` / `kv.delete` |
+| `kv` | client, peer | `kv.put` / `kv.get` / `kv.delete` / `kv.repair` |
 | `node` | peer | `node.join` |
 | `inspect` | peer | `node.inspect` → paginated `node.info` |
 
 `gossip.*`, `replication.*` and `transfer.*` are internal to the cluster and deliberately have no client service.
 
-`tourctl` builds on those services with cyclopts commands (`probe ping`, `node inspect`, `node join`, `put`, `get`, `delete`). Commands stay thin; rendering and error mapping live in `tourctl/core/`, which translates configuration, TLS/connectivity and protocol failures into actionable `SystemExit` messages instead of tracebacks.
+`tourctl` builds on those services with cyclopts commands (`probe ping`, `node inspect`, `node join`, `put`, `get`, `delete`, `repair`). Commands stay thin; rendering and error mapping live in `tourctl/core/`, which translates configuration, TLS/connectivity and protocol failures into actionable `SystemExit` messages instead of tracebacks.
 
 `tourillon config ca | client | node` generates the mTLS material and the TOML configuration files that both sides consume.
 
@@ -250,6 +262,6 @@ The following are design decisions that have **not** been settled yet; see [`BAC
 
 - Namespaces exist on the wire and in addressing but have no registry, quota, or access-control semantics.
 - Consistency is expressed as raw per-request quorum integers; there is no named consistency-level API.
-- There is no read repair: a read selects a winner but does not heal stale replicas.
+- There is no anti-entropy between replicas outside the read path: divergence is healed opportunistically by read repair, or on demand through `kv.repair`, and never proactively.
 - Placement has no failure-domain (anti-affinity) awareness.
 - Graceful leave and steady-state rebalancing are not implemented; transfers are currently join-driven.

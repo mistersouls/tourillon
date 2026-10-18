@@ -35,3 +35,16 @@ class DeleteRequest:
     namespace: bytes
     key: bytes
     quorum_write: int | None = None
+
+
+@dataclass(frozen=True)
+class RepairRequest:
+    """Resume a write that was persisted without reaching its quorum.
+
+    The token is the opaque handle returned with the quorum failure. It
+    designates an existing version, so a repair copies it rather than writing
+    a new one, which is what makes retrying harmless.
+    """
+
+    token: str
+    quorum_write: int | None = None

@@ -119,10 +119,6 @@ class GossipBootstrapper:
                 await client.connect()
 
             members = await self._exchange_digest(client, seed_address)
-            for member in members:
-                # todo(souls) some pre check condition
-                pass
-
             await self._topologymgr.merge_registry(members)
             results[idx] = True
         except BootstrapPartitionShiftError:

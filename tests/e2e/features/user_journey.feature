@@ -34,6 +34,11 @@ Feature: Operate a real Tourillon database through its command-line tools
     When I write the same key in two namespaces and delete it from one
     Then only that namespace loses its value and the default namespace stays empty
 
+  Scenario: An under-replicated write is resumable from the handle it returns
+    Given an authorized single-node database
+    When I write a value demanding more replicas than the database holds
+    Then the write fails but the value is readable and the handle resumes it
+
   Scenario: Invalid node configuration fails without leaving a server
     Given a generated node and authorized client configuration
     When I start the node with an invalid configuration

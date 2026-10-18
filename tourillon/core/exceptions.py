@@ -15,6 +15,8 @@
 from collections.abc import Sequence
 from typing import Any
 
+from tourlib.constant import MAX_QUORUM
+
 
 class BootstrapPartitionShiftError(Exception):
     """
@@ -104,6 +106,11 @@ class QuorumNotMetError(StoreOperationError):
 
     Underlying errors are optional: replicas may all have answered and still
     disagree, or some of them may not have answered in time.
+
+    A write carries the handle of the version it produced. The write is
+    persisted on the replicas that did accept it, so the failure is partial by
+    nature: the handle is what lets the client finish the job with `kv.repair`
+    instead of writing a second version.
     """
 
     code = "quorum_not_met"
@@ -114,14 +121,19 @@ class QuorumNotMetError(StoreOperationError):
         required: int,
         received: int,
         errors: Sequence[Exception] = (),
+        token: str | None = None,
     ) -> None:
         self.required = required
         self.received = received
+        self.token = token
         message = f"{operation} quorum not met: successes={received}, required={required}"
         self._set_details(operation, errors, message)
 
     def to_dict(self) -> dict[str, Any]:
-        return {**super().to_dict(), "required": self.required, "received": self.received}
+        data = {**super().to_dict(), "required": self.required, "received": self.received}
+        if self.token is not None:
+            data["token"] = self.token
+        return data
 
 
 class NoReplicaAvailableError(StoreOperationError):
@@ -131,6 +143,66 @@ class NoReplicaAvailableError(StoreOperationError):
 
     def __init__(self, operation: str) -> None:
         self._set_details(operation, (), f"{operation}: preference list has no replication target")
+
+
+class InvalidQuorumError(StoreOperationError):
+    """Raised when a request asks for a quorum the store cannot record.
+
+    The requested durability is persisted with the version, in a single byte,
+    so a quorum outside that range has no storable meaning and is refused
+    before anything is written.
+    """
+
+    code = "invalid_quorum"
+
+    def __init__(self, operation: str, quorum: int) -> None:
+        self.quorum = quorum
+        self._set_details(
+            operation,
+            (),
+            f"{operation}: quorum {quorum} is out of range [1, {MAX_QUORUM}]",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**super().to_dict(), "quorum": self.quorum}
+
+
+class InvalidRepairTokenError(StoreOperationError):
+    """Raised when a repair handle cannot designate a version of this store.
+
+    The handle is unsigned on purpose, so a fabricated one must be caught by
+    what it says rather than by who sent it: a malformed encoding, a timestamp
+    no clock here could have emitted, or a partition id that disagrees with
+    the address it is paired with. That last case is the dangerous one — a
+    record filed under a foreign partition id lands where reads for its
+    address never look.
+    """
+
+    code = "invalid_repair_token"
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        self._set_details("repair", (), f"repair: invalid token: {reason}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**super().to_dict(), "reason": self.reason}
+
+
+class VersionNotFoundError(StoreOperationError):
+    """Raised when no replica holds the version a repair was asked to spread.
+
+    Distinct from a met quorum with nothing to do: here there is nothing to
+    copy, and repair never creates a version it did not find.
+    """
+
+    code = "version_not_found"
+
+    def __init__(self, token: str) -> None:
+        self.token = token
+        self._set_details("repair", (), "repair: no replica holds this version")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**super().to_dict(), "token": self.token}
 
 
 class ProcessError(Exception):

@@ -14,10 +14,12 @@
 
 from contextlib import asynccontextmanager
 import pickle
+import time
 from typing import cast
 
 import pytest
 
+from tourillon.core.models.retry import BackoffRetry
 from tourillon.core.models.storageschema import (
     Key,
     Keyspace,
@@ -29,7 +31,7 @@ from tourillon.core.models.storageschema import (
     TagKind,
     Value,
 )
-from tourillon.core.replay.hint import HintReplayer
+from tourillon.core.replay.hint import HintReplayer, _TargetBackoff
 from tourlib.envelope import Envelope, build_envelope
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
@@ -38,12 +40,17 @@ from tourlib.models.version import Address
 class _FakeStore:
     def __init__(self) -> None:
         self._items: dict[tuple[Keyspace, bytes], KVPair] = {}
+        self.gets: list[tuple[Keyspace, bytes]] = []
 
     def put(self, kv: KVPair) -> None:
         self._items[(kv.keyspace, kv.key)] = kv
 
     def get(self, ref: KVRef) -> KVPair | None:
+        self.gets.append((ref.keyspace, ref.key))
         return self._items.get((ref.keyspace, ref.key))
+
+    def reads(self, keyspace: Keyspace) -> int:
+        return sum(1 for ks, _ in self.gets if ks == keyspace)
 
     def list(self, keyspace: Keyspace) -> list[KVPair]:
         items = [kv for (ks, _), kv in self._items.items() if ks == keyspace]
@@ -194,6 +201,15 @@ def _record_at(idx: int) -> Record:
     )
 
 
+def _live_at(idx: int) -> Record:
+    key = Key(
+        pid=Pid(7),
+        address=Address(namespace=b"ns", key=f"live{idx}".encode()),
+        ts=HLCTimestamp(wall_ms=200 + idx, counter=idx, node_id="node-a"),
+    )
+    return Record(key=key, value=Value(data=b"x", quorum_write=1), tag=Tag(kind=TagKind.LIVE))
+
+
 def _seed(store: _FakeStore, record: Record) -> None:
     store.put(KVPair(key=record.key.to_bytes(Keyspace.TAGS), value=record.tag.to_bytes(), keyspace=Keyspace.TAGS))
     store.put(KVPair(key=record.key.to_bytes(Keyspace.LOGS), value=record.value.to_bytes(), keyspace=Keyspace.LOGS))
@@ -278,3 +294,79 @@ async def test_replay_once_keeps_hint_when_remote_write_is_rejected() -> None:
     assert provider.write_sessions == 0
 
 
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_replay_does_not_read_logs_for_non_hint_tags() -> None:
+    """A replay cycle must cost the number of hints, not the size of the store.
+
+    Tags carry their own kind, so a live entry can be discarded without
+    touching LOGS. Without that, every cycle issued one random read per stored
+    version, a few times a second, even with nothing to replay.
+    """
+    store = _FakeStore()
+    for idx in range(5):
+        _seed(store, _live_at(idx))
+    hint = _record()
+    _seed(store, hint)
+    serializer = _PickleSerializer()
+    provider = _FakeSessionProvider(store)
+    replayer = HintReplayer(
+        storage=cast(object, _FakeStorage(provider)),
+        peer_pool=_FakePeerPool(_FakeClient(serializer, "replication.write.accept")),  # type: ignore[arg-type]
+        serializer=serializer,  # type: ignore[arg-type]
+        total_groups=1,
+    )
+
+    await replayer._replay_once()
+
+    assert store.reads(Keyspace.LOGS) == 1
+    assert _stored_tag(store, hint) == Tag(kind=TagKind.LIVE)
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_replay_leases_an_unreachable_target_once_per_cycle() -> None:
+    """One unreachable peer must not cost one dial per pending hint."""
+    store = _FakeStore()
+    hints = [_record_at(1), _record_at(2), _record_at(3)]
+    for record in hints:
+        _seed(store, record)
+    serializer = _PickleSerializer()
+    pool = _FakePeerPool(_FakeClient(serializer, "replication.write.unexpected"))
+    replayer = HintReplayer(
+        storage=cast(object, _FakeStorage(provider := _FakeSessionProvider(store))),
+        peer_pool=pool,  # type: ignore[arg-type]
+        serializer=serializer,  # type: ignore[arg-type]
+        total_groups=1,
+    )
+
+    await replayer._replay_once()
+
+    assert pool.leased == ["node-b"]
+    assert all(_stored_tag(store, record).kind == TagKind.HINT for record in hints)
+    assert provider.write_sessions == 0
+
+
+@pytest.mark.tourillon
+def test_target_backoff_defers_after_failure_and_resets_after_success() -> None:
+    backoff = _TargetBackoff(BackoffRetry(initial_delay=30.0, jitter=0.0))
+
+    assert backoff.deferred("node-b") is False
+    backoff.failed("node-b")
+    assert backoff.deferred("node-b") is True
+    assert backoff.deferred("node-c") is False
+
+    backoff.succeeded("node-b")
+    assert backoff.deferred("node-b") is False
+
+
+@pytest.mark.tourillon
+def test_target_backoff_grows_the_delay_while_the_target_stays_down() -> None:
+    backoff = _TargetBackoff(BackoffRetry(initial_delay=1.0, factor=2.0, max_delay=4.0, jitter=0.0))
+
+    delays = []
+    for _ in range(4):
+        backoff.failed("node-b")
+        delays.append(round(backoff._until["node-b"] - time.monotonic()))
+
+    assert delays == [1, 2, 4, 4]
