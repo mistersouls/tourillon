@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tourctl"
-version = "0.1.0.dev1"
+version = "0.1.0.dev2"
 description = "Command-line client and operator tools for Tourillon."
 requires-python = ">=3.14"
 dependencies = ["tourlib"]

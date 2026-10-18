@@ -976,7 +976,7 @@ wheels = [
 
 [[package]]
 name = "tourctl"
-version = "0.1.0.dev1"
+version = "0.1.0.dev2"
 source = { editable = "tourctl" }
 dependencies = [
     { name = "tourlib" },
@@ -987,7 +987,7 @@ requires-dist = [{ name = "tourlib", virtual = "tourlib" }]
 
 [[package]]
 name = "tourillon"
-version = "0.1.0.dev1"
+version = "0.1.0.dev2"
 source = { editable = "tourillon" }
 dependencies = [
     { name = "lmdb" },
@@ -1027,7 +1027,7 @@ requires-dist = [
 
 [[package]]
 name = "tourproject"
-version = "0.1.0.dev1"
+version = "0.1.0.dev2"
 source = { virtual = "." }
 
 [package.optional-dependencies]
