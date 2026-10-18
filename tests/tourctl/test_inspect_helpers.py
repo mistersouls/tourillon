@@ -47,7 +47,11 @@ def _node_info(*, members: tuple[MemberInspect, ...]) -> NodeInfo:
             total_partitions=1024,
             owned_partitions=12,
             owned_percent=1.2,
-            vnode_ranges=(VnodeRangeInspect(token="0x123456789abcdef", arc=(900, 120), partitions=244),),
+            vnode_ranges=(
+                VnodeRangeInspect(
+                    token="0x123456789abcdef", arc=(900, 120), partitions=244
+                ),
+            ),
         ),
         gossip_stats={
             "known_members": 3,
@@ -68,19 +72,37 @@ def _node_info(*, members: tuple[MemberInspect, ...]) -> NodeInfo:
 @pytest.mark.parametrize(
     ("exc", "context_name", "expected"),
     [
-        (FileNotFoundError("missing"), None, "Unable to load the Tourillon client config"),
+        (
+            FileNotFoundError("missing"),
+            None,
+            "Unable to load the Tourillon client config",
+        ),
         (KeyError("clusters.default"), None, "Missing client configuration entry"),
         (KeyError("prod"), "prod", "Unknown client context 'prod'"),
         (ValidationError("bad"), None, "Invalid Tourillon client configuration"),
-        (ssl.SSLError("bad tls"), None, "TLS setup or handshake failed during node inspect"),
-        (OSError("network down"), None, "Unable to reach the Tourillon node for inspect"),
+        (
+            ssl.SSLError("bad tls"),
+            None,
+            "TLS setup or handshake failed during node inspect",
+        ),
+        (
+            OSError("network down"),
+            None,
+            "Unable to reach the Tourillon node for inspect",
+        ),
         (ProtocolError("bad frame"), None, "invalid inspect response"),
         (ResponseError("bad response"), None, "invalid inspect response"),
-        (UnknownServiceError("Unknown service: inspect"), None, "Unknown service: inspect"),
+        (
+            UnknownServiceError("Unknown service: inspect"),
+            None,
+            "Unknown service: inspect",
+        ),
         (RuntimeError("boom"), None, "Node inspect failed: boom"),
     ],
 )
-def test_inspect_error_message_branches(exc: Exception, context_name: str | None, expected: str) -> None:
+def test_inspect_error_message_branches(
+    exc: Exception, context_name: str | None, expected: str
+) -> None:
     assert expected in _inspect_error_message(exc, context_name)
 
 
@@ -100,7 +122,9 @@ def test_render_text_merges_members_and_formats_wraparound() -> None:
         )
     )
     second = _node_info(
-        members=(MemberInspect(node_id="node-2", phase="READY", status="DEAD", epoch=4),)
+        members=(
+            MemberInspect(node_id="node-2", phase="READY", status="DEAD", epoch=4),
+        )
     )
 
     output = _render_text("127.0.0.1:7701", [first, second])
@@ -114,8 +138,16 @@ def test_render_text_merges_members_and_formats_wraparound() -> None:
 
 @pytest.mark.tourctl
 def test_merge_members_keeps_latest_entry_per_node() -> None:
-    first = _node_info(members=(MemberInspect(node_id="node-2", phase="READY", status="UNKNOWN", epoch=1),))
-    second = _node_info(members=(MemberInspect(node_id="node-2", phase="READY", status="DEAD", epoch=2),))
+    first = _node_info(
+        members=(
+            MemberInspect(node_id="node-2", phase="READY", status="UNKNOWN", epoch=1),
+        )
+    )
+    second = _node_info(
+        members=(
+            MemberInspect(node_id="node-2", phase="READY", status="DEAD", epoch=2),
+        )
+    )
 
     merged = _merge_members([first, second])
 
@@ -136,4 +168,3 @@ def test_gossip_state_variants() -> None:
     assert _gossip_state({"last_ae_failure": "boom"}) == "degraded"
     assert _gossip_state({"ae_diverged": 1}) == "active"
     assert _gossip_state({"ae_diverged": 0}) == "stable"
-

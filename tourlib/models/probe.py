@@ -18,12 +18,14 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class ProbePing:
     """Probe ping request payload."""
+
     timestamp_ms: int
 
 
 @dataclass(frozen=True)
 class ProbePong:
     """Probe pong response payload."""
+
     node_id: str
     timestamp_ms: int
     recv_ms: int

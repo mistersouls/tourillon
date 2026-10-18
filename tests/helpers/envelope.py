@@ -35,4 +35,3 @@ def make_envelope(
         kind=kind,
         payload=payload,
     )
-

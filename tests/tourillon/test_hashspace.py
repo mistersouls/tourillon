@@ -61,4 +61,3 @@ def test_hashspace_truncates_md5_to_requested_bit_width() -> None:
     space = HashSpace(bits=12)
 
     assert space.hash(b"abc") == full_int >> (128 - 12)
-

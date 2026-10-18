@@ -38,7 +38,7 @@ class PeerFailureDetector:
         serializer: Serializer,
         threshold: float = 8.0,
         probe_interval: float = 5.0,
-        probe_jitter: float = 0.2
+        probe_jitter: float = 0.2,
     ) -> None:
         self._peer_id = peer_id
         self._serializer = serializer
@@ -62,8 +62,7 @@ class PeerFailureDetector:
             if not self.is_running:
                 self._active = True
                 self._probe_task = asyncio.create_task(
-                    self._probe_peer(),
-                    name=f"probe-{self._peer_id}"
+                    self._probe_peer(), name=f"probe-{self._peer_id}"
                 )
 
     async def stop(self) -> None:
@@ -81,7 +80,6 @@ class PeerFailureDetector:
     def status(self) -> PeerStatus:
         if self._active:
             return PeerStatus.SUSPECT
-
 
         phi = self._phi_accrual.phi()
         if phi < 1:
@@ -110,9 +108,7 @@ class PeerFailureDetector:
         while True:
             payload = self._serializer.encode({"timestamp_ms": int(time.time() * 1000)})
             ping = build_envelope(
-                kind="probe.ping",
-                payload=payload,
-                schema_id=self._serializer.schema_id
+                kind="probe.ping", payload=payload, schema_id=self._serializer.schema_id
             )
             try:
                 await self._client.request(ping)
@@ -125,8 +121,12 @@ class PeerFailureDetector:
                 self._phi_accrual.reset()
                 break
 
-            interval = self._probe_interval + random.uniform(-self._probe_jitter, self._probe_jitter)
-            logger.debug("Probing peer %s, next probe in %.2f seconds", self._peer_id, interval)
+            interval = self._probe_interval + random.uniform(
+                -self._probe_jitter, self._probe_jitter
+            )
+            logger.debug(
+                "Probing peer %s, next probe in %.2f seconds", self._peer_id, interval
+            )
             await asyncio.sleep(interval)
 
 
@@ -136,7 +136,7 @@ class FailureDetectorProvider:
         serializer: Serializer,
         threshold: float = 8.0,
         probe_interval: float = 5.0,
-        probe_jitter: float = 0.2
+        probe_jitter: float = 0.2,
     ) -> None:
         self._serializer = serializer
         self._threshold = threshold
@@ -149,5 +149,5 @@ class FailureDetectorProvider:
             serializer=self._serializer,
             threshold=self._threshold,
             probe_interval=self._probe_interval,
-            probe_jitter=self._probe_jitter
+            probe_jitter=self._probe_jitter,
         )

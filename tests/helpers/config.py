@@ -31,4 +31,3 @@ def generate_ca(tmp_path: Path) -> tuple[Path, Path]:
         overwrite=False,
     )
     return ca_result.certificate_path, ca_result.private_key_path
-

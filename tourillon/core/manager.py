@@ -61,9 +61,7 @@ class Manager:
     ) -> None:
         self._config = config
         self._partitioner = Partitioner(
-            hashspace=HashSpace(bits=128),
-            pshift=17,
-            gshift=2
+            hashspace=HashSpace(bits=128), pshift=17, gshift=2
         )
         self._topologymgr = TopologyManager()
         self._gossip_stats = GossipStats()
@@ -85,7 +83,7 @@ class Manager:
             replication_factor=config.placement.replication_factor,
             topologymgr=self._topologymgr,
             partitioner=self._partitioner,
-            peer_pool=self._peer_pool
+            peer_pool=self._peer_pool,
         )
         self._store = StoreService(
             node_id=config.node.id,
@@ -128,7 +126,7 @@ class Manager:
             topologymgr=self._topologymgr,
             serializer=serializer,
             storage=self._storage,
-            partitioner=self._partitioner
+            partitioner=self._partitioner,
         )
         self._serializer = serializer
 
@@ -178,7 +176,9 @@ class Manager:
         try:
             latest = await self._storage.latest_hlc(self._partitioner.total_groups)
         except Exception:
-            logger.exception("Failed to load latest HLC from storage for node '%s'", self.node_id)
+            logger.exception(
+                "Failed to load latest HLC from storage for node '%s'", self.node_id
+            )
             raise
         logger.info(
             "Latest persisted HLC for node '%s': wall_ms=%s counter=%s source_node=%s",
@@ -205,7 +205,9 @@ class Manager:
             try:
                 await step()
             except Exception as exc:
-                logger.exception("shutdown step failed: %s, reason=%s", step.__qualname__, exc)
+                logger.exception(
+                    "shutdown step failed: %s, reason=%s", step.__qualname__, exc
+                )
         logger.info("Manager stopped for node '%s'", self.node_id)
 
     async def serve_forever(self, seeds: list[str] | None = None) -> None:
@@ -221,7 +223,9 @@ class Manager:
             try:
                 await stop_requested.wait()
             except KeyboardInterrupt:
-                logger.info("Keyboard interrupt received; shutting down node '%s'", self.node_id)
+                logger.info(
+                    "Keyboard interrupt received; shutting down node '%s'", self.node_id
+                )
         finally:
             await self.stop()
 

@@ -57,12 +57,7 @@ class PartitionRange:
 
 
 class Partitioner:
-    def __init__(
-        self,
-        pshift: int,
-        gshift: int,
-        hashspace: HashSpace
-    ) -> None:
+    def __init__(self, pshift: int, gshift: int, hashspace: HashSpace) -> None:
         if pshift >= hashspace.bits:
             raise ValueError(
                 f"partition_shift ({pshift}) must be "

@@ -39,13 +39,13 @@ async def put(request: Envelope) -> AsyncIterator[Envelope]:
         yield replay_envelope(
             kind="kv.put.accept",
             request=request,
-            payload=serializer.encode(None if version is None else version.to_dict())
+            payload=serializer.encode(None if version is None else version.to_dict()),
         )
     except StoreOperationError as exc:
         yield replay_envelope(
             kind=f"{request.kind}.reject",
             request=request,
-            payload=serializer.encode(exc.to_dict())
+            payload=serializer.encode(exc.to_dict()),
         )
 
 
@@ -64,13 +64,13 @@ async def get(request: Envelope) -> AsyncIterator[Envelope]:
         yield replay_envelope(
             kind="kv.get.accept",
             request=request,
-            payload=serializer.encode(None if version is None else version.to_dict())
+            payload=serializer.encode(None if version is None else version.to_dict()),
         )
     except StoreOperationError as exc:
         yield replay_envelope(
             kind=f"{request.kind}.reject",
             request=request,
-            payload=serializer.encode(exc.to_dict())
+            payload=serializer.encode(exc.to_dict()),
         )
 
 
@@ -89,13 +89,13 @@ async def delete(request: Envelope) -> AsyncIterator[Envelope]:
         yield replay_envelope(
             kind="kv.delete.accept",
             request=request,
-            payload=serializer.encode(None if version is None else version.to_dict())
+            payload=serializer.encode(None if version is None else version.to_dict()),
         )
     except StoreOperationError as exc:
         yield replay_envelope(
             kind=f"{request.kind}.reject",
             request=request,
-            payload=serializer.encode(exc.to_dict())
+            payload=serializer.encode(exc.to_dict()),
         )
 
 
@@ -120,5 +120,5 @@ async def repair(request: Envelope) -> AsyncIterator[Envelope]:
         yield replay_envelope(
             kind=f"{request.kind}.reject",
             request=request,
-            payload=serializer.encode(exc.to_dict())
+            payload=serializer.encode(exc.to_dict()),
         )

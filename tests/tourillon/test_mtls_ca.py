@@ -26,8 +26,11 @@ def test_generate_ca_rejects_validity_days_below_one() -> None:
     adapter = CryptographyMtlsAdapter()
     with pytest.raises(ValueError, match="validity_days must be >= 1"):
         adapter.generate_ca(
-            common_name="ca", organization="org", country=None,
-            validity_days=0, key_size=2048,
+            common_name="ca",
+            organization="org",
+            country=None,
+            validity_days=0,
+            key_size=2048,
         )
 
 
@@ -36,8 +39,11 @@ def test_generate_ca_rejects_key_size_below_2048() -> None:
     adapter = CryptographyMtlsAdapter()
     with pytest.raises(ValueError, match="key_size must be >= 2048"):
         adapter.generate_ca(
-            common_name="ca", organization="org", country=None,
-            validity_days=1, key_size=1024,
+            common_name="ca",
+            organization="org",
+            country=None,
+            validity_days=1,
+            key_size=1024,
         )
 
 
@@ -45,14 +51,19 @@ def test_generate_ca_rejects_key_size_below_2048() -> None:
 def test_generate_cert_rejects_empty_common_name(tmp_path: Path) -> None:
     adapter = CryptographyMtlsAdapter()
     ca_cert, ca_key = adapter.generate_ca(
-        common_name="ca", organization="org", country=None,
-        validity_days=1, key_size=2048,
+        common_name="ca",
+        organization="org",
+        country=None,
+        validity_days=1,
+        key_size=2048,
     )
     with pytest.raises(ValueError, match="common_name must not be empty"):
         adapter.generate_cert(
             common_name="",
-            ca_certificate_pem=ca_cert, ca_private_key_pem=ca_key,
-            validity_days=1, key_size=2048,
+            ca_certificate_pem=ca_cert,
+            ca_private_key_pem=ca_key,
+            validity_days=1,
+            key_size=2048,
         )
 
 
@@ -60,14 +71,19 @@ def test_generate_cert_rejects_empty_common_name(tmp_path: Path) -> None:
 def test_generate_cert_rejects_validity_days_below_one(tmp_path: Path) -> None:
     adapter = CryptographyMtlsAdapter()
     ca_cert, ca_key = adapter.generate_ca(
-        common_name="ca", organization="org", country=None,
-        validity_days=1, key_size=2048,
+        common_name="ca",
+        organization="org",
+        country=None,
+        validity_days=1,
+        key_size=2048,
     )
     with pytest.raises(ValueError, match="validity_days must be >= 1"):
         adapter.generate_cert(
             common_name="node",
-            ca_certificate_pem=ca_cert, ca_private_key_pem=ca_key,
-            validity_days=0, key_size=2048,
+            ca_certificate_pem=ca_cert,
+            ca_private_key_pem=ca_key,
+            validity_days=0,
+            key_size=2048,
         )
 
 
@@ -75,14 +91,19 @@ def test_generate_cert_rejects_validity_days_below_one(tmp_path: Path) -> None:
 def test_generate_cert_rejects_key_size_below_2048(tmp_path: Path) -> None:
     adapter = CryptographyMtlsAdapter()
     ca_cert, ca_key = adapter.generate_ca(
-        common_name="ca", organization="org", country=None,
-        validity_days=1, key_size=2048,
+        common_name="ca",
+        organization="org",
+        country=None,
+        validity_days=1,
+        key_size=2048,
     )
     with pytest.raises(ValueError, match="key_size must be >= 2048"):
         adapter.generate_cert(
             common_name="node",
-            ca_certificate_pem=ca_cert, ca_private_key_pem=ca_key,
-            validity_days=1, key_size=1024,
+            ca_certificate_pem=ca_cert,
+            ca_private_key_pem=ca_key,
+            validity_days=1,
+            key_size=1024,
         )
 
 
@@ -161,4 +182,3 @@ def test_cli_tourillon_config_ca(tmp_path: Path) -> None:
     assert "Generated mTLS CA files" in result
     assert cert_path.exists()
     assert key_path.exists()
-

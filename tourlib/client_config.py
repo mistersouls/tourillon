@@ -106,7 +106,9 @@ class ClientCluster:
 
     @classmethod
     def from_document(cls, document: Mapping[str, Any]) -> "ClientCluster":
-        return cls(client=require_str(document, "client"), peer=require_str(document, "peer"))
+        return cls(
+            client=require_str(document, "client"), peer=require_str(document, "peer")
+        )
 
 
 @dataclass(frozen=True)
@@ -147,8 +149,12 @@ class ClientConfig:
         return {
             "version": self.version,
             "current-context": self.current_context,
-            "contexts": {name: value.to_document() for name, value in self.contexts.items()},
-            "clusters": {name: value.to_document() for name, value in self.clusters.items()},
+            "contexts": {
+                name: value.to_document() for name, value in self.contexts.items()
+            },
+            "clusters": {
+                name: value.to_document() for name, value in self.clusters.items()
+            },
             "auth": {name: value.to_document() for name, value in self.auth.items()},
         }
 
@@ -156,8 +162,12 @@ class ClientConfig:
     def from_document(cls, document: Mapping[str, Any]) -> "ClientConfig":
         version = require_str(document, "version")
         current_context = require_str(document, "current-context")
-        contexts = require_named_table(document, "contexts", ClientContext.from_document)
-        clusters = require_named_table(document, "clusters", ClientCluster.from_document)
+        contexts = require_named_table(
+            document, "contexts", ClientContext.from_document
+        )
+        clusters = require_named_table(
+            document, "clusters", ClientCluster.from_document
+        )
         auth = require_named_table(document, "auth", ClientAuthConfig.from_document)
         config = cls(
             version=version,
@@ -174,9 +184,13 @@ class ClientConfig:
             raise ValueError("current-context must reference an existing context")
         for name, context in self.contexts.items():
             if context.cluster not in self.clusters:
-                raise ValueError(f"context '{name}' references unknown cluster '{context.cluster}'")
+                raise ValueError(
+                    f"context '{name}' references unknown cluster '{context.cluster}'"
+                )
             if context.auth not in self.auth:
-                raise ValueError(f"context '{name}' references unknown auth '{context.auth}'")
+                raise ValueError(
+                    f"context '{name}' references unknown auth '{context.auth}'"
+                )
 
     def context(self, name: str | None = None) -> ClientContext:
         resolved = self.current_context if name is None else name

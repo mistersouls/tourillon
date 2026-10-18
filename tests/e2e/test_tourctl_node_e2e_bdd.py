@@ -67,12 +67,16 @@ def node_command_context(tmp_path: Path) -> dict[str, object]:
             process.wait(timeout=TERMINATION_TIMEOUT_SECONDS)
 
 
-@scenario("features/tourillon_tourctl_node.feature", "Display help for tourctl node inspect")
+@scenario(
+    "features/tourillon_tourctl_node.feature", "Display help for tourctl node inspect"
+)
 def test_tourctl_node_inspect_help_e2e() -> None:
     pass
 
 
-@scenario("features/tourillon_tourctl_node.feature", "Display help for tourctl node join")
+@scenario(
+    "features/tourillon_tourctl_node.feature", "Display help for tourctl node join"
+)
 def test_tourctl_node_join_help_e2e() -> None:
     pass
 
@@ -203,7 +207,9 @@ def given_running_node_target_configs(node_command_context: dict[str, object]) -
 
 
 @given("a tourillon node is running for node commands")
-def given_running_node_for_node_commands(node_command_context: dict[str, object]) -> None:
+def given_running_node_for_node_commands(
+    node_command_context: dict[str, object],
+) -> None:
     tourillon_cli = node_command_context["tourillon_cli"]
     node_config_path = node_command_context["node_config_path"]
     peer_port = node_command_context["peer_port"]
@@ -226,7 +232,9 @@ def given_running_node_for_node_commands(node_command_context: dict[str, object]
             stderr = ""
             if process.stderr is not None:
                 stderr = process.stderr.read()
-            raise AssertionError(f"tourillon node exited before node commands: {stderr}")
+            raise AssertionError(
+                f"tourillon node exited before node commands: {stderr}"
+            )
         try:
             with socket.create_connection(("127.0.0.1", peer_port), timeout=0.5):
                 return
@@ -328,7 +336,9 @@ def then_node_inspect_succeeds(node_command_context: dict[str, object]) -> None:
 
 
 @then("the node inspect output includes the running node id")
-def then_node_inspect_output_has_node_id(node_command_context: dict[str, object]) -> None:
+def then_node_inspect_output_has_node_id(
+    node_command_context: dict[str, object],
+) -> None:
     result = node_command_context["result"]
     node_id = node_command_context["node_id"]
     assert isinstance(result, subprocess.CompletedProcess)
@@ -352,7 +362,9 @@ def then_node_join_succeeds(node_command_context: dict[str, object]) -> None:
 
 
 @then("the node join output confirms the operation was triggered")
-def then_node_join_output_reports_triggered(node_command_context: dict[str, object]) -> None:
+def then_node_join_output_reports_triggered(
+    node_command_context: dict[str, object],
+) -> None:
     result = node_command_context["result"]
     assert isinstance(result, subprocess.CompletedProcess)
     assert "join operation is successful triggered" in result.stdout.lower()

@@ -106,7 +106,9 @@ class CryptographyMtlsAdapter:
         validity_days: int,
     ) -> x509.Certificate:
         now = dt.datetime.now(dt.UTC)
-        subject = self._subject(common_name=common_name, organization=organization, country=country)
+        subject = self._subject(
+            common_name=common_name, organization=organization, country=country
+        )
         return (
             x509.CertificateBuilder()
             .subject_name(subject)
@@ -115,7 +117,9 @@ class CryptographyMtlsAdapter:
             .serial_number(x509.random_serial_number())
             .not_valid_before(now - dt.timedelta(minutes=1))
             .not_valid_after(now + dt.timedelta(days=validity_days))
-            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(
+                x509.BasicConstraints(ca=True, path_length=None), critical=True
+            )
             .add_extension(
                 x509.KeyUsage(
                     digital_signature=False,
@@ -166,7 +170,9 @@ class CryptographyMtlsAdapter:
             .serial_number(x509.random_serial_number())
             .not_valid_before(now - dt.timedelta(minutes=1))
             .not_valid_after(now + dt.timedelta(days=validity_days))
-            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.BasicConstraints(ca=False, path_length=None), critical=True
+            )
             .add_extension(
                 x509.SubjectKeyIdentifier.from_public_key(leaf_public_key),
                 critical=False,
@@ -183,10 +189,11 @@ class CryptographyMtlsAdapter:
         )
 
     @staticmethod
-    def _subject(*, common_name: str, organization: str, country: str | None) -> x509.Name:
+    def _subject(
+        *, common_name: str, organization: str, country: str | None
+    ) -> x509.Name:
         parts = [x509.NameAttribute(NameOID.ORGANIZATION_NAME, organization)]
         if country is not None:
             parts.insert(0, x509.NameAttribute(NameOID.COUNTRY_NAME, country))
         parts.append(x509.NameAttribute(NameOID.COMMON_NAME, common_name))
         return x509.Name(parts)
-

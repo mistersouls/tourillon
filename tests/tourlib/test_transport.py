@@ -48,7 +48,9 @@ def _fnf_envelope() -> Envelope:
 
 
 def _make_client() -> EnvelopeClient:
-    return EnvelopeClient(bind="127.0.0.1:4000", tls_ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+    return EnvelopeClient(
+        bind="127.0.0.1:4000", tls_ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    )
 
 
 class _FakeWriter:
@@ -124,7 +126,9 @@ async def test_send_raises_runtime_error_when_writer_is_none() -> None:
 
 @pytest.mark.tourlib
 @pytest.mark.asyncio
-async def test_send_calls_connect_and_send_on_fnf_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_send_calls_connect_and_send_on_fnf_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = _make_client()
     envelope = _fnf_envelope()
     calls: list[str] = []
@@ -145,7 +149,9 @@ async def test_send_calls_connect_and_send_on_fnf_envelope(monkeypatch: pytest.M
 
 @pytest.mark.tourlib
 @pytest.mark.asyncio
-async def test_connect_raises_runtime_error_when_reader_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_connect_raises_runtime_error_when_reader_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = _make_client()
     writer = _FakeWriter()
 
@@ -153,7 +159,9 @@ async def test_connect_raises_runtime_error_when_reader_is_none(monkeypatch: pyt
         _ = host, port, ssl
         return None, writer
 
-    monkeypatch.setattr("tourlib.transport.asyncio.open_connection", fake_open_connection)
+    monkeypatch.setattr(
+        "tourlib.transport.asyncio.open_connection", fake_open_connection
+    )
 
     with pytest.raises(RuntimeError, match="Failed to create reader"):
         await client.connect()
@@ -161,7 +169,9 @@ async def test_connect_raises_runtime_error_when_reader_is_none(monkeypatch: pyt
 
 @pytest.mark.tourlib
 @pytest.mark.asyncio
-async def test_connect_and_close_roundtrip_updates_connection_state(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_connect_and_close_roundtrip_updates_connection_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = _make_client()
     writer = _FakeWriter()
     read_gate = asyncio.Event()
@@ -173,7 +183,9 @@ async def test_connect_and_close_roundtrip_updates_connection_state(monkeypatch:
     async def fake_read_loop(self: EnvelopeClient) -> None:
         await read_gate.wait()
 
-    monkeypatch.setattr("tourlib.transport.asyncio.open_connection", fake_open_connection)
+    monkeypatch.setattr(
+        "tourlib.transport.asyncio.open_connection", fake_open_connection
+    )
     monkeypatch.setattr(EnvelopeClient, "_read_loop", fake_read_loop)
 
     await client.connect()
@@ -183,7 +195,6 @@ async def test_connect_and_close_roundtrip_updates_connection_state(monkeypatch:
 
     await client.close()
     assert client.is_connected is False
-
 
 
 @pytest.mark.tourlib
@@ -218,7 +229,9 @@ async def test_dequeue_with_timeout_raises_response_timeout_error() -> None:
 
 @pytest.mark.tourlib
 @pytest.mark.asyncio
-async def test_request_propagates_cancelled_error(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_request_propagates_cancelled_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = _make_client()
     envelope = _rpc_envelope()
 
@@ -237,7 +250,9 @@ async def test_request_propagates_cancelled_error(monkeypatch: pytest.MonkeyPatc
 
 @pytest.mark.tourlib
 @pytest.mark.asyncio
-async def test_request_times_out_and_cleans_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_request_times_out_and_cleans_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = _make_client()
     envelope = _rpc_envelope()
 
@@ -258,7 +273,9 @@ async def test_request_times_out_and_cleans_pending(monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.tourlib
 @pytest.mark.asyncio
-async def test_stream_yields_then_closes_and_cleans_stream_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_stream_yields_then_closes_and_cleans_stream_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = _make_client()
     envelope = _rpc_envelope()
     streamed = _rpc_envelope()
@@ -270,17 +287,23 @@ async def test_stream_yields_then_closes_and_cleans_stream_registry(monkeypatch:
     async def fake_send(_: Envelope) -> None:
         return None
 
-    async def fake_dequeue(queue: asyncio.Queue[Envelope | None], correlation_id: uuid.UUID, timeout: float):
+    async def fake_dequeue(
+        queue: asyncio.Queue[Envelope | None], correlation_id: uuid.UUID, timeout: float
+    ):
         _ = queue, correlation_id, timeout
         calls.append(1)
         return streamed if len(calls) == 1 else None
 
     monkeypatch.setattr(client, "connect", fake_connect)
     monkeypatch.setattr(client, "_send", fake_send)
-    monkeypatch.setattr(EnvelopeClient, "_dequeue_with_timeout", staticmethod(fake_dequeue))
+    monkeypatch.setattr(
+        EnvelopeClient, "_dequeue_with_timeout", staticmethod(fake_dequeue)
+    )
 
     received: list[Envelope] = []
-    with pytest.raises(ConnectionError, match=f"Stream closed for {envelope.correlation_id}"):
+    with pytest.raises(
+        ConnectionError, match=f"Stream closed for {envelope.correlation_id}"
+    ):
         async for item in client.stream(envelope, timeout=0.01):
             received.append(item)
 
@@ -310,7 +333,9 @@ async def test_stream_opened_on_a_dead_connection_survives_the_reconnection(
         await self._streams[envelope.correlation_id.bytes].put(streamed)
         await read_gate.wait()
 
-    monkeypatch.setattr("tourlib.transport.asyncio.open_connection", fake_open_connection)
+    monkeypatch.setattr(
+        "tourlib.transport.asyncio.open_connection", fake_open_connection
+    )
     monkeypatch.setattr(EnvelopeClient, "_read_loop", fake_read_loop)
 
     stream = client.stream(envelope, timeout=1.0)
@@ -324,7 +349,9 @@ async def test_stream_opened_on_a_dead_connection_survives_the_reconnection(
 
 @pytest.mark.tourlib
 @pytest.mark.asyncio
-async def test_read_loop_routes_pending_stream_and_unsolicited_messages(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_read_loop_routes_pending_stream_and_unsolicited_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = _make_client()
     pending = _rpc_envelope()
     streamed = _rpc_envelope()
@@ -457,5 +484,3 @@ async def test_send_rejects_when_client_is_closing() -> None:
 
     with pytest.raises(ConnectionError, match="closing"):
         await client._send(_rpc_envelope())
-
-

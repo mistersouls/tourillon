@@ -32,12 +32,17 @@ def ca_command_context(tmp_path: Path) -> dict[str, object]:
     return {"output_dir": tmp_path, "argv": [], "cli_path": cli_path, "result": None}
 
 
-@scenario("features/tourillon_config_ca.feature", "Generate CA files in an empty output directory")
+@scenario(
+    "features/tourillon_config_ca.feature",
+    "Generate CA files in an empty output directory",
+)
 def test_config_ca_generates_files_e2e() -> None:
     pass
 
 
-@scenario("features/tourillon_config_ca.feature", "Refuse overwrite when files already exist")
+@scenario(
+    "features/tourillon_config_ca.feature", "Refuse overwrite when files already exist"
+)
 def test_config_ca_refuses_overwrite_e2e() -> None:
     pass
 
@@ -126,10 +131,9 @@ def then_command_fails_with_file_exists(ca_command_context: dict[str, object]) -
 
 
 @then("the error message mentions overwrite refusal")
-def then_error_mentions_overwrite_refusal(ca_command_context: dict[str, object]) -> None:
+def then_error_mentions_overwrite_refusal(
+    ca_command_context: dict[str, object],
+) -> None:
     result = ca_command_context["result"]
     assert isinstance(result, subprocess.CompletedProcess)
     assert "refusing to overwrite" in result.stderr
-
-
-

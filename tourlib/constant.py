@@ -27,7 +27,7 @@ MAX_ENVELOPE_PAYLOAD = 18 * 1024 * 1024
 ENVELOPE_RESPONSE_TIMEOUT = 30.0  # seconds
 
 # Max time to wait for a connection to be established before timing out.
-ENVELOPE_CONNECTION_TIMEOUT = 5.0 # seconds
+ENVELOPE_CONNECTION_TIMEOUT = 5.0  # seconds
 
 # Current protocol version used for wire-format compatibility.
 PROTOCOL_VERSION = 1

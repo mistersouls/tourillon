@@ -26,12 +26,20 @@ from tourlib.exceptions import ProtocolError, ResponseError
 @pytest.mark.parametrize(
     ("exc", "context_name", "expected"),
     [
-        (FileNotFoundError("missing"), None, "Unable to load the Tourillon client config"),
+        (
+            FileNotFoundError("missing"),
+            None,
+            "Unable to load the Tourillon client config",
+        ),
         (KeyError("clusters.default"), None, "Missing client configuration entry"),
         (KeyError("prod"), "prod", "Unknown client context 'prod'"),
         (ValidationError("bad"), None, "Invalid Tourillon client configuration"),
         (ValueError("bad"), None, "Invalid Tourillon client configuration"),
-        (ssl.SSLError("bad tls"), None, "TLS setup or handshake failed while contacting the Tourillon node"),
+        (
+            ssl.SSLError("bad tls"),
+            None,
+            "TLS setup or handshake failed while contacting the Tourillon node",
+        ),
         (ConnectionRefusedError("nope"), None, "Tourillon node refused the connection"),
         (OSError("network down"), None, "Unable to reach the Tourillon node"),
         (ProtocolError("bad frame"), None, "returned an invalid response"),
@@ -46,4 +54,3 @@ def test_handle_error_returns_expected_message(
     expected: str,
 ) -> None:
     assert expected in handle_error(exc, context_name)
-

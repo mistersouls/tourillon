@@ -57,7 +57,9 @@ def test_node_start_requires_config_e2e() -> None:
     pass
 
 
-@scenario("features/tourillon_node_start.feature", "Start node from a generated config file")
+@scenario(
+    "features/tourillon_node_start.feature", "Start node from a generated config file"
+)
 def test_node_start_from_generated_config_e2e() -> None:
     pass
 
@@ -194,9 +196,7 @@ def when_run_node_start_command(
         except subprocess.TimeoutExpired:
             process.kill()
             _, stderr = process.communicate(timeout=TERMINATION_TIMEOUT_SECONDS)
-        raise AssertionError(
-            f"node '{node_id}' did not become ready in time: {stderr}"
-        )
+        raise AssertionError(f"node '{node_id}' did not become ready in time: {stderr}")
 
     process.terminate()
     try:
@@ -218,7 +218,9 @@ def then_command_returns_help_text(node_start_context: dict[str, object]) -> Non
 
 
 @then("the command fails because config is missing")
-def then_command_fails_because_config_missing(node_start_context: dict[str, object]) -> None:
+def then_command_fails_because_config_missing(
+    node_start_context: dict[str, object],
+) -> None:
     result = node_start_context["result"]
     assert isinstance(result, subprocess.CompletedProcess)
     assert result.returncode != 0

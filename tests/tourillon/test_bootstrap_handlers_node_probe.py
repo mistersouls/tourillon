@@ -30,7 +30,9 @@ class _ManagerStub:
         self.inspect_requests: list[NodeInspectRequest] = []
         self.join_calls: list[list[str]] = []
 
-    async def inspect(self, request: NodeInspectRequest) -> AsyncIterator[dict[str, object]]:
+    async def inspect(
+        self, request: NodeInspectRequest
+    ) -> AsyncIterator[dict[str, object]]:
         self.inspect_requests.append(request)
         yield {"chunk_index": 0, "node_id": "node-local"}
 
@@ -40,7 +42,9 @@ class _ManagerStub:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_node_handler_inspect_decodes_request_and_streams_infos(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_node_handler_inspect_decodes_request_and_streams_infos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _ManagerStub()
     monkeypatch.setattr(node_handler, "get_manager", lambda: manager)
 
@@ -59,7 +63,9 @@ async def test_node_handler_inspect_decodes_request_and_streams_infos(monkeypatc
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_node_handler_join_triggers_manager_join(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_node_handler_join_triggers_manager_join(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _ManagerStub()
     monkeypatch.setattr(node_handler, "get_manager", lambda: manager)
 
@@ -73,12 +79,16 @@ async def test_node_handler_join_triggers_manager_join(monkeypatch: pytest.Monke
 
     assert manager.join_calls == [["seed-a", "seed-b"]]
     assert responses[0].kind == "node.join.accept"
-    assert manager.serializer.decode(responses[0].payload)["message"].startswith("Join operation")
+    assert manager.serializer.decode(responses[0].payload)["message"].startswith(
+        "Join operation"
+    )
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_probe_handler_ping_replies_with_pong(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_probe_handler_ping_replies_with_pong(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _ManagerStub()
     monkeypatch.setattr(probe_handler, "get_manager", lambda: manager)
     monkeypatch.setattr(probe_handler.time, "time", lambda: 1234.567)
@@ -96,6 +106,8 @@ async def test_probe_handler_ping_replies_with_pong(monkeypatch: pytest.MonkeyPa
     assert isinstance(response, Envelope)
     assert response.kind == "probe.pong"
     payload = manager.serializer.decode(response.payload)
-    assert payload == {"node_id": "node-local", "timestamp_ms": 1000, "recv_ms": 1234567}
-
-
+    assert payload == {
+        "node_id": "node-local",
+        "timestamp_ms": 1000,
+        "recv_ms": 1234567,
+    }

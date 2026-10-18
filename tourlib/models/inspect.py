@@ -34,12 +34,20 @@ class NodeInspectRequest:
     @classmethod
     def from_document(cls, document: Mapping[str, Any]) -> "NodeInspectRequest":
         phases = cls._as_tuple_of_str(document.get("phases"), "phases")
-        probe_statuses = cls._as_tuple_of_str(document.get("probe_statuses"), "probe_statuses")
+        probe_statuses = cls._as_tuple_of_str(
+            document.get("probe_statuses"), "probe_statuses"
+        )
         node_id_prefix = document.get("node_id_prefix")
-        if node_id_prefix is not None and (not isinstance(node_id_prefix, str) or not node_id_prefix):
-            raise ValidationError("node_id_prefix must be a non-empty string when provided")
+        if node_id_prefix is not None and (
+            not isinstance(node_id_prefix, str) or not node_id_prefix
+        ):
+            raise ValidationError(
+                "node_id_prefix must be a non-empty string when provided"
+            )
 
-        only_anomalies = cls._as_bool(document.get("only_anomalies", False), "only_anomalies")
+        only_anomalies = cls._as_bool(
+            document.get("only_anomalies", False), "only_anomalies"
+        )
         limit = cls._as_limit(document.get("limit", 500))
         cursor = document.get("cursor")
         if cursor is not None and (not isinstance(cursor, str) or not cursor):
@@ -63,7 +71,9 @@ class NodeInspectRequest:
         values: list[str] = []
         for item in raw:
             if not isinstance(item, str) or not item:
-                raise ValidationError(f"{field_name} must be a list of non-empty strings")
+                raise ValidationError(
+                    f"{field_name} must be a list of non-empty strings"
+                )
             values.append(item.upper())
         return tuple(values)
 

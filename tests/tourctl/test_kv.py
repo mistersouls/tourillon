@@ -101,7 +101,9 @@ def _version_document(namespace: Any, key: Any, value: Any) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 @pytest.mark.tourctl
-async def test_tourctl_kv_core_supports_typed_inputs_and_json_output(tmp_path: Path) -> None:
+async def test_tourctl_kv_core_supports_typed_inputs_and_json_output(
+    tmp_path: Path,
+) -> None:
     ca_cert_path, ca_key_path = generate_ca(tmp_path)
     server_ssl = _build_server_ssl_from_ca(tmp_path, ca_cert_path, ca_key_path)
     serializer = MsgPackSerializer()
@@ -344,7 +346,12 @@ async def test_kv_get_reports_rejected_request(monkeypatch: pytest.MonkeyPatch) 
                 "operation": "read",
                 "code": "quorum_not_met",
                 "message": "read quorum not met: successes=1, required=2",
-                "errors": [{"type": "TimeoutError", "message": "no response from node-b within 30.0s"}],
+                "errors": [
+                    {
+                        "type": "TimeoutError",
+                        "message": "no response from node-b within 30.0s",
+                    }
+                ],
             },
         )
 
@@ -392,7 +399,11 @@ async def test_kv_repair_renders_json(monkeypatch: pytest.MonkeyPatch) -> None:
 
     output = await kv_repair(token="tok", as_json=True)
 
-    assert json.loads(output) == {"issue": "already_durable", "replicas": 3, "token": "tok"}
+    assert json.loads(output) == {
+        "issue": "already_durable",
+        "replicas": 3,
+        "token": "tok",
+    }
 
 
 @pytest.mark.asyncio

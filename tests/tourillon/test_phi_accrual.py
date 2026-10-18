@@ -33,7 +33,9 @@ def test_phi_failure_detector_validates_constructor_and_threshold() -> None:
 
 
 @pytest.mark.tourillon
-def test_phi_is_zero_until_enough_observations_then_increases_with_elapsed_time() -> None:
+def test_phi_is_zero_until_enough_observations_then_increases_with_elapsed_time() -> (
+    None
+):
     detector = PhiAccrual(min_samples=3, min_stddev=0.05)
 
     detector.record(0.0)
@@ -79,4 +81,3 @@ def test_reset_clears_state() -> None:
     assert detector.interval_samples == 0
     assert detector.has_observations is False
     assert detector.phi(now=2.0) == 0.0
-

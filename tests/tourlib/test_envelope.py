@@ -18,8 +18,8 @@ from uuid import UUID, uuid4
 import pytest
 
 from tests.helpers import make_envelope
-from tourlib.constant import TRANSPORT_ERROR_KIND
 from tourlib import ValidationError
+from tourlib.constant import TRANSPORT_ERROR_KIND
 from tourlib.envelope import Envelope, read_envelope
 from tourlib.exceptions import ProtocolError
 
@@ -265,5 +265,3 @@ async def test_read_envelope_returns_transport_error_envelope() -> None:
 
     assert decoded.kind == TRANSPORT_ERROR_KIND
     assert decoded.payload == b"unknown kind: kv.get"
-
-

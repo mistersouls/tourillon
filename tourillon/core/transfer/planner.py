@@ -46,7 +46,9 @@ class TransferPlanner:
             hi = min(current_segment.hi, target_segment.hi)
 
             if lo <= hi and current_replicas != new_replicas:
-                transfers.extend(self._pair_segments((lo, hi), current_replicas, new_replicas))
+                transfers.extend(
+                    self._pair_segments((lo, hi), current_replicas, new_replicas)
+                )
 
             if current_segment.hi < target_segment.hi:
                 current_segment = next(current_iter, None)
@@ -76,7 +78,7 @@ class TransferPlanner:
         for src, dst in zip(leaving, entering, strict=False):
             result.append(RangeTransfer(segment=segment, src=src, dst=dst))
 
-        unpaired = entering[len(leaving):]
+        unpaired = entering[len(leaving) :]
         if not unpaired:
             return result
 
@@ -97,4 +99,3 @@ class TransferPlanner:
             if len(replicas) == self._replication_factor:
                 break
         return frozenset(replicas)
-

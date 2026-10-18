@@ -117,4 +117,3 @@ def test_registry_iteration_yields_members() -> None:
 
     node_ids = {member.node_id for member in registry}
     assert node_ids == {"node-a", "node-b"}
-

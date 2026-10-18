@@ -28,6 +28,7 @@ from tourlib.port import Persistence
 
 class TomlPersistence(Persistence):
     """Path-based TOML persistence with lock + atomic write guarantees."""
+
     def __init__(self) -> None:
         self._locks: dict[Path, asyncio.Lock] = {}
 

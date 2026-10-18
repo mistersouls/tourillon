@@ -169,10 +169,22 @@ def test_envelope_client_pool_requires_positive_max_size(
 ) -> None:
     topologymgr = _TopologyManagerStub()
     with pytest.raises(ValueError, match="max_size must be >= 1"):
-        PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, max_size=0, telemetry=telemetry)
+        PeerPool(
+            tls_ctx=tls_ctx,
+            topologymgr=_as_topologymgr(topologymgr),
+            fd_provider=fd_provider,
+            max_size=0,
+            telemetry=telemetry,
+        )
 
     with pytest.raises(ValueError, match="idle_ttl must be > 0"):
-        PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, idle_ttl=0, telemetry=telemetry)
+        PeerPool(
+            tls_ctx=tls_ctx,
+            topologymgr=_as_topologymgr(topologymgr),
+            fd_provider=fd_provider,
+            idle_ttl=0,
+            telemetry=telemetry,
+        )
 
 
 @pytest.mark.tourillon
@@ -183,7 +195,12 @@ async def test_acquire_fails_for_unknown_peer(
     fd_provider: FailureDetectorProvider,
 ) -> None:
     topologymgr = _TopologyManagerStub()
-    pool = PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, telemetry=telemetry)
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        telemetry=telemetry,
+    )
 
     with pytest.raises(RuntimeError, match="unknown peer"):
         await pool.acquire("peer-z")
@@ -241,7 +258,12 @@ async def test_acquire_recreates_client_when_bind_changes(
     fd_provider: FailureDetectorProvider,
 ) -> None:
     topologymgr = _TopologyManagerStub()
-    pool = PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, telemetry=telemetry)
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        telemetry=telemetry,
+    )
 
     old_client = await _acquire_fake_client(pool, "peer-a")
     topologymgr.binds["peer-a"] = "127.0.0.1:5000"
@@ -504,5 +526,3 @@ async def test_release_stops_detector_when_overflow_peer_is_removed(
 
     assert isinstance(overflow_fd, _FakeDetector)
     assert overflow_fd.stop_calls == 1
-
-

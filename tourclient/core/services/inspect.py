@@ -39,7 +39,9 @@ class InspectService:
         self._transport = transport
         self._serializer = serializer
 
-    async def inspect(self, request: NodeInspectRequest | None = None) -> list[NodeInfo]:
+    async def inspect(
+        self, request: NodeInspectRequest | None = None
+    ) -> list[NodeInfo]:
         effective_request = request or NodeInspectRequest()
         chunks: list[NodeInfo] = []
         cursor = effective_request.cursor
@@ -51,7 +53,9 @@ class InspectService:
                 document=_request_to_document(page_request),
             )
             if response.kind != "node.info":
-                raise ResponseError(f"unexpected inspect response kind: {response.kind}")
+                raise ResponseError(
+                    f"unexpected inspect response kind: {response.kind}"
+                )
 
             data = self._serializer.decode(response.payload)
             if not isinstance(data, Mapping):
@@ -108,7 +112,9 @@ def _ring_position_from_document(data: Mapping[str, Any]) -> RingPositionInspect
         total_partitions=_require_int(data, "total_partitions"),
         owned_partitions=_require_int(data, "owned_partitions"),
         owned_percent=float(data.get("owned_percent", 0.0)),
-        vnode_ranges=tuple(_vnode_range_from_document(item) for item in vnode_ranges_data),
+        vnode_ranges=tuple(
+            _vnode_range_from_document(item) for item in vnode_ranges_data
+        ),
     )
 
 
@@ -198,4 +204,3 @@ def _require_bool(data: Mapping[str, Any], field_name: str) -> bool:
     if not isinstance(value, bool):
         raise ResponseError(f"invalid node.inspect response field '{field_name}'")
     return value
-

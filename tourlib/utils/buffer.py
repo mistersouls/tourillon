@@ -63,4 +63,3 @@ class BytesWalker:
         chunk = self._data[self._pos :]
         self._pos = len(self._data)
         return chunk
-

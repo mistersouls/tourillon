@@ -48,7 +48,7 @@ async def join(request: Envelope) -> AsyncIterator[Envelope]:
     yield replay_envelope(
         kind="node.join.accept",
         request=request,
-        payload=serializer.encode({
-            "message": "Join operation is successful triggered."
-        }),
+        payload=serializer.encode(
+            {"message": "Join operation is successful triggered."}
+        ),
     )

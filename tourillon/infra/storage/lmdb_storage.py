@@ -17,9 +17,9 @@ from pathlib import Path
 
 from tourillon.core.models.clock import HLCTimestamp
 from tourillon.core.models.config import StorageConfig
-from tourillon.core.models.storageschema import Keyspace, Key
-from tourillon.core.ports.storage import Storage, StorageProvider, SessionProvider
-from tourillon.infra.storage.lmdb_session import LmdbSessionProvider, LmdbConfig
+from tourillon.core.models.storageschema import Key, Keyspace
+from tourillon.core.ports.storage import SessionProvider, Storage, StorageProvider
+from tourillon.infra.storage.lmdb_session import LmdbConfig, LmdbSessionProvider
 
 
 class LMDBStorage(Storage):
@@ -39,9 +39,7 @@ class LMDBStorage(Storage):
             provider = await self.session_provider_for(group)
             async with provider.session(write=False) as session:
                 async for kv in session.iter(
-                    keyspace=Keyspace.TAGS,
-                    reverse=True,
-                    limit=1
+                    keyspace=Keyspace.TAGS, reverse=True, limit=1
                 ):
                     key = Key.from_bytes(kv.key, Keyspace.TAGS)
                     if key.ts > latest:
@@ -84,7 +82,9 @@ class LMDBStorage(Storage):
                     provider = LmdbSessionProvider(config, group)
                     self._providers[group] = provider
                 except Exception as e:
-                    raise RuntimeError(f"Failed to initialize LMDB session provider for group {group}") from e
+                    raise RuntimeError(
+                        f"Failed to initialize LMDB session provider for group {group}"
+                    ) from e
         return provider
 
 

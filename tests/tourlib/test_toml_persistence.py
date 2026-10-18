@@ -20,7 +20,9 @@ from tourlib.adapter import TomlPersistence
 
 
 @pytest.mark.tourlib
-def test_atomic_write_cleans_up_temp_file_on_replace_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_atomic_write_cleans_up_temp_file_on_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "config.toml"
     temp_files_before = set(tmp_path.iterdir())
 
@@ -34,4 +36,3 @@ def test_atomic_write_cleans_up_temp_file_on_replace_failure(tmp_path: Path, mon
 
     assert not path.exists()
     assert set(tmp_path.iterdir()) == temp_files_before
-

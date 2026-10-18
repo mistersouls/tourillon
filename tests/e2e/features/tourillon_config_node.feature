@@ -21,4 +21,3 @@ Feature: tourillon config node command
     And the CA certificate file has been deleted
     When I run the tourillon config node command
     Then the command exits with a non-zero code
-

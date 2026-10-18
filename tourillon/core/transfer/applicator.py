@@ -155,7 +155,11 @@ class TransferApplicator:
         for range_id in dropped:
             self._drop(range_id)
 
-        started = [range_ for range_id, range_ in incoming.items() if self._should_start(range_id)]
+        started = [
+            range_
+            for range_id, range_ in incoming.items()
+            if self._should_start(range_id)
+        ]
         for range_ in started:
             self._start(range_)
 
@@ -206,7 +210,10 @@ class TransferApplicator:
 
     def _should_start(self, range_id: str) -> bool:
         handle = self._handles.get(range_id)
-        return handle is None or handle.state in {TransferState.FAILED, TransferState.CANCELLED}
+        return handle is None or handle.state in {
+            TransferState.FAILED,
+            TransferState.CANCELLED,
+        }
 
     def _start(self, range_: RangeTransfer) -> None:
         handle = TransferHandle(range=range_, state=TransferState.PENDING)
@@ -273,7 +280,9 @@ class TransferApplicator:
         limit = self._backoff.max_retries
         return 0 < limit < failures
 
-    async def _sleep_before_retry(self, handle: TransferHandle, failures: int, delay: float) -> None:
+    async def _sleep_before_retry(
+        self, handle: TransferHandle, failures: int, delay: float
+    ) -> None:
         jitter = self._backoff.jitter
         pause = max(0.0, delay * (1 + random.uniform(-jitter, jitter)))
         logger.warning(
@@ -373,14 +382,18 @@ class TransferApplicator:
         envelope = self._envelope("transfer.claim", claim.to_dict())
         async with aclosing(client.stream(envelope)) as responses:
             async for response in responses:
-                chunk = TransferChunk.from_dict(self._expect(response, "transfer.chunk"))
+                chunk = TransferChunk.from_dict(
+                    self._expect(response, "transfer.chunk")
+                )
                 await receiver.receive(chunk)
                 handle.transferred += len(chunk.raw)
                 if receiver.complete:
                     break
 
         if not receiver.complete:
-            raise TransferError(f"range={handle.range.id} stream closed before its last chunk")
+            raise TransferError(
+                f"range={handle.range.id} stream closed before its last chunk"
+            )
         if receiver.more and receiver.cursor == start:
             raise ProcessError(
                 f"range={handle.range.id} source announced more records without sending any"
@@ -396,7 +409,9 @@ class TransferApplicator:
             async with aclosing(streamer.stream(session.resumes)) as chunks:
                 async for chunk in chunks:
                     payload = replace(chunk, session=session.session).to_dict()
-                    await self._request(client, "transfer.chunk", payload, "transfer.chunk.accept")
+                    await self._request(
+                        client, "transfer.chunk", payload, "transfer.chunk.accept"
+                    )
                     handle.transferred += len(chunk.raw)
 
             commit = TransferCommit(range=range_, session=session.session)
@@ -423,7 +438,9 @@ class TransferApplicator:
         range_: RangeTransfer,
     ) -> TransferInitAccept:
         init = TransferInit(serial=self._plan.serial, range=range_)
-        data = await self._request(client, "transfer.init", init.to_dict(), "transfer.init.accept")
+        data = await self._request(
+            client, "transfer.init", init.to_dict(), "transfer.init.accept"
+        )
         return TransferInitAccept.from_dict(data)
 
     async def _request(
@@ -446,7 +463,9 @@ class TransferApplicator:
             reject = TransferReject.from_dict(self._serializer.decode(response.payload))
             error = ProcessError if reject.fatal else TransferError
             raise error(f"{response.kind}: {reject.reason}")
-        raise ProcessError(f"unexpected response kind {response.kind!r}, expected {kind!r}")
+        raise ProcessError(
+            f"unexpected response kind {response.kind!r}, expected {kind!r}"
+        )
 
     def _envelope(self, kind: str, payload: dict[str, Any]) -> Envelope:
         return build_envelope(
@@ -463,6 +482,3 @@ class TransferApplicator:
             partitioner=self._partitioner,
             max_chunk_size=self._max_chunk_size,
         )
-
-
-

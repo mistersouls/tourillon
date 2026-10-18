@@ -70,4 +70,3 @@ def test_iter_from_yields_clockwise_sequence_from_token_position() -> None:
     assert [v.token for v in from_present] == [20, 30, 10]
     assert [v.token for v in from_absent] == [30, 10, 20]
     assert [v.token for v in from_after_max] == [10, 20, 30]
-

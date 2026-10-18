@@ -79,6 +79,3 @@ class HLCTimestamp:
         counter = walker.read_int(2, "hlc counter")
         node_id = walker.read_field("hlc node_id").decode("utf-8")
         return cls(wall_ms=wall_ms, counter=counter, node_id=node_id)
-
-
-

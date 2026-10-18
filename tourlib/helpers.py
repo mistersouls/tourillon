@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import functools
 import importlib
 import inspect
@@ -41,6 +40,7 @@ def scan(package: str):
 
     def decorator(func: Callable):
         if inspect.iscoroutinefunction(func):
+
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
                 _do_scan()

@@ -50,13 +50,12 @@ async def join(
 ) -> str:
     try:
         response = await _run_join(
-            address,
-            seeds=seeds,
-            tourconf=tourconf,
-            context_name=context_name
+            address, seeds=seeds, tourconf=tourconf, context_name=context_name
         )
     except Exception as exc:
-        raise SystemExit(handle_error(exc, context_name, NODE_JOIN_ERROR_PROFILE)) from None
+        raise SystemExit(
+            handle_error(exc, context_name, NODE_JOIN_ERROR_PROFILE)
+        ) from None
 
     if not response.success:
         raise SystemExit(response.message)

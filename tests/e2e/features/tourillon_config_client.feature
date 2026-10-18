@@ -14,4 +14,3 @@ Feature: tourillon config client command
     When I run the tourillon config client command
     Then the command fails with a file exists error
     And the error message mentions overwrite refusal
-

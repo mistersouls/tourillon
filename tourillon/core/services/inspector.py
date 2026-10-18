@@ -76,7 +76,9 @@ class NodeInspector:
             )
             return
 
-        for chunk_index, chunk_ids in enumerate(self._iter_chunks(node_ids, chunk_size)):
+        for chunk_index, chunk_ids in enumerate(
+            self._iter_chunks(node_ids, chunk_size)
+        ):
             yield self._build_chunk(
                 snapshot_at=snapshot_at,
                 chunk_index=chunk_index,
@@ -128,7 +130,9 @@ class NodeInspector:
     def _build_self_member(self, registry: MemberRegistry) -> MemberInspect:
         member = registry.get(self._node_id)
         if member is None:
-            raise RuntimeError(f"self member '{self._node_id}' not found in topology registry")
+            raise RuntimeError(
+                f"self member '{self._node_id}' not found in topology registry"
+            )
         return MemberInspect(
             node_id=member.node_id,
             phase=member.phase.value.upper(),
@@ -172,7 +176,7 @@ class NodeInspector:
     @staticmethod
     def _iter_chunks(node_ids: list[str], chunk_size: int) -> Iterator[tuple[str, ...]]:
         for start in range(0, len(node_ids), chunk_size):
-            yield tuple(node_ids[start:start + chunk_size])
+            yield tuple(node_ids[start : start + chunk_size])
 
     def _build_ring_position(self, ring) -> RingPositionInspect:
         vnode_ranges: list[VnodeRangeInspect] = []
@@ -188,11 +192,7 @@ class NodeInspector:
             token = self._format_token(partition_range.owner.token)
             arc = partition_range.arc
             vnode_ranges.append(
-                VnodeRangeInspect(
-                    token=token,
-                    arc=arc,
-                    partitions=partitions
-                )
+                VnodeRangeInspect(token=token, arc=arc, partitions=partitions)
             )
 
         owned_percent = 0.0 if total == 0 else (owned_partitions / total) * 100
@@ -231,7 +231,11 @@ class NodeInspector:
             has_more=has_more,
             next_cursor=next_cursor,
             self_member=self_member,
-            members=tuple(member_by_id[node_id] for node_id in chunk_ids if node_id in member_by_id),
+            members=tuple(
+                member_by_id[node_id]
+                for node_id in chunk_ids
+                if node_id in member_by_id
+            ),
             ring_position=ring_position,
             gossip_stats=gossip_stats if chunk_index == 0 else {},
         )

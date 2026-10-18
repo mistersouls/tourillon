@@ -85,7 +85,9 @@ class OpenTelemetryProvider:
         )
         return self._telemetry
 
-    def _setup_metrics(self, resource: Resource, options: Mapping[str, Any]) -> MeterProvider:
+    def _setup_metrics(
+        self, resource: Resource, options: Mapping[str, Any]
+    ) -> MeterProvider:
         endpoint = self._require_endpoint(options)
 
         exporter = OTLPMetricExporter(
@@ -106,7 +108,9 @@ class OpenTelemetryProvider:
         metrics.set_meter_provider(provider)
         return provider
 
-    def _setup_tracing(self, resource: Resource, options: Mapping[str, Any]) -> TracerProvider:
+    def _setup_tracing(
+        self, resource: Resource, options: Mapping[str, Any]
+    ) -> TracerProvider:
         endpoint = self._require_endpoint(options)
 
         exporter = OTLPSpanExporter(

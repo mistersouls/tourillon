@@ -25,4 +25,3 @@ class Serializer(Protocol):
 
     def decode(self, payload: bytes) -> Any:
         """Decode payload bytes back into a Python object."""
-

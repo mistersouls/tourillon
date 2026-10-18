@@ -21,6 +21,3 @@ from tourillon.core.services.inspector import NodeInspector
 def test_inspector_formats_vnode_token_as_hex_string() -> None:
     token = (1 << 120) + 123
     assert NodeInspector._format_token(token) == hex(token)
-
-
-

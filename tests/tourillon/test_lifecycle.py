@@ -36,8 +36,7 @@ from tourillon.core.config import (
 from tourillon.core.exceptions import BootstrapError
 from tourillon.core.gossip.gossiper import GossipStats
 from tourillon.core.gossip.topology import TopologyManager
-from tourillon.core.models.member import Member
-from tourillon.core.models.member import MemberPhase
+from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.models.state import NodeState
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer.pool import PeerPool
@@ -145,7 +144,9 @@ def _build_config(data_dir: Path, node_id: str = "test-node") -> TourillonConfig
     )
 
 
-def _build_lifecycle(config: TourillonConfig, persistence: Persistence) -> NodeLifecycle:
+def _build_lifecycle(
+    config: TourillonConfig, persistence: Persistence
+) -> NodeLifecycle:
     serializer = MsgPackSerializer()
     pool_opts = config.transport.pool
     topologymgr = TopologyManager()
@@ -178,7 +179,9 @@ def _build_lifecycle(config: TourillonConfig, persistence: Persistence) -> NodeL
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_load_state_defaults_to_config_node_id_when_missing(tmp_path: Path) -> None:
+async def test_load_state_defaults_to_config_node_id_when_missing(
+    tmp_path: Path,
+) -> None:
     persistence = _MissingStatePersistence()
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path, node_id="node-a"),
@@ -233,7 +236,9 @@ async def test_load_state_uses_persisted_document(tmp_path: Path) -> None:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_lifecycle_configures_peer_pool_from_transport_pool_options(tmp_path: Path) -> None:
+async def test_lifecycle_configures_peer_pool_from_transport_pool_options(
+    tmp_path: Path,
+) -> None:
     config = TourillonConfig(
         node=NodeConfig(id="node-pool"),
         storage=StorageConfig(data_dir=str(tmp_path), group_size="8Mi"),
@@ -241,7 +246,9 @@ async def test_lifecycle_configures_peer_pool_from_transport_pool_options(tmp_pa
         server_client=ClientServerConfig(bind="127.0.0.1:7000"),
         server_peer=PeerServerConfig(bind="127.0.0.1:7001", advertise="127.0.0.1:7001"),
         transport=TransportConfig(
-            pool=TransportPoolConfig(min_size=2, max_size=7, max_overflow=3, idle_ttl=9.5)
+            pool=TransportPoolConfig(
+                min_size=2, max_size=7, max_overflow=3, idle_ttl=9.5
+            )
         ),
     )
     lifecycle = _build_lifecycle(config=config, persistence=_MissingStatePersistence())
@@ -309,7 +316,9 @@ async def test_join_raises_when_no_seeds_configured(tmp_path: Path) -> None:
 
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path, node_id="node-a"),
-        persistence=_DocumentStatePersistence({"node": {"node_id": "node-a", "phase": "idle", "epoch": 0}}),
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "node-a", "phase": "idle", "epoch": 0}}
+        ),
     )
 
     with pytest.raises(JoinError, match="No seed peers provided"):
@@ -320,7 +329,9 @@ async def test_join_raises_when_no_seeds_configured(tmp_path: Path) -> None:
 def test_is_joining_returns_false_when_no_task(tmp_path: Path) -> None:
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path, node_id="node-a"),
-        persistence=_DocumentStatePersistence({"node": {"node_id": "node-a", "phase": "idle", "epoch": 0}}),
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "node-a", "phase": "idle", "epoch": 0}}
+        ),
     )
 
     assert lifecycle.is_joining() is False
@@ -330,7 +341,9 @@ def test_is_joining_returns_false_when_no_task(tmp_path: Path) -> None:
 def test_generate_tokens_returns_hex_strings(tmp_path: Path) -> None:
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path, node_id="node-a"),
-        persistence=_DocumentStatePersistence({"node": {"node_id": "node-a", "phase": "idle", "epoch": 0}}),
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "node-a", "phase": "idle", "epoch": 0}}
+        ),
     )
 
     tokens = lifecycle._generate_tokens()
@@ -376,19 +389,26 @@ async def test_start_client_rejects_invalid_bind(tmp_path: Path) -> None:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_sync_full_returns_false_when_bootstrapper_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_sync_full_returns_false_when_bootstrapper_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path),
         persistence=_MissingStatePersistence(),
     )
-    state = NodeState(node_id="node-a", phase=MemberPhase.JOINING, epoch=1, seeds=("seed1:9001",))
+    state = NodeState(
+        node_id="node-a", phase=MemberPhase.JOINING, epoch=1, seeds=("seed1:9001",)
+    )
 
     class _Bootstrapper:
         async def run(self, seeds):
             _ = seeds
             raise BootstrapError("boom")
 
-    monkeypatch.setattr("tourillon.core.services.lifecycle.GossipBootstrapper", lambda **kwargs: _Bootstrapper())
+    monkeypatch.setattr(
+        "tourillon.core.services.lifecycle.GossipBootstrapper",
+        lambda **kwargs: _Bootstrapper(),
+    )
 
     assert await lifecycle._sync_full(state) is False
     assert lifecycle._gossip_stats.bootstrap_err_total == 1
@@ -422,7 +442,9 @@ async def test_transition_to_persists_phase_tokens_and_seeds(tmp_path: Path) -> 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_start_dispatches_to_phase_specific_startup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_start_dispatches_to_phase_specific_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path, node_id="node-a"),
         persistence=_DocumentStatePersistence(
@@ -516,7 +538,9 @@ async def test_stop_cancels_active_join_and_stops_components(tmp_path: Path) -> 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_startup_idle_branches_on_seed_configuration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_startup_idle_branches_on_seed_configuration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path, node_id="node-a"),
         persistence=_DocumentStatePersistence(
@@ -565,7 +589,9 @@ async def test_publish_state_uses_advertise_address(tmp_path: Path) -> None:
     )
     lifecycle = _build_lifecycle(
         config=config,
-        persistence=_DocumentStatePersistence({"node": {"node_id": "node-a", "phase": "ready", "epoch": 2}}),
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "node-a", "phase": "ready", "epoch": 2}}
+        ),
     )
     state = NodeState(
         node_id="node-a",
@@ -594,7 +620,9 @@ async def test_publish_state_uses_advertise_address(tmp_path: Path) -> None:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_startup_joining_and_ready_override_seeds(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_startup_joining_and_ready_override_seeds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     persistence = _DocumentStatePersistence(
         {
             "node": {
@@ -649,7 +677,9 @@ async def test_startup_joining_and_ready_override_seeds(monkeypatch: pytest.Monk
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_start_ready_publish_state_and_sync_success_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_start_ready_publish_state_and_sync_success_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path, node_id="node-a"),
         persistence=_DocumentStatePersistence(
@@ -693,7 +723,14 @@ async def test_start_ready_publish_state_and_sync_success_paths(monkeypatch: pyt
     lifecycle._hint_replayer.start = start_hint_replayer  # type: ignore[method-assign]  # noqa: SLF001
 
     await lifecycle._start_ready(ready_state)
-    assert calls == ["pool", "sync:seed:9000", "gossiper", "publish:ready", "client", "hint"]
+    assert calls == [
+        "pool",
+        "sync:seed:9000",
+        "gossiper",
+        "publish:ready",
+        "client",
+        "hint",
+    ]
 
     calls.clear()
     ready_no_seeds = NodeState(
@@ -708,7 +745,9 @@ async def test_start_ready_publish_state_and_sync_success_paths(monkeypatch: pyt
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_publish_state_and_sync_full_success_increment_counters(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_publish_state_and_sync_full_success_increment_counters(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path, node_id="node-a"),
         persistence=_DocumentStatePersistence(
@@ -754,8 +793,12 @@ async def test_publish_state_and_sync_full_success_increment_counters(monkeypatc
 class _TransferRunnerStub:
     def __init__(self) -> None:
         loop = asyncio.get_running_loop()
-        self.run_result: asyncio.Future[tuple[list[str], list[str]]] = loop.create_future()
-        self.wait_result: asyncio.Future[tuple[list[str], list[str]]] = loop.create_future()
+        self.run_result: asyncio.Future[tuple[list[str], list[str]]] = (
+            loop.create_future()
+        )
+        self.wait_result: asyncio.Future[tuple[list[str], list[str]]] = (
+            loop.create_future()
+        )
         self.calls: list[tuple[str, ...]] = []
         self.cancelled = False
 
@@ -787,10 +830,14 @@ class _RingTopologyStub:
         return await self.changes.get()
 
 
-def _joining_lifecycle(tmp_path: Path, ring: Ring) -> tuple[NodeLifecycle, _TransferRunnerStub, _RingTopologyStub]:
+def _joining_lifecycle(
+    tmp_path: Path, ring: Ring
+) -> tuple[NodeLifecycle, _TransferRunnerStub, _RingTopologyStub]:
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path, node_id="node-a"),
-        persistence=_DocumentStatePersistence({"node": {"node_id": "node-a", "phase": "joining", "epoch": 1}}),
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "node-a", "phase": "joining", "epoch": 1}}
+        ),
     )
     runner, topology = _TransferRunnerStub(), _RingTopologyStub(ring)
     lifecycle._transfer_runner = runner  # type: ignore[assignment]  # noqa: SLF001
@@ -809,19 +856,25 @@ _JOINING = Member(
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_run_transfers_returns_the_results_once_transfers_settle(tmp_path: Path) -> None:
+async def test_run_transfers_returns_the_results_once_transfers_settle(
+    tmp_path: Path,
+) -> None:
     ring = Ring([VNode(token=0, node_id="node-b")])
     lifecycle, runner, _ = _joining_lifecycle(tmp_path, ring)
     runner.run_result.set_result((["r1"], []))
 
     assert await lifecycle._run_transfers(_JOINING) == (["r1"], [])  # noqa: SLF001
-    assert runner.calls == [("run", ring.serial(), ring.add_vnodes(_JOINING.vnodes).serial())]
+    assert runner.calls == [
+        ("run", ring.serial(), ring.add_vnodes(_JOINING.vnodes).serial())
+    ]
     assert runner.cancelled is False
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_run_transfers_replans_on_ring_change_and_awaits_the_new_plan(tmp_path: Path) -> None:
+async def test_run_transfers_replans_on_ring_change_and_awaits_the_new_plan(
+    tmp_path: Path,
+) -> None:
     ring = Ring([VNode(token=0, node_id="node-b")])
     changed = ring.add_vnodes([VNode(token=64, node_id="node-c")])
     lifecycle, runner, topology = _joining_lifecycle(tmp_path, ring)
@@ -830,7 +883,10 @@ async def test_run_transfers_replans_on_ring_change_and_awaits_the_new_plan(tmp_
     runner.wait_result.set_result((["r1", "r2"], ["r3"]))
     topology.changes.put_nowait(changed)
 
-    assert await lifecycle._run_transfers(_JOINING) == (["r1", "r2"], ["r3"])  # noqa: SLF001
+    assert await lifecycle._run_transfers(_JOINING) == (
+        ["r1", "r2"],
+        ["r3"],
+    )  # noqa: SLF001
     assert runner.calls[1:] == [
         ("apply", changed.serial(), changed.add_vnodes(_JOINING.vnodes).serial()),
         ("wait",),
@@ -839,8 +895,12 @@ async def test_run_transfers_replans_on_ring_change_and_awaits_the_new_plan(tmp_
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_run_transfers_cancels_the_transfers_when_the_join_is_cancelled(tmp_path: Path) -> None:
-    lifecycle, runner, _ = _joining_lifecycle(tmp_path, Ring([VNode(token=0, node_id="node-b")]))
+async def test_run_transfers_cancels_the_transfers_when_the_join_is_cancelled(
+    tmp_path: Path,
+) -> None:
+    lifecycle, runner, _ = _joining_lifecycle(
+        tmp_path, Ring([VNode(token=0, node_id="node-b")])
+    )
 
     task = asyncio.create_task(lifecycle._run_transfers(_JOINING))  # noqa: SLF001
     for _ in range(5):
@@ -852,49 +912,71 @@ async def test_run_transfers_cancels_the_transfers_when_the_join_is_cancelled(tm
     assert runner.cancelled is True
 
 
-@pytest.mark.tourillon
-@pytest.mark.asyncio
-async def test_perform_join_moves_to_ready_or_failed_from_the_transfer_results(tmp_path: Path) -> None:
-    lifecycle, _, _ = _joining_lifecycle(tmp_path, Ring([VNode(token=0, node_id="node-b")]))
-    state = NodeState(node_id="node-a", phase=MemberPhase.JOINING, epoch=1, tokens=("0x80",))
-    events: list[str] = []
-    outcomes = [(["r1"], []), (["r1"], ["r2"])]
-    synced = [True, True, False]
+class _JoinStubs:
+    def __init__(
+        self,
+        events: list[str],
+        outcomes: list[tuple[list[str], list[str]]],
+        synced: list[bool],
+    ) -> None:
+        self.events = events
+        self.outcomes = outcomes
+        self.synced = synced
 
-    async def noop() -> None:
+    async def noop(self) -> None:
         return None
 
-    async def publish_state(published: NodeState) -> Member:
-        events.append(f"publish:{published.phase.value}")
+    async def publish_state(self, published: NodeState) -> Member:
+        self.events.append(f"publish:{published.phase.value}")
         return _JOINING
 
-    async def sync_full(_state: NodeState) -> bool:
-        return synced.pop(0)
+    async def sync_full(self, _state: NodeState) -> bool:
+        return self.synced.pop(0)
 
-    async def run_transfers(_member: Member) -> tuple[list[str], list[str]]:
-        return outcomes.pop(0)
+    async def run_transfers(self, _member: Member) -> tuple[list[str], list[str]]:
+        return self.outcomes.pop(0)
 
-    async def transition_to(_state: NodeState, phase: MemberPhase) -> NodeState:
+    async def transition_to(self, _state: NodeState, phase: MemberPhase) -> NodeState:
         return NodeState(node_id="node-a", phase=phase, epoch=2, tokens=("0x80",))
 
-    async def start_client() -> None:
-        events.append("client")
+    async def start_client(self) -> None:
+        self.events.append("client")
 
-    async def start_hint_replayer() -> None:
-        events.append("hint")
+    async def start_hint_replayer(self) -> None:
+        self.events.append("hint")
 
-    async def stop_gossiper() -> None:
-        events.append("gossiper-stopped")
+    async def stop_gossiper(self) -> None:
+        self.events.append("gossiper-stopped")
 
-    lifecycle._peer_pool.start = noop  # type: ignore[method-assign]  # noqa: SLF001
-    lifecycle._gossiper.start = noop  # type: ignore[method-assign]  # noqa: SLF001
-    lifecycle._gossiper.stop = stop_gossiper  # type: ignore[method-assign]  # noqa: SLF001
-    lifecycle._publish_state = publish_state  # type: ignore[method-assign]  # noqa: SLF001
-    lifecycle._sync_full = sync_full  # type: ignore[method-assign]  # noqa: SLF001
-    lifecycle._run_transfers = run_transfers  # type: ignore[method-assign]  # noqa: SLF001
-    lifecycle._transition_to = transition_to  # type: ignore[method-assign]  # noqa: SLF001
-    lifecycle._start_client = start_client  # type: ignore[method-assign]  # noqa: SLF001
-    lifecycle._hint_replayer.start = start_hint_replayer  # type: ignore[method-assign]  # noqa: SLF001
+    def apply(self, lifecycle: NodeLifecycle) -> None:
+        lifecycle._peer_pool.start = self.noop  # type: ignore[method-assign]  # noqa: SLF001
+        lifecycle._gossiper.start = self.noop  # type: ignore[method-assign]  # noqa: SLF001
+        lifecycle._gossiper.stop = self.stop_gossiper  # type: ignore[method-assign]  # noqa: SLF001
+        lifecycle._publish_state = self.publish_state  # type: ignore[method-assign]  # noqa: SLF001
+        lifecycle._sync_full = self.sync_full  # type: ignore[method-assign]  # noqa: SLF001
+        lifecycle._run_transfers = self.run_transfers  # type: ignore[method-assign]  # noqa: SLF001
+        lifecycle._transition_to = self.transition_to  # type: ignore[method-assign]  # noqa: SLF001
+        lifecycle._start_client = self.start_client  # type: ignore[method-assign]  # noqa: SLF001
+        lifecycle._hint_replayer.start = self.start_hint_replayer  # type: ignore[method-assign]  # noqa: SLF001
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_perform_join_moves_to_ready_or_failed_from_the_transfer_results(
+    tmp_path: Path,
+) -> None:
+    lifecycle, _, _ = _joining_lifecycle(
+        tmp_path, Ring([VNode(token=0, node_id="node-b")])
+    )
+    state = NodeState(
+        node_id="node-a", phase=MemberPhase.JOINING, epoch=1, tokens=("0x80",)
+    )
+    events: list[str] = []
+    outcomes: list[tuple[list[str], list[str]]] = [(["r1"], []), (["r1"], ["r2"])]
+    synced = [True, True, False]
+
+    stubs = _JoinStubs(events, outcomes, synced)
+    stubs.apply(lifecycle)
 
     await lifecycle._perform_join(state)  # noqa: SLF001
     assert events == ["publish:joining", "client", "publish:ready", "hint"]
@@ -904,8 +986,8 @@ async def test_perform_join_moves_to_ready_or_failed_from_the_transfer_results(t
     assert events == ["publish:joining", "publish:failed", "gossiper-stopped"]
 
     events.clear()
-    await lifecycle._perform_join(state)  # membership sync failed: no transfer at all  # noqa: SLF001
+    await lifecycle._perform_join(
+        state
+    )  # membership sync failed: no transfer at all  # noqa: SLF001
     assert events == ["publish:joining", "publish:failed", "gossiper-stopped"]
     assert outcomes == []
-
-

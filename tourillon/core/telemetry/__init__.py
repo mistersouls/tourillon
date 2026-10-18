@@ -36,4 +36,3 @@ __all__ = [
     "build_noop_telemetry",
     "build_noop_telemetry_provider",
 ]
-

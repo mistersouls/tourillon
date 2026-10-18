@@ -68,7 +68,11 @@ async def test_inspect_streams_compact_membership_rows() -> None:
     assert chunk.chunk_index == 0
     assert chunk.has_more is False
     assert chunk.next_cursor is None
-    assert [member.node_id for member in chunk.members] == ["node-1", "node-2", "node-3"]
+    assert [member.node_id for member in chunk.members] == [
+        "node-1",
+        "node-2",
+        "node-3",
+    ]
     assert [member.phase for member in chunk.members] == ["READY", "JOINING", "READY"]
     assert [member.status for member in chunk.members] == ["UNKNOWN", "UNKNOWN", "-"]
     assert [member.epoch for member in chunk.members] == [2, 1, 3]
@@ -163,7 +167,10 @@ async def test_inspect_only_anomalies_keeps_non_ready_members() -> None:
     ]
     await topologymgr.merge_registry(members)
 
-    chunks = [chunk async for chunk in inspector.inspect(NodeInspectRequest(only_anomalies=True))]
+    chunks = [
+        chunk
+        async for chunk in inspector.inspect(NodeInspectRequest(only_anomalies=True))
+    ]
 
     assert len(chunks) == 1
     assert [member.node_id for member in chunks[0].members] == ["node-2"]
@@ -241,5 +248,3 @@ def test_build_ring_position_keeps_wraparound_as_single_range() -> None:
     assert vnode_range.token == "0xabc"
     assert vnode_range.arc == (900, 120)
     assert vnode_range.partitions == (1024 - 901) + (120 + 1)
-
-

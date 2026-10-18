@@ -84,10 +84,20 @@ async def test_inspect_service_collects_multiple_pages(
                 has_more=True,
                 next_cursor="node-1",
                 members=[
-                    {"node_id": "node-1", "phase": "READY", "status": "LIVE", "epoch": 3}
+                    {
+                        "node_id": "node-1",
+                        "phase": "READY",
+                        "status": "LIVE",
+                        "epoch": 3,
+                    }
                 ],
                 gossip_stats={"known_members": 3},
-                self_member={"node_id": "node-3", "phase": "READY", "status": "-", "epoch": 3},
+                self_member={
+                    "node_id": "node-3",
+                    "phase": "READY",
+                    "status": "-",
+                    "epoch": 3,
+                },
             )
         else:
             payload = _node_info_document(
@@ -148,7 +158,9 @@ async def test_inspect_service_accepts_hex_token_values(
             chunk_index=0,
             has_more=False,
             next_cursor=None,
-            members=[{"node_id": "node-3", "phase": "READY", "status": "-", "epoch": 3}],
+            members=[
+                {"node_id": "node-3", "phase": "READY", "status": "-", "epoch": 3}
+            ],
             gossip_stats={},
         )
         ring_position = payload["ring_position"]
@@ -199,7 +211,9 @@ async def test_inspect_service_fails_on_unexpected_response_kind(
             payload=serializer.encode({"status": "ok"}),
         )
 
-    server = await start_envelope_server({"node.inspect": bad_inspect_handler}, server_ssl)
+    server = await start_envelope_server(
+        {"node.inspect": bad_inspect_handler}, server_ssl
+    )
 
     try:
         host, port = server.endpoint
@@ -259,5 +273,3 @@ async def test_inspect_service_rejects_missing_self_member_payload(
             await transport.close()
     finally:
         await server.stop()
-
-

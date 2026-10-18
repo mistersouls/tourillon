@@ -78,7 +78,9 @@ def test_node_state_rejects_empty_phase_when_present() -> None:
 
 @pytest.mark.tourillon
 def test_node_state_rejects_unknown_phase_when_present() -> None:
-    with pytest.raises(ValidationError, match="node.phase must be a valid member phase"):
+    with pytest.raises(
+        ValidationError, match="node.phase must be a valid member phase"
+    ):
         NodeState.from_document(
             {
                 "node": {
@@ -91,7 +93,9 @@ def test_node_state_rejects_unknown_phase_when_present() -> None:
 
 @pytest.mark.tourillon
 def test_node_state_requires_non_negative_integer_epoch() -> None:
-    with pytest.raises(ValidationError, match="node.epoch must be a non-negative integer"):
+    with pytest.raises(
+        ValidationError, match="node.epoch must be a non-negative integer"
+    ):
         NodeState.from_document(
             {
                 "node": {
@@ -105,7 +109,9 @@ def test_node_state_requires_non_negative_integer_epoch() -> None:
 
 @pytest.mark.tourillon
 def test_node_state_rejects_unknown_prev_phase_when_present() -> None:
-    with pytest.raises(ValidationError, match="node.prev_phase must be a valid member phase"):
+    with pytest.raises(
+        ValidationError, match="node.prev_phase must be a valid member phase"
+    ):
         NodeState.from_document(
             {
                 "node": {
@@ -164,7 +170,9 @@ def test_node_state_round_trip_with_tokens() -> None:
 
 @pytest.mark.tourillon
 def test_node_state_rejects_non_list_tokens() -> None:
-    with pytest.raises(ValidationError, match="node.tokens must be a list of hex strings"):
+    with pytest.raises(
+        ValidationError, match="node.tokens must be a list of hex strings"
+    ):
         NodeState.from_document(
             {
                 "node": {
@@ -214,7 +222,9 @@ def test_node_state_with_seeds_returns_new_state_with_seeds() -> None:
 
 @pytest.mark.tourillon
 def test_node_state_to_document_includes_seeds() -> None:
-    state = NodeState(node_id="node-a", phase=MemberPhase.IDLE, epoch=0, seeds=("s1:7001",))
+    state = NodeState(
+        node_id="node-a", phase=MemberPhase.IDLE, epoch=0, seeds=("s1:7001",)
+    )
     doc = state.to_document()
 
     assert doc["node"]["seeds"] == ["s1:7001"]  # type: ignore[index]
@@ -222,7 +232,9 @@ def test_node_state_to_document_includes_seeds() -> None:
 
 @pytest.mark.tourillon
 def test_node_state_rejects_empty_prev_phase_string() -> None:
-    with pytest.raises(ValidationError, match="node.prev_phase must be a non-empty string"):
+    with pytest.raises(
+        ValidationError, match="node.prev_phase must be a non-empty string"
+    ):
         NodeState.from_document(
             {
                 "node": {
@@ -236,7 +248,9 @@ def test_node_state_rejects_empty_prev_phase_string() -> None:
 
 @pytest.mark.tourillon
 def test_node_state_rejects_non_list_seeds() -> None:
-    with pytest.raises(ValidationError, match="node.seeds must be a list of non-empty strings"):
+    with pytest.raises(
+        ValidationError, match="node.seeds must be a list of non-empty strings"
+    ):
         NodeState.from_document(
             {
                 "node": {
@@ -249,7 +263,9 @@ def test_node_state_rejects_non_list_seeds() -> None:
 
 @pytest.mark.tourillon
 def test_node_state_rejects_empty_seed_entry() -> None:
-    with pytest.raises(ValidationError, match="node.seeds must be a list of non-empty strings"):
+    with pytest.raises(
+        ValidationError, match="node.seeds must be a list of non-empty strings"
+    ):
         NodeState.from_document(
             {
                 "node": {

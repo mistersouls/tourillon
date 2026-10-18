@@ -27,4 +27,3 @@ Feature: tourillon and tourctl interoperability
     When I run the tourctl probe ping command against peer endpoint
     Then the probe command exits with zero code
     And the probe output includes the running node id
-

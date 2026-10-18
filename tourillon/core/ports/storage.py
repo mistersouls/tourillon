@@ -54,7 +54,7 @@ class Batch(Protocol):
         self,
         keyspace: Keyspace,
         prefix: SupportsBytes | None = None,
-        predicate: Callable[[KVPair], bool] | None = None
+        predicate: Callable[[KVPair], bool] | None = None,
     ) -> None:
         """
         Schedule a get operation for the last key-value pair in the given keyspace,
@@ -92,7 +92,7 @@ class Session(Protocol):
         self,
         keyspace: Keyspace,
         prefix: SupportsBytes | None = None,
-        predicate: Callable[[KVPair], bool] | None = None
+        predicate: Callable[[KVPair], bool] | None = None,
     ) -> KVPair | None:
         """
         Get the last key-value pair in the given keyspace,

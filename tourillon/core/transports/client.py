@@ -39,9 +39,7 @@ class PeerClient(EnvelopeClient):
         self._phi_task: asyncio.Task[None] | None = None
 
     async def request(
-        self,
-        envelope: Envelope,
-        timeout: float = ENVELOPE_RESPONSE_TIMEOUT
+        self, envelope: Envelope, timeout: float = ENVELOPE_RESPONSE_TIMEOUT
     ) -> Envelope:
         try:
             return await super().request(envelope, timeout)
@@ -50,9 +48,7 @@ class PeerClient(EnvelopeClient):
             raise exc
 
     async def stream(
-        self,
-        envelope: Envelope,
-        timeout: float = ENVELOPE_RESPONSE_TIMEOUT
+        self, envelope: Envelope, timeout: float = ENVELOPE_RESPONSE_TIMEOUT
     ) -> AsyncIterator[Envelope]:
         try:
             async for response in super().stream(envelope, timeout):
@@ -60,4 +56,3 @@ class PeerClient(EnvelopeClient):
         except PeerFailure as exc:
             await self._fd.run(self)
             raise exc
-

@@ -40,6 +40,7 @@ class Topology:
     the TopologyManager lock acquisition. It is safe to iterate and query
     without holding any lock.
     """
+
     registry: MemberRegistry
     ring: Ring
 
@@ -196,4 +197,3 @@ class TopologyManager:
             digest.update(member.node_id.encode("utf-8"))
             digest.update(member.epoch.to_bytes(8, byteorder="big", signed=False))
         return digest.hexdigest()
-

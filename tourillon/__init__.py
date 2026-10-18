@@ -13,4 +13,3 @@
 # limitations under the License.
 
 """Tourillon – leaderless peer-to-peer distributed key-value database."""
-

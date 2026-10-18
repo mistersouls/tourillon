@@ -42,7 +42,9 @@ class Address:
         key_len = len(self.key)
 
         if ns_len > MAX_NAMESPACE_LEN:
-            raise OverflowError(f"Namespace length {ns_len} exceeds {MAX_NAMESPACE_LEN} bytes")
+            raise OverflowError(
+                f"Namespace length {ns_len} exceeds {MAX_NAMESPACE_LEN} bytes"
+            )
         if key_len > MAX_KEY_LEN:
             raise OverflowError(f"Key length {key_len} exceeds {MAX_KEY_LEN} bytes")
 
@@ -62,13 +64,13 @@ class Address:
         if len(b) < 1 + ns_len + 1:
             raise ValueError("Input bytes too short for namespace length")
 
-        namespace = b[1:1 + ns_len]
+        namespace = b[1 : 1 + ns_len]
         key_len = b[1 + ns_len]
 
         if len(b) < 1 + ns_len + 1 + key_len:
             raise ValueError("Input bytes too short for key length")
 
-        key = b[1 + ns_len + 1:1 + ns_len + 1 + key_len]
+        key = b[1 + ns_len + 1 : 1 + ns_len + 1 + key_len]
         return cls(key=key, namespace=namespace)
 
     @classmethod

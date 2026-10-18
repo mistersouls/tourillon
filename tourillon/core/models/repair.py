@@ -58,7 +58,11 @@ def encode_token(key: Key) -> str:
     it opaque is deliberate: clients and the operator CLI never need the
     storage schema, so the layout stays free to change without a wire break.
     """
-    return base64.urlsafe_b64encode(key.to_bytes(Keyspace.LOGS)).decode("ascii").rstrip("=")
+    return (
+        base64.urlsafe_b64encode(key.to_bytes(Keyspace.LOGS))
+        .decode("ascii")
+        .rstrip("=")
+    )
 
 
 def decode_token(token: str) -> Key:
@@ -78,4 +82,6 @@ def decode_token(token: str) -> Key:
     try:
         return Key.from_bytes(raw, Keyspace.LOGS)
     except (ValueError, OverflowError, IndexError, UnicodeDecodeError) as exc:
-        raise ValueError(f"repair token does not decode to a version key: {exc}") from exc
+        raise ValueError(
+            f"repair token does not decode to a version key: {exc}"
+        ) from exc

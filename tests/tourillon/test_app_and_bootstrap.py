@@ -92,7 +92,9 @@ async def _generate_config_file(tmp_path: Path, node_id: str = "node-app-test") 
     return output_file
 
 
-def _build_application(telemetry_provider: TelemetryProvider | None = None) -> Application:
+def _build_application(
+    telemetry_provider: TelemetryProvider | None = None,
+) -> Application:
     return Application(
         crypto=CryptographyMtlsAdapter(),
         persistence=TomlPersistence(),
@@ -166,7 +168,9 @@ async def test_application_create_manager_builds_manager(tmp_path: Path) -> None
 
 
 @pytest.mark.tourillon
-def test_get_manager_returns_manager_from_context(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_manager_returns_manager_from_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fake_manager = object()
     app = type("FakeDepsApp", (), {"ctx": ApplicationContext()})()
     app.ctx.set(Manager, fake_manager)
@@ -176,7 +180,9 @@ def test_get_manager_returns_manager_from_context(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.tourillon
-def test_get_manager_raises_when_manager_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_manager_raises_when_manager_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     app = type("FakeDepsApp", (), {"ctx": ApplicationContext()})()
     monkeypatch.setattr(deps, "get_app", lambda: app)
 
@@ -209,4 +215,3 @@ async def test_node_start_loads_config_initializes_logging_and_serves(
     assert fake_app.ctx.get(Manager) is fake_manager
     assert fake_manager.seeds == ["seed-a:9001"]
     assert seen_logging_configs == [fake_config.logging]
-

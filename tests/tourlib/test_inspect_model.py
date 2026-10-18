@@ -47,5 +47,7 @@ def test_node_inspect_request_from_document_rejects_invalid_limit() -> None:
 
 @pytest.mark.tourlib
 def test_node_inspect_request_from_document_rejects_invalid_probe_statuses() -> None:
-    with pytest.raises(ValidationError, match="probe_statuses must be a list of non-empty strings"):
+    with pytest.raises(
+        ValidationError, match="probe_statuses must be a list of non-empty strings"
+    ):
         NodeInspectRequest.from_document({"probe_statuses": ["LIVE", ""]})

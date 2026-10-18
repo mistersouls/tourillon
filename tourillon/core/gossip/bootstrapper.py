@@ -66,7 +66,7 @@ class GossipBootstrapper:
                     "after %d attempt(s). seeds_ok=%d seeds_err=%d",
                     attempt,
                     seeds_ok,
-                    len(seeds) - seeds_ok
+                    len(seeds) - seeds_ok,
                 )
                 return seeds_ok
             except BootstrapPartitionShiftError:
@@ -77,16 +77,21 @@ class GossipBootstrapper:
                     logger.error(
                         "Gossip bootstrap failed after %d attempt(s): %s",
                         attempt,
-                        str(exc)
+                        str(exc),
                     )
                     raise BootstrapError(
                         f"No seed responded after {attempt} attempt(s)"
                     ) from exc
 
-                jittered = delay * (1 + random.uniform(-self._backoff.jitter, self._backoff.jitter))
+                jittered = delay * (
+                    1 + random.uniform(-self._backoff.jitter, self._backoff.jitter)
+                )
                 logger.warning(
                     "Gossip bootstrap attempt %d/%s failed: %s, retrying in %.1fs.",
-                    attempt, max_retries or "∞", str(exc), jittered
+                    attempt,
+                    max_retries or "∞",
+                    str(exc),
+                    jittered,
                 )
                 await asyncio.sleep(jittered)
                 delay = min(delay * self._backoff.factor, self._backoff.max_delay)
@@ -98,7 +103,7 @@ class GossipBootstrapper:
             for idx, seed in enumerate(seeds):
                 tg.create_task(
                     self._attempt_seed(seed, results, idx),
-                    name=f"gossip-bootstrap-seed-{seed}"
+                    name=f"gossip-bootstrap-seed-{seed}",
                 )
 
         seeds_ok = sum(1 for result in results if result)
@@ -107,12 +112,11 @@ class GossipBootstrapper:
         return seeds_ok
 
     async def _attempt_seed(
-        self,
-        seed_address: str,
-        results: list[bool],
-        idx: int
+        self, seed_address: str, results: list[bool], idx: int
     ) -> None:
-        client = EnvelopeClient(seed_address, tls_ctx=self._tls_client, logger=logger.transport())
+        client = EnvelopeClient(
+            seed_address, tls_ctx=self._tls_client, logger=logger.transport()
+        )
 
         try:
             async with asyncio.timeout(self._connection_timeout):
@@ -129,9 +133,7 @@ class GossipBootstrapper:
             await client.close()
 
     async def _exchange_digest(
-        self,
-        client: EnvelopeClient,
-        seed_address: str
+        self, client: EnvelopeClient, seed_address: str
     ) -> list[Member]:
         payload = {
             "sender": self._node_id,
@@ -148,7 +150,9 @@ class GossipBootstrapper:
 
         async for delta in client.stream(digest):
             if delta.kind == "gossip.error":
-                logger.warning("Seed %s returned gossip.error for digest.", seed_address)
+                logger.warning(
+                    "Seed %s returned gossip.error for digest.", seed_address
+                )
                 break
             if delta.kind == "gossip.delta":
                 data = self._serializer.decode(delta.payload)
@@ -157,7 +161,11 @@ class GossipBootstrapper:
                 if not data.get("has_more", False):
                     break
             else:
-                logger.warning("Seed %s returned unexpected envelope kind: %s", seed_address, delta.kind)
+                logger.warning(
+                    "Seed %s returned unexpected envelope kind: %s",
+                    seed_address,
+                    delta.kind,
+                )
                 break
 
         return members
@@ -170,5 +178,7 @@ class GossipBootstrapper:
                 member = Member.from_dict(member_data)
                 members.append(member)
             except (KeyError, TypeError, ValueError) as exc:
-                logger.warning("Failed to decode member data: %s, error: %s", member_data, str(exc))
+                logger.warning(
+                    "Failed to decode member data: %s, error: %s", member_data, str(exc)
+                )
         return members

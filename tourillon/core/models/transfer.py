@@ -42,20 +42,12 @@ class PartitionTransfer:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the PartitionTransfer to a dictionary."""
-        return {
-            "pid": self.pid,
-            "src": self.src,
-            "dst": self.dst
-        }
+        return {"pid": self.pid, "src": self.src, "dst": self.dst}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PartitionTransfer":
         """Deserialize a dictionary to a PartitionTransfer."""
-        return cls(
-            pid=data["pid"],
-            src=data["src"],
-            dst=data["dst"]
-        )
+        return cls(pid=data["pid"], src=data["src"], dst=data["dst"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,11 +63,7 @@ class RangeTransfer:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the RangeTransfer to a dictionary."""
-        return {
-            "segment": self.segment,
-            "src": self.src,
-            "dst": self.dst
-        }
+        return {"segment": self.segment, "src": self.src, "dst": self.dst}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RangeTransfer":
@@ -85,11 +73,7 @@ class RangeTransfer:
         which would break equality and hashing.
         """
         lo, hi = data["segment"]
-        return cls(
-            segment=(int(lo), int(hi)),
-            src=data["src"],
-            dst=data["dst"]
-        )
+        return cls(segment=(int(lo), int(hi)), src=data["src"], dst=data["dst"])
 
 
 @dataclass
@@ -349,4 +333,3 @@ class TransferReject:
             reason=str(data.get("reason") or "unknown"),
             fatal=bool(data.get("fatal")),
         )
-

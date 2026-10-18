@@ -21,10 +21,7 @@ from tourillon.core.log import init_loggers, logger
 from tourillon.core.manager import Manager
 from tourlib.helpers import scan
 
-node_app = App(
-    name="node",
-    help="Node lifecycle and management commands."
-)
+node_app = App(name="node", help="Node lifecycle and management commands.")
 
 
 @node_app.command(name="start")

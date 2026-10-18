@@ -111,7 +111,9 @@ class KvService:
         if response.kind == f"{request_kind}.reject":
             raise self._rejected(request_kind, response.payload)
         if response.kind != response_kind:
-            raise ResponseError(f"unexpected {request_kind} response kind: {response.kind}")
+            raise ResponseError(
+                f"unexpected {request_kind} response kind: {response.kind}"
+            )
         document = self._serializer.decode(response.payload)
         return self._parse_version(document, request_kind=request_kind)
 

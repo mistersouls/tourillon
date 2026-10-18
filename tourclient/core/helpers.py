@@ -61,4 +61,3 @@ async def load_config(
 
     document = await persistence.load(path)
     return ClientConfig.from_document(document)
-

@@ -217,7 +217,9 @@ class _TelemetryRecorder:
     def gossip_failed_announcements_total(self) -> _Counter:
         return self._gossip_failed_announcements_total
 
-    def start_span(self, name: str, *, attributes: dict[str, AttributeValue] | None = None) -> AbstractContextManager[Span]:
+    def start_span(
+        self, name: str, *, attributes: dict[str, AttributeValue] | None = None
+    ) -> AbstractContextManager[Span]:
         span = _SpanRecorder()
         self.spans.append((name, dict(attributes or {}), span))
         return _SpanCtx(span)
@@ -250,7 +252,9 @@ class _FakeClient:
 
 
 class _FakePool:
-    def __init__(self, client: _FakeClient | None = None, error: BaseException | None = None) -> None:
+    def __init__(
+        self, client: _FakeClient | None = None, error: BaseException | None = None
+    ) -> None:
         self._client = client
         self._error = error
         self.calls: list[str] = []
@@ -263,7 +267,9 @@ class _FakePool:
         return self._client
 
 
-def _member(node_id: str, *, phase: MemberPhase = MemberPhase.READY, epoch: int = 1) -> Member:
+def _member(
+    node_id: str, *, phase: MemberPhase = MemberPhase.READY, epoch: int = 1
+) -> Member:
     return Member(
         node_id=node_id,
         peer_address=f"127.0.0.1:{4000 + epoch}",
@@ -468,7 +474,13 @@ async def test_gossiper_push_member_and_send_push_paths_cover_success_and_errors
     serializer = _MapSerializer()
     telemetry = _TelemetryRecorder()
     topology = TopologyManager()
-    await topology.merge_registry((_member("node-a"), _member("node-b"), _member("node-c", phase=MemberPhase.PAUSED)))
+    await topology.merge_registry(
+        (
+            _member("node-a"),
+            _member("node-b"),
+            _member("node-c", phase=MemberPhase.PAUSED),
+        )
+    )
 
     push_accept = _envelope("gossip.push.accept", serializer, {"accepted": 0})
     push_error = _envelope("gossip.error", serializer, {"error": "reject", "code": ""})
@@ -538,7 +550,9 @@ async def test_gossiper_ae_cycle_ping_pong_and_digest_delta_paths(
             "has_more": False,
         },
     )
-    client = _FakeClient(request_responses=[pong, push_accept], stream_responses=[delta])
+    client = _FakeClient(
+        request_responses=[pong, push_accept], stream_responses=[delta]
+    )
     engine = Gossiper(
         node_id="node-a",
         config=GossipConfig(),
@@ -568,7 +582,9 @@ async def test_gossiper_ae_cycle_ping_pong_and_digest_delta_paths(
     )
     error_client = _FakeClient(stream_responses=[ae_error])
     with caplog.at_level("WARNING"):
-        await engine._ae_digest_delta(peer, cast(EnvelopeClient, cast(object, error_client)))
+        await engine._ae_digest_delta(
+            peer, cast(EnvelopeClient, cast(object, error_client))
+        )
 
     assert "Received gossip.error during AE cycle" in caplog.text
     assert "cid=" in caplog.text
@@ -582,7 +598,9 @@ async def test_gossiper_build_digest_and_merge_delta_error_paths(
     serializer = _MapSerializer()
     telemetry = _TelemetryRecorder()
     topology = TopologyManager()
-    await topology.merge_registry((_member("node-b", epoch=2), _member("node-a", epoch=1)))
+    await topology.merge_registry(
+        (_member("node-b", epoch=2), _member("node-a", epoch=1))
+    )
     engine = Gossiper(
         node_id="node-a",
         config=GossipConfig(),
@@ -630,7 +648,9 @@ async def test_gossiper_satisfy_wanted_handles_empty_and_request_failure(
     await topology.merge_registry((_member("node-a"), _member("node-b")))
     peer = _member("node-b")
 
-    ok_client = _FakeClient(request_responses=[_envelope("gossip.push.accept", serializer, {"accepted": 1})])
+    ok_client = _FakeClient(
+        request_responses=[_envelope("gossip.push.accept", serializer, {"accepted": 1})]
+    )
     engine = Gossiper(
         node_id="node-a",
         config=GossipConfig(),
@@ -641,12 +661,18 @@ async def test_gossiper_satisfy_wanted_handles_empty_and_request_failure(
         telemetry=cast(Telemetry, cast(object, telemetry)),
     )
 
-    await engine._satisfy_wanted(peer, cast(EnvelopeClient, cast(object, ok_client)), {"node-z"})
-    await engine._satisfy_wanted(peer, cast(EnvelopeClient, cast(object, ok_client)), {"node-a"})
+    await engine._satisfy_wanted(
+        peer, cast(EnvelopeClient, cast(object, ok_client)), {"node-z"}
+    )
+    await engine._satisfy_wanted(
+        peer, cast(EnvelopeClient, cast(object, ok_client)), {"node-a"}
+    )
 
     failing_client = _FakeClient(request_error=EnvelopeError("failed"))
     with caplog.at_level("WARNING"):
-        await engine._satisfy_wanted(peer, cast(EnvelopeClient, cast(object, failing_client)), {"node-a"})
+        await engine._satisfy_wanted(
+            peer, cast(EnvelopeClient, cast(object, failing_client)), {"node-a"}
+        )
 
     assert "gossip.satisfy_wanted failed" in caplog.text
 
@@ -663,6 +689,7 @@ async def test_ae_loop_continues_after_network_errors() -> None:
 
     class FailingPool:
         """Pool that always raises ConnectionRefusedError."""
+
         async def acquire(self, peer_id: str):
             raise ConnectionRefusedError(f"peer {peer_id} unreachable")
 
@@ -701,8 +728,9 @@ async def test_ae_loop_continues_after_network_errors() -> None:
     status = gossiper.status()
 
     # With the fix, loop should still be running despite network errors
-    assert status["ae_running"], \
-        "AE loop should survive network errors and continue running. " \
+    assert status["ae_running"], (
+        "AE loop should survive network errors and continue running. "
         "Wrap _ae_loop body with try/except Exception to catch all errors and retry."
+    )
 
     await asyncio.gather(gossiper.stop(), return_exceptions=True)

@@ -89,7 +89,9 @@ class _FakeBatch:
                 results.append(None)
             elif kind == "last":
                 _, keyspace, prefix, predicate = op
-                results.append(self._store.last(keyspace, prefix=prefix, predicate=predicate))
+                results.append(
+                    self._store.last(keyspace, prefix=prefix, predicate=predicate)
+                )
             elif kind == "list":
                 _, keyspace, prefix, start, limit, reverse = op
                 results.append(
@@ -174,7 +176,9 @@ class _FakeSession:
     async def delete(self, ref: KVRef) -> None:
         self._store.delete(ref)
 
-    async def last(self, keyspace: Keyspace, prefix=None, predicate=None) -> KVPair | None:
+    async def last(
+        self, keyspace: Keyspace, prefix=None, predicate=None
+    ) -> KVPair | None:
         return self._store.last(keyspace, prefix=prefix, predicate=predicate)
 
     async def iter(
@@ -269,7 +273,9 @@ def _seed_record(store: _FakeStore, record: Record) -> None:
 
 
 def _stored_tag(store: _FakeStore, record: Record) -> Tag:
-    kv = store.get(KVRef(key=record.key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS))
+    kv = store.get(
+        KVRef(key=record.key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS)
+    )
     assert kv is not None
     return Tag.from_bytes(kv.value)
 
@@ -355,9 +361,19 @@ async def test_scan_skips_unreadable_entries() -> None:
         )
     )
     _seed_record(store, bad_value)
-    store.put(KVPair(key=bad_value.key.to_bytes(Keyspace.LOGS), value=b"", keyspace=Keyspace.LOGS))
+    store.put(
+        KVPair(
+            key=bad_value.key.to_bytes(Keyspace.LOGS), value=b"", keyspace=Keyspace.LOGS
+        )
+    )
     _seed_record(store, bad_tag)
-    store.put(KVPair(key=bad_tag.key.to_bytes(Keyspace.TAGS), value=b"\xff", keyspace=Keyspace.TAGS))
+    store.put(
+        KVPair(
+            key=bad_tag.key.to_bytes(Keyspace.TAGS),
+            value=b"\xff",
+            keyspace=Keyspace.TAGS,
+        )
+    )
 
     assert await _scan(_staging(store)) == [good]
 
@@ -391,7 +407,13 @@ async def test_stage_writes_staging_entries_and_keeps_active_records_visible() -
     foreign = _record(8, 1)
     _seed_record(store, active)
     _seed_record(store, corrupted)
-    store.put(KVPair(key=corrupted.key.to_bytes(Keyspace.TAGS), value=b"\xff", keyspace=Keyspace.TAGS))
+    store.put(
+        KVPair(
+            key=corrupted.key.to_bytes(Keyspace.TAGS),
+            value=b"\xff",
+            keyspace=Keyspace.TAGS,
+        )
+    )
     _seed_record(store, _with_tag(foreign, Tag.staging(foreign.tag, "other")))
     staging = _staging(store)
 
@@ -420,7 +442,9 @@ async def test_commit_activates_owned_records_only_and_is_idempotent() -> None:
     _seed_record(store, live)
 
     assert await staging.commit(batch_size=1) == 3
-    assert [_stored_tag(store, record) for record in owned] == [record.tag for record in owned]
+    assert [_stored_tag(store, record) for record in owned] == [
+        record.tag for record in owned
+    ]
     assert _stored_tag(store, foreign).kind == TagKind.STAGING
     assert _stored_tag(store, live) == live.tag
     assert await staging.last_keys() == {}
@@ -457,7 +481,13 @@ async def test_commit_keeps_unreadable_entries_and_stops_at_the_segment_end() ->
     _seed_record(store, _with_tag(legacy, legacy_tag))
     corrupted = _record(7, 3)
     _seed_record(store, corrupted)
-    store.put(KVPair(key=corrupted.key.to_bytes(Keyspace.TAGS), value=b"\xff", keyspace=Keyspace.TAGS))
+    store.put(
+        KVPair(
+            key=corrupted.key.to_bytes(Keyspace.TAGS),
+            value=b"\xff",
+            keyspace=Keyspace.TAGS,
+        )
+    )
     inside, beyond = _record(7, 2), _record(8, 1)
     whole_group = _staging(store)
     await whole_group.stage([inside, beyond])
@@ -477,7 +507,9 @@ async def test_commit_keeps_unreadable_entries_and_stops_at_the_segment_end() ->
 async def test_hint_satisfy_restores_original_tags_and_is_idempotent() -> None:
     store = _FakeStore()
     live = _with_tag(_record(7, 1), Tag.hint(Tag(kind=TagKind.LIVE), "node-b"))
-    tombstone = _with_tag(_record(7, 2), Tag.hint(Tag(kind=TagKind.TOMBSTONE), "node-b"))
+    tombstone = _with_tag(
+        _record(7, 2), Tag.hint(Tag(kind=TagKind.TOMBSTONE), "node-b")
+    )
     plain = _record(7, 3)
     for record in (live, tombstone, plain):
         _seed_record(store, record)
@@ -498,7 +530,13 @@ async def test_hint_satisfy_skips_missing_and_unreadable_entries() -> None:
     missing = _with_tag(_record(7, 1), Tag.hint(Tag(kind=TagKind.LIVE), "node-b"))
     broken = _with_tag(_record(7, 2), Tag.hint(Tag(kind=TagKind.LIVE), "node-b"))
     _seed_record(store, broken)
-    store.put(KVPair(key=broken.key.to_bytes(Keyspace.TAGS), value=b"\xff", keyspace=Keyspace.TAGS))
+    store.put(
+        KVPair(
+            key=broken.key.to_bytes(Keyspace.TAGS),
+            value=b"\xff",
+            keyspace=Keyspace.TAGS,
+        )
+    )
 
     assert await _hints(store).satisfy([missing, broken]) is False
     assert store.get(KVRef(key=broken.key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS)).value == b"\xff"  # type: ignore[union-attr]
@@ -506,12 +544,12 @@ async def test_hint_satisfy_skips_missing_and_unreadable_entries() -> None:
 
 @pytest.mark.tourillon
 def test_partition_group_staging_rejects_segment_outside_its_group() -> None:
-    with pytest.raises(ValueError, match=r"segment \[0, 1\] is not handled by group 0 \[7, 8\]"):
+    with pytest.raises(
+        ValueError, match=r"segment \[0, 1\] is not handled by group 0 \[7, 8\]"
+    ):
         _staging(_FakeStore(), segment=(0, 1))
     with pytest.raises(ValueError, match="is not handled"):
         _staging(_FakeStore(), segment=(8, 7))
-
-
 
 
 def _store_over(store: _FakeStore) -> PartitionGroupStore:
@@ -525,7 +563,9 @@ async def test_get_at_returns_the_version_stored_at_that_exact_timestamp() -> No
     older = _record(7, 1)
     newer = _record(7, 1)
     newer = Record(
-        key=Key(pid=newer.key.pid, address=newer.key.address, ts=HLCTimestamp(900, 0, "n")),
+        key=Key(
+            pid=newer.key.pid, address=newer.key.address, ts=HLCTimestamp(900, 0, "n")
+        ),
         value=Value(data=b"newer", quorum_write=1),
         tag=newer.tag,
     )

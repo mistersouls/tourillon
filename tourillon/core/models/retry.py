@@ -39,7 +39,9 @@ class BackoffRetry:
         }
 
     @classmethod
-    def from_document(cls, document: Mapping[str, Any], prefix: str = "") -> "BackoffRetry":
+    def from_document(
+        cls, document: Mapping[str, Any], prefix: str = ""
+    ) -> "BackoffRetry":
         delays: dict[str, float] = {}
         for name in _DELAY_FIELDS:
             value = document.get(name, getattr(cls, name))

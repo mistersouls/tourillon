@@ -50,4 +50,3 @@ class RequestRejectedError(Exception):
         if not errors:
             return message
         return f"{message} ({'; '.join(errors)})"
-

@@ -62,7 +62,9 @@ class TourClient:
         """
         # Avoid infinite recursion for private/protected attributes
         if name.startswith("_"):
-            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+            raise AttributeError(
+                f"'{self.__class__.__name__}' object has no attribute '{name}'"
+            )
 
         # Check cache first
         if name in self._services_cache:
@@ -140,7 +142,9 @@ async def client(
     try:
         await transport.connect()
         if service:
-            yield get_service(service, endpoint, transport=transport, serializer=serializer)
+            yield get_service(
+                service, endpoint, transport=transport, serializer=serializer
+            )
         else:
             yield TourClient(
                 transport=transport,

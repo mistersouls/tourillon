@@ -85,7 +85,12 @@ async def inspect_node(
         _raise_user_error(_inspect_error_message(exc, context_name))
 
     if as_json:
-        return json.dumps([asdict(chunk) for chunk in chunks], ensure_ascii=False, indent=2, sort_keys=True)
+        return json.dumps(
+            [asdict(chunk) for chunk in chunks],
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
     return _render_text(address, chunks)
 
 
@@ -203,5 +208,3 @@ def _gossip_state(stats: dict[str, object]) -> str:
     if isinstance(diverged, int) and diverged > 0:
         return "active"
     return "stable"
-
-

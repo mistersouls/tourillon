@@ -118,7 +118,9 @@ class TransferService:
             touched=self._clock(),
         )
         if request.range.id in self._sessions:
-            logger.info("range=%s push session restarted by its source", request.range.id)
+            logger.info(
+                "range=%s push session restarted by its source", request.range.id
+            )
         self._sessions[request.range.id] = session
         return TransferInitAccept(resumes=resumes, session=session.id)
 
@@ -146,7 +148,9 @@ class TransferService:
     def _session(self, range_: RangeTransfer, session_id: str) -> _PushSession:
         session = self._sessions.get(range_.id)
         if session is None or session.id != session_id:
-            raise TransferError(f"range={range_.id} unknown transfer session {session_id!r}")
+            raise TransferError(
+                f"range={range_.id} unknown transfer session {session_id!r}"
+            )
         return session
 
     def _evict_idle_sessions(self) -> None:
@@ -184,6 +188,3 @@ class TransferService:
     async def _current_serial(self) -> str:
         topology = await self._topologymgr.snapshot()
         return topology.ring.serial()
-
-
-

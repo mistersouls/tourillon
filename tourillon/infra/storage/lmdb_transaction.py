@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, List
+from collections.abc import Callable
 
 import lmdb
 
-from tourillon.core.models.storageschema import KVRef, KVPair, Keyspace
+from tourillon.core.models.storageschema import Keyspace, KVPair, KVRef
 from tourlib.models.types import SupportsBytes
 
 
@@ -26,13 +26,13 @@ class LmdbTransaction:
         txn: lmdb.Transaction,
         dbi_logs: lmdb._Database,
         dbi_tags: lmdb._Database,
-        dbi_meta: lmdb._Database
+        dbi_meta: lmdb._Database,
     ) -> None:
         self._txn = txn
         self._dbis = {
             Keyspace.LOGS: dbi_logs,
             Keyspace.TAGS: dbi_tags,
-            Keyspace.META: dbi_meta
+            Keyspace.META: dbi_meta,
         }
 
     def get(self, ref: KVRef) -> KVPair | None:
@@ -63,7 +63,9 @@ class LmdbTransaction:
         cursor = self._txn.cursor(db=dbi)
         prefix_bytes = prefix.to_bytes() if prefix is not None else None
 
-        if prefix_bytes is not None and not self._cursor_range(cursor, prefix_bytes, reverse=True):
+        if prefix_bytes is not None and not self._cursor_range(
+            cursor, prefix_bytes, reverse=True
+        ):
             return None
 
         while True:
@@ -85,7 +87,7 @@ class LmdbTransaction:
         start: bytes | None = None,
         limit: int | None = None,
         reverse: bool = False,
-    ) -> List[KVPair]:
+    ) -> list[KVPair]:
         if limit is not None and limit <= 0:
             return []
 
@@ -146,7 +148,7 @@ class LmdbTransaction:
         cursor: lmdb.Cursor,
         prefix: bytes | None,
         start: bytes | None,
-        reverse: bool
+        reverse: bool,
     ) -> bool:
         if start is not None:
             return self._cursor_range(cursor, start, reverse)

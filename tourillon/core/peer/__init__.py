@@ -15,4 +15,3 @@
 from tourillon.core.peer.pool import PeerConnection, PeerPool
 
 __all__ = ["PeerConnection", "PeerPool"]
-

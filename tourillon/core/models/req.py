@@ -35,4 +35,3 @@ class HintRequest:
             target_node_id=data["target_node_id"],
             record=Record.from_dict(data["record"]),
         )
-

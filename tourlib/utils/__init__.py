@@ -15,4 +15,3 @@
 from tourlib.utils.buffer import BytesWalker
 
 __all__ = ["BytesWalker"]
-

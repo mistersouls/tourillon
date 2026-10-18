@@ -65,7 +65,9 @@ class NodeConfigGenerator:
         validate_node_id(node_id, "node_id")
         if not isinstance(node_size, NodeSize):
             raise ValidationError("node_size must be one of: XS, S, M, L, XL, XXL")
-        if seeds is not None and not all(isinstance(seed, str) and seed for seed in seeds):
+        if seeds is not None and not all(
+            isinstance(seed, str) and seed for seed in seeds
+        ):
             raise ValidationError("seeds must be a list of non-empty strings")
         data_dir = StorageConfig.validate_data_dir(data_dir)
         if not client_bind:
@@ -88,7 +90,9 @@ class NodeConfigGenerator:
         )
         config = TourillonConfig(
             node=NodeConfig(id=node_id, size=node_size, seeds=seeds),
-            storage=StorageConfig.from_document({"data_dir": data_dir, "group_size": group_size}),
+            storage=StorageConfig.from_document(
+                {"data_dir": data_dir, "group_size": group_size}
+            ),
             tls=TlsConfig(
                 ca_data=self._b64(ca_cert_pem),
                 cert_data=self._b64(cert_pem),

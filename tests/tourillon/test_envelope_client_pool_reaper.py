@@ -94,4 +94,3 @@ async def test_remove_expired_removes_idle_overflow_peer() -> None:
     assert overflow_client.close_calls == 1
     assert detector.stop_calls == 1
     assert "peer-overflow" not in pool._overflows
-

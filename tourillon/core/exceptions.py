@@ -24,11 +24,13 @@ class BootstrapPartitionShiftError(Exception):
     the bootstrap process of the node.
     """
 
+
 class BootstrapAttemptError(Exception):
     """
     Raised when there is an error during
     the bootstrap attempt of the node.
     """
+
 
 class BootstrapError(Exception):
     """
@@ -49,6 +51,7 @@ class JoinError(Exception):
     Raised when there is an error during
     the join process of the node.
     """
+
     def __init__(self, error: str) -> None:
         super().__init__(error)
         self.error = error
@@ -59,12 +62,20 @@ class StoreOperationError(Exception):
 
     code = "store_operation_failed"
 
-    def __init__(self, operation: str, errors: Sequence[Exception], message: str | None = None) -> None:
+    def __init__(
+        self, operation: str, errors: Sequence[Exception], message: str | None = None
+    ) -> None:
         if not errors:
-            raise ValueError("StoreOperationError requires at least one underlying exception")
-        self._set_details(operation, errors, message or f"{operation} replication failed")
+            raise ValueError(
+                "StoreOperationError requires at least one underlying exception"
+            )
+        self._set_details(
+            operation, errors, message or f"{operation} replication failed"
+        )
 
-    def _set_details(self, operation: str, errors: Sequence[Exception], message: str) -> None:
+    def _set_details(
+        self, operation: str, errors: Sequence[Exception], message: str
+    ) -> None:
         Exception.__init__(self, message)
         self.operation = operation
         self.errors = tuple(errors)
@@ -101,6 +112,7 @@ class StoreOperationError(Exception):
         message = data.get("message", f"{operation} replication failed")
         return cls(operation=operation, errors=errors, message=message)
 
+
 class QuorumNotMetError(StoreOperationError):
     """Raised when fewer replicas than required agreed on the operation outcome.
 
@@ -126,11 +138,17 @@ class QuorumNotMetError(StoreOperationError):
         self.required = required
         self.received = received
         self.token = token
-        message = f"{operation} quorum not met: successes={received}, required={required}"
+        message = (
+            f"{operation} quorum not met: successes={received}, required={required}"
+        )
         self._set_details(operation, errors, message)
 
     def to_dict(self) -> dict[str, Any]:
-        data = {**super().to_dict(), "required": self.required, "received": self.received}
+        data = {
+            **super().to_dict(),
+            "required": self.required,
+            "received": self.received,
+        }
         if self.token is not None:
             data["token"] = self.token
         return data
@@ -142,7 +160,9 @@ class NoReplicaAvailableError(StoreOperationError):
     code = "no_replica_available"
 
     def __init__(self, operation: str) -> None:
-        self._set_details(operation, (), f"{operation}: preference list has no replication target")
+        self._set_details(
+            operation, (), f"{operation}: preference list has no replication target"
+        )
 
 
 class InvalidQuorumError(StoreOperationError):

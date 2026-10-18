@@ -115,7 +115,9 @@ class _Storage:
 
     def __init__(self) -> None:
         self.stores = {0: _FakeStore(), 1: _FakeStore()}
-        self._providers = {gid: _FakeSessionProvider(store, gid) for gid, store in self.stores.items()}
+        self._providers = {
+            gid: _FakeSessionProvider(store, gid) for gid, store in self.stores.items()
+        }
 
     async def session_provider_for(self, group: int) -> _FakeSessionProvider:
         return self._providers[group]
@@ -161,13 +163,17 @@ class _FakePeerPool:
 class _ScriptedClient:
     """Peer answering from scripts: one list of items per stream, one item per request."""
 
-    def __init__(self, streams: list[list[Any]] | None = None, requests: list[Any] | None = None) -> None:
+    def __init__(
+        self, streams: list[list[Any]] | None = None, requests: list[Any] | None = None
+    ) -> None:
         self._streams = list(streams or [])
         self._requests = list(requests or [])
         self.streamed: list[Envelope] = []
         self.requested: list[Envelope] = []
 
-    async def stream(self, envelope: Envelope, timeout: float = 30.0) -> AsyncIterator[Envelope]:
+    async def stream(
+        self, envelope: Envelope, timeout: float = 30.0
+    ) -> AsyncIterator[Envelope]:
         self.streamed.append(envelope)
         for item in self._streams.pop(0):
             if isinstance(item, BaseException):
@@ -190,7 +196,9 @@ class _LoopbackClient:
     pairs whose n-th request of that kind fails with a connection reset.
     """
 
-    def __init__(self, service: TransferService, monkeypatch: pytest.MonkeyPatch) -> None:
+    def __init__(
+        self, service: TransferService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         manager = SimpleNamespace(serializer=SERIALIZER, transfer=service)
         monkeypatch.setattr(transfer_handlers, "get_manager", lambda: manager)
         self.stream_faults: list[int | None] = []
@@ -199,7 +207,9 @@ class _LoopbackClient:
         self.served: list[list[TransferChunk]] = []
         self.requests: list[tuple[str, float]] = []
 
-    async def stream(self, envelope: Envelope, timeout: float = 30.0) -> AsyncIterator[Envelope]:
+    async def stream(
+        self, envelope: Envelope, timeout: float = 30.0
+    ) -> AsyncIterator[Envelope]:
         self.claims.append(TransferClaim.from_dict(SERIALIZER.decode(envelope.payload)))
         served: list[TransferChunk] = []
         self.served.append(served)
@@ -208,7 +218,9 @@ class _LoopbackClient:
             if limit is not None and len(served) >= limit:
                 raise ConnectionResetError("connection reset by peer")
             if response.kind == "transfer.chunk":
-                served.append(TransferChunk.from_dict(SERIALIZER.decode(response.payload)))
+                served.append(
+                    TransferChunk.from_dict(SERIALIZER.decode(response.payload))
+                )
             yield response
 
     async def request(self, envelope: Envelope, timeout: float = 30.0) -> Envelope:
@@ -268,7 +280,9 @@ def _applicator(
         storage=storage,  # type: ignore[arg-type]
         serializer=SERIALIZER,
         partitioner=_MiniPartitioner(),  # type: ignore[arg-type]
-        backoff=BackoffRetry(initial_delay=0.0, max_delay=0.0, max_retries=max_retries, jitter=0.0),
+        backoff=BackoffRetry(
+            initial_delay=0.0, max_delay=0.0, max_retries=max_retries, jitter=0.0
+        ),
         **kwargs,
     )
 
@@ -280,7 +294,9 @@ def _decode(streamer: TransferStreamer, chunks: list[TransferChunk]) -> list[Rec
 
 
 def _env(kind: str, payload: dict[str, Any]) -> Envelope:
-    return build_envelope(kind=kind, payload=SERIALIZER.encode(payload), schema_id=SERIALIZER.schema_id)
+    return build_envelope(
+        kind=kind, payload=SERIALIZER.encode(payload), schema_id=SERIALIZER.schema_id
+    )
 
 
 def _frame(payload: bytes) -> bytes:
@@ -315,34 +331,55 @@ def test_transfer_models_round_trip_through_the_wire_format() -> None:
     )
     models = [
         TransferPlan(ranges=[RANGE], serial="serial"),
-        TransferClaim(serial="serial", resumes={1: record.key}, range=RANGE, after=record.key, window=7),
+        TransferClaim(
+            serial="serial",
+            resumes={1: record.key},
+            range=RANGE,
+            after=record.key,
+            window=7,
+        ),
         TransferClaim(serial="serial", resumes={}, range=RANGE),
         TransferInit(serial="serial", range=RANGE),
         TransferInitAccept(resumes={1: record.key}, session="s-1"),
-        TransferChunk(range=RANGE, raw=b"raw", last=True, seq=4, more=True, session="s-1"),
+        TransferChunk(
+            range=RANGE, raw=b"raw", last=True, seq=4, more=True, session="s-1"
+        ),
         TransferCommit(range=RANGE, session="s-1"),
         TransferReject(reason="nope", fatal=True),
     ]
 
     for model in models:
-        assert type(model).from_dict(SERIALIZER.decode(SERIALIZER.encode(model.to_dict()))) == model
+        assert (
+            type(model).from_dict(SERIALIZER.decode(SERIALIZER.encode(model.to_dict())))
+            == model
+        )
 
-    wired = RangeTransfer.from_dict(SERIALIZER.decode(SERIALIZER.encode(RANGE.to_dict())))
+    wired = RangeTransfer.from_dict(
+        SERIALIZER.decode(SERIALIZER.encode(RANGE.to_dict()))
+    )
     assert wired == RANGE and hash(wired) == hash(RANGE)
     assert TransferHandle.from_dict(handle.to_dict()) == handle
     transfer = PartitionTransfer(pid=1, src="a", dst="b")
     assert PartitionTransfer.from_dict(transfer.to_dict()) == transfer
     assert transfer.id == "1:a->b"
-    assert TransferReject.from_dict(None) == TransferReject(reason="unknown", fatal=False)
-    assert TransferChunk.from_dict({"range": RANGE.to_dict(), "raw": b"x"}) == TransferChunk(range=RANGE, raw=b"x")
+    assert TransferReject.from_dict(None) == TransferReject(
+        reason="unknown", fatal=False
+    )
+    assert TransferChunk.from_dict(
+        {"range": RANGE.to_dict(), "raw": b"x"}
+    ) == TransferChunk(range=RANGE, raw=b"x")
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_stream_sends_transferable_records_in_key_order_in_numbered_chunks() -> None:
+async def test_stream_sends_transferable_records_in_key_order_in_numbered_chunks() -> (
+    None
+):
     source = _Storage()
     records = _dataset()
-    staged_elsewhere = _with_tag(_record(1, 5), Tag.staging(Tag(kind=TagKind.LIVE), "other"))
+    staged_elsewhere = _with_tag(
+        _record(1, 5), Tag.staging(Tag(kind=TagKind.LIVE), "other")
+    )
     stale = _kind(_record(2, 7), TagKind.STALE)
     source.seed(*records, staged_elsewhere, stale)
     streamer = _streamer(source, max_chunk_size=64)
@@ -354,7 +391,10 @@ async def test_stream_sends_transferable_records_in_key_order_in_numbered_chunks
     assert chunks[-1].more is False
     assert all(len(chunk.raw) == 64 for chunk in chunks[:-1])
     assert _decode(streamer, chunks) == records
-    assert [provider.group_id for provider in await streamer.session_providers()] == [0, 1]
+    assert [provider.group_id for provider in await streamer.session_providers()] == [
+        0,
+        1,
+    ]
 
 
 @pytest.mark.tourillon
@@ -365,7 +405,12 @@ async def test_stream_resumes_per_pid_and_cuts_windows_at_record_boundaries() ->
     source.seed(*records)
     streamer = _streamer(source, max_chunk_size=64)
 
-    resumed = [chunk async for chunk in streamer.stream(resumes={0: records[1].key, 3: records[4].key})]
+    resumed = [
+        chunk
+        async for chunk in streamer.stream(
+            resumes={0: records[1].key, 3: records[4].key}
+        )
+    ]
     assert _decode(streamer, resumed) == [records[2], records[3], records[5]]
 
     received: list[Record] = []
@@ -400,7 +445,9 @@ async def test_receiver_stages_a_stream_and_commit_activates_it() -> None:
     assert received == len(records)
     assert receiver.complete and not receiver.more
     assert receiver.cursor == records[-1].key
-    assert [dest.tag(record) for record in records] == [Tag.staging(r.tag, "src") for r in records]
+    assert [dest.tag(record) for record in records] == [
+        Tag.staging(r.tag, "src") for r in records
+    ]
     assert await receiver.streamer.last_keys() == {
         0: records[1].key,
         1: records[2].key,
@@ -409,7 +456,9 @@ async def test_receiver_stages_a_stream_and_commit_activates_it() -> None:
     }
 
     assert await receiver.streamer.commit() == len(records)
-    assert [dest.tag(record) for record in records] == [record.tag for record in records]
+    assert [dest.tag(record) for record in records] == [
+        record.tag for record in records
+    ]
     assert await receiver.streamer.last_keys() == {}
 
 
@@ -422,10 +471,17 @@ async def test_receiver_rejects_gaps_foreign_ranges_and_chunks_after_the_end() -
         await receiver.receive(TransferChunk(range=RANGE, raw=b"", seq=1))
     with pytest.raises(ProcessError, match="received a chunk of range"):
         await receiver.receive(
-            TransferChunk(range=RangeTransfer(segment=(9, 9), src="src", dst="dst"), raw=b"")
+            TransferChunk(
+                range=RangeTransfer(segment=(9, 9), src="src", dst="dst"), raw=b""
+            )
         )
 
-    assert await receiver.receive(TransferChunk(range=RANGE, raw=b"", last=True, more=True)) == 0
+    assert (
+        await receiver.receive(
+            TransferChunk(range=RANGE, raw=b"", last=True, more=True)
+        )
+        == 0
+    )
     assert receiver.complete and receiver.more and receiver.cursor is None
 
     with pytest.raises(TransferError, match="after the last one"):
@@ -445,14 +501,18 @@ async def test_receiver_rejects_corrupted_streams() -> None:
         (_frame(SERIALIZER.encode({"key": {}})), "invalid record frame"),
         (streamer.encode_record(_record(9, 1)), "outside its segment"),
         (
-            streamer.encode_record(_with_tag(_record(0, 1), Tag.staging(Tag(kind=TagKind.LIVE), "x"))),
+            streamer.encode_record(
+                _with_tag(_record(0, 1), Tag.staging(Tag(kind=TagKind.LIVE), "x"))
+            ),
             "received a STAGING record",
         ),
     ]
 
     for raw, message in cases:
         with pytest.raises(ProcessError, match=message):
-            await TransferReceiver(streamer).receive(TransferChunk(range=RANGE, raw=raw, last=True))
+            await TransferReceiver(streamer).receive(
+                TransferChunk(range=RANGE, raw=raw, last=True)
+            )
 
 
 @pytest.mark.tourillon
@@ -470,7 +530,11 @@ def _largest_record() -> Record:
         key=Key(
             pid=Pid(3),
             address=Address(namespace=b"n" * MAX_NAMESPACE_LEN, key=b"k" * MAX_KEY_LEN),
-            ts=HLCTimestamp(wall_ms=2**63 - 1, counter=2**16 - 1, node_id="x" * MAX_NODE_ID_LEN_BYTES),
+            ts=HLCTimestamp(
+                wall_ms=2**63 - 1,
+                counter=2**16 - 1,
+                node_id="x" * MAX_NODE_ID_LEN_BYTES,
+            ),
         ),
         value=Value(data=b"v" * MAX_VALUE_DATA_LEN, quorum_write=MAX_QUORUM_WRITE),
         tag=Tag.hint(Tag(kind=TagKind.TOMBSTONE), "h" * MAX_NODE_ID_LEN_BYTES),
@@ -479,7 +543,9 @@ def _largest_record() -> Record:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_the_largest_record_fits_in_a_frame_and_the_largest_chunks_in_an_envelope() -> None:
+async def test_the_largest_record_fits_in_a_frame_and_the_largest_chunks_in_an_envelope() -> (
+    None
+):
     source, dest = _Storage(), _Storage()
     record = _largest_record()
     source.seed(record)
@@ -488,8 +554,12 @@ async def test_the_largest_record_fits_in_a_frame_and_the_largest_chunks_in_an_e
 
     receiver = TransferReceiver(_streamer(dest, max_chunk_size=MAX_CHUNK_SIZE))
     async for chunk in streamer.stream():
-        envelope = _env("transfer.chunk", chunk.to_dict())  # refused above the envelope limit
-        await receiver.receive(TransferChunk.from_dict(SERIALIZER.decode(envelope.payload)))
+        envelope = _env(
+            "transfer.chunk", chunk.to_dict()
+        )  # refused above the envelope limit
+        await receiver.receive(
+            TransferChunk.from_dict(SERIALIZER.decode(envelope.payload))
+        )
 
     assert receiver.complete
     assert dest.tag(record) == Tag.staging(record.tag, "src")
@@ -505,7 +575,12 @@ async def test_service_claim_checks_the_ring_serial_and_caps_the_window() -> Non
     service = _service(source, max_window=1)
 
     with pytest.raises(TransferError, match="Serial mismatch"):
-        [chunk async for chunk in service.claim(TransferClaim(serial="other", resumes={}, range=RANGE))]
+        [
+            chunk
+            async for chunk in service.claim(
+                TransferClaim(serial="other", resumes={}, range=RANGE)
+            )
+        ]
 
     for window in (None, 0, 10**9):
         claim = TransferClaim(serial="serial", resumes={}, range=RANGE, window=window)
@@ -539,8 +614,12 @@ async def test_service_receives_a_pushed_range_in_a_session() -> None:
     for chunk in chunks:
         await service.chunk(chunk)
 
-    assert await service.commit(TransferCommit(range=RANGE, session=accept.session)) == len(records)
-    assert [dest.tag(record) for record in records] == [record.tag for record in records]
+    assert await service.commit(
+        TransferCommit(range=RANGE, session=accept.session)
+    ) == len(records)
+    assert [dest.tag(record) for record in records] == [
+        record.tag for record in records
+    ]
     with pytest.raises(TransferError, match="unknown transfer session"):
         await service.commit(TransferCommit(range=RANGE, session=accept.session))
 
@@ -563,7 +642,9 @@ async def test_service_replaces_and_evicts_push_sessions() -> None:
     await service.init(TransferInit(serial="serial", range=other))
 
     with pytest.raises(TransferError, match="unknown transfer session"):
-        await service.chunk(TransferChunk(range=RANGE, raw=b"", seq=1, session=second.session))
+        await service.chunk(
+            TransferChunk(range=RANGE, raw=b"", seq=1, session=second.session)
+        )
 
 
 @pytest.mark.tourillon
@@ -590,12 +671,18 @@ async def test_pull_claims_windows_until_the_range_is_exhausted_then_activates_i
 
     assert handle.state is TransferState.COMPLETED
     assert handle.attempts == 1
-    assert handle.transferred == sum(len(chunk.raw) for served in client.served for chunk in served)
-    assert [dest.tag(record) for record in records] == [record.tag for record in records]
+    assert handle.transferred == sum(
+        len(chunk.raw) for served in client.served for chunk in served
+    )
+    assert [dest.tag(record) for record in records] == [
+        record.tag for record in records
+    ]
     assert len(client.claims) > 2
     assert client.claims[0].after is None
     assert all(claim.after is not None for claim in client.claims[1:])
-    assert all(claim.serial == "serial" and claim.window == 150 for claim in client.claims)
+    assert all(
+        claim.serial == "serial" and claim.window == 150 for claim in client.claims
+    )
     assert pool.acquired == ["src"] and pool.released == ["src"]
 
 
@@ -619,8 +706,12 @@ async def test_pull_resumes_from_staged_keys_after_a_reset_without_resending(
     assert client.claims[1].resumes  # the second attempt resumed from staged keys
     streamer = _streamer(source)
     first_attempt = _decode(streamer, client.served[0])
-    assert first_attempt and first_attempt + _decode(streamer, client.served[1]) == records
-    assert [dest.tag(record) for record in records] == [record.tag for record in records]
+    assert (
+        first_attempt and first_attempt + _decode(streamer, client.served[1]) == records
+    )
+    assert [dest.tag(record) for record in records] == [
+        record.tag for record in records
+    ]
 
 
 @pytest.mark.tourillon
@@ -639,20 +730,33 @@ async def test_pull_retries_rejected_claims_until_the_serial_converges(
     assert handle.state is TransferState.COMPLETED
     assert handle.attempts == 3
     assert "Serial mismatch" in (handle.last_error or "")
-    assert [dest.tag(record) for record in records] == [record.tag for record in records]
+    assert [dest.tag(record) for record in records] == [
+        record.tag for record in records
+    ]
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
 async def test_pull_fails_at_once_on_fatal_rejections_and_protocol_violations() -> None:
-    fatal = _env("transfer.claim.reject", TransferReject(reason="broken", fatal=True).to_dict())
+    fatal = _env(
+        "transfer.claim.reject", TransferReject(reason="broken", fatal=True).to_dict()
+    )
     unexpected = _env("transfer.other", {})
-    empty_more = _env("transfer.chunk", TransferChunk(range=RANGE, raw=b"", last=True, more=True).to_dict())
-    cases = [([fatal], "broken"), ([unexpected], "unexpected response kind"), ([empty_more], "without sending")]
+    empty_more = _env(
+        "transfer.chunk",
+        TransferChunk(range=RANGE, raw=b"", last=True, more=True).to_dict(),
+    )
+    cases = [
+        ([fatal], "broken"),
+        ([unexpected], "unexpected response kind"),
+        ([empty_more], "without sending"),
+    ]
 
     for stream, message in cases:
         client = _ScriptedClient(streams=[stream])
-        handle = await _run(_applicator("dst", _FakePeerPool({"src": client}), _Storage()))
+        handle = await _run(
+            _applicator("dst", _FakePeerPool({"src": client}), _Storage())
+        )
         assert handle.state is TransferState.FAILED
         assert handle.attempts == 1
         assert message in (handle.last_error or "")
@@ -664,7 +768,9 @@ async def test_pull_retries_streams_closed_before_their_last_chunk() -> None:
     first_chunk = _env("transfer.chunk", TransferChunk(range=RANGE, raw=b"").to_dict())
     client = _ScriptedClient(streams=[[first_chunk], []])
 
-    handle = await _run(_applicator("dst", _FakePeerPool({"src": client}), _Storage(), max_retries=1))
+    handle = await _run(
+        _applicator("dst", _FakePeerPool({"src": client}), _Storage(), max_retries=1)
+    )
 
     assert handle.state is TransferState.FAILED
     assert handle.attempts == 2
@@ -673,12 +779,20 @@ async def test_pull_retries_streams_closed_before_their_last_chunk() -> None:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_push_sends_acknowledged_chunks_then_commits(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_push_sends_acknowledged_chunks_then_commits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source, dest = _Storage(), _Storage()
     records = _dataset()
     source.seed(*records)
     client = _LoopbackClient(_service(dest), monkeypatch)
-    app = _applicator("src", _FakePeerPool({"dst": client}), source, max_chunk_size=1024, commit_timeout=99.0)
+    app = _applicator(
+        "src",
+        _FakePeerPool({"dst": client}),
+        source,
+        max_chunk_size=1024,
+        commit_timeout=99.0,
+    )
 
     handle = await _run(app)
 
@@ -688,43 +802,65 @@ async def test_push_sends_acknowledged_chunks_then_commits(monkeypatch: pytest.M
     assert set(kinds[1:-1]) == {"transfer.chunk"}
     assert client.requests[-1] == ("transfer.commit", 99.0)
     assert handle.transferred > 0
-    assert [dest.tag(record) for record in records] == [record.tag for record in records]
+    assert [dest.tag(record) for record in records] == [
+        record.tag for record in records
+    ]
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_push_reopens_a_lost_session_and_resumes(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_push_reopens_a_lost_session_and_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source, dest = _Storage(), _Storage()
     records = [_record(pid, idx) for pid in range(4) for idx in range(1, 30)]
     source.seed(*records)
     client = _LoopbackClient(_service(dest), monkeypatch)
     client.fail_requests = {("transfer.chunk", 3)}
-    app = _applicator("src", _FakePeerPool({"dst": client}), source, max_chunk_size=1024)
-    full_stream = len([chunk async for chunk in _streamer(source, max_chunk_size=1024).stream()])
+    app = _applicator(
+        "src", _FakePeerPool({"dst": client}), source, max_chunk_size=1024
+    )
+    full_stream = len(
+        [chunk async for chunk in _streamer(source, max_chunk_size=1024).stream()]
+    )
     assert full_stream > 3
 
     handle = await _run(app)
 
     kinds = [kind for kind, _ in client.requests]
-    second_attempt = kinds[kinds.index("transfer.init", 1):]
+    second_attempt = kinds[kinds.index("transfer.init", 1) :]
     assert handle.state is TransferState.COMPLETED
     assert handle.attempts == 2
     assert handle.last_error == "connection reset by peer"
-    assert kinds[:4] == ["transfer.init", "transfer.chunk", "transfer.chunk", "transfer.chunk"]
+    assert kinds[:4] == [
+        "transfer.init",
+        "transfer.chunk",
+        "transfer.chunk",
+        "transfer.chunk",
+    ]
     assert second_attempt.count("transfer.chunk") < full_stream
-    assert [dest.tag(record) for record in records] == [record.tag for record in records]
+    assert [dest.tag(record) for record in records] == [
+        record.tag for record in records
+    ]
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
 async def test_push_maps_rejections_to_retries_or_failures() -> None:
     retryable = _env("transfer.init.reject", TransferReject(reason="serial").to_dict())
-    accept = _env("transfer.init.accept", TransferInitAccept(resumes={}, session="s").to_dict())
+    accept = _env(
+        "transfer.init.accept", TransferInitAccept(resumes={}, session="s").to_dict()
+    )
     chunk_accept = _env("transfer.chunk.accept", {"seq": 0})
-    fatal_commit = _env("transfer.commit.reject", TransferReject(reason="corrupted", fatal=True).to_dict())
+    fatal_commit = _env(
+        "transfer.commit.reject",
+        TransferReject(reason="corrupted", fatal=True).to_dict(),
+    )
     client = _ScriptedClient(requests=[retryable, accept, chunk_accept, fatal_commit])
 
-    handle = await _run(_applicator("src", _FakePeerPool({"dst": client}), _Storage(), max_retries=3))
+    handle = await _run(
+        _applicator("src", _FakePeerPool({"dst": client}), _Storage(), max_retries=3)
+    )
 
     assert handle.state is TransferState.FAILED
     assert handle.attempts == 2
@@ -739,7 +875,9 @@ async def test_push_maps_rejections_to_retries_or_failures() -> None:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_retry_budget_only_counts_attempts_without_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_retry_budget_only_counts_attempts_without_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     app = _applicator("dst", _FakePeerPool({}), _Storage(), max_retries=2)
     progress = [0, 0, 100, 0, 0, 0]
 
@@ -757,7 +895,9 @@ async def test_retry_budget_only_counts_attempts_without_progress(monkeypatch: p
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_unbounded_retries_outlast_long_outages(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_unbounded_retries_outlast_long_outages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     assert _default_backoff().max_retries == 0
     app = _applicator("dst", _FakePeerPool({}), _Storage(), max_retries=0)
     outcomes: list[BaseException | None] = [ConnectionRefusedError()] * 25 + [None]
@@ -780,8 +920,13 @@ async def test_unbounded_retries_outlast_long_outages(monkeypatch: pytest.Monkey
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_process_and_unexpected_errors_fail_the_range_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    for error, message in [(ProcessError("inconsistent"), "inconsistent"), (KeyError("bug"), "'bug'")]:
+async def test_process_and_unexpected_errors_fail_the_range_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for error, message in [
+        (ProcessError("inconsistent"), "inconsistent"),
+        (KeyError("bug"), "'bug'"),
+    ]:
         app = _applicator("dst", _FakePeerPool({}), _Storage())
 
         async def do_transfer(handle: TransferHandle, error: Exception = error) -> None:
@@ -804,7 +949,9 @@ async def test_ranges_not_involving_this_node_fail() -> None:
 
     await app.apply(TransferPlan(ranges=[foreign, loop], serial="serial"))
     assert await app.wait() == ([], sorted([foreign.id, loop.id]))
-    assert "neither source nor destination" in (app.handles[foreign.id].last_error or "")
+    assert "neither source nor destination" in (
+        app.handles[foreign.id].last_error or ""
+    )
     assert "same source and destination" in (app.handles[loop.id].last_error or "")
 
 
@@ -814,7 +961,9 @@ async def test_apply_restarts_failed_ranges_cancels_dropped_ones_and_keeps_the_o
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = _applicator("dst", _FakePeerPool({}), _Storage())
-    r1, r2, r3 = (RangeTransfer(segment=(pid, pid), src="src", dst="dst") for pid in range(3))
+    r1, r2, r3 = (
+        RangeTransfer(segment=(pid, pid), src="src", dst="dst") for pid in range(3)
+    )
     release = asyncio.Event()
     r2_outcomes: list[Exception | None] = [ProcessError("bad"), None]
 
@@ -833,9 +982,11 @@ async def test_apply_restarts_failed_ranges_cancels_dropped_ones_and_keeps_the_o
     await app.apply(TransferPlan(ranges=[r1, r2, r3], serial="s2"))
     assert app.handles[r1.id] is running
     assert app.handles[r2.id] is not failed
-    await _until(lambda: all(
-        app.handles[r.id].state is TransferState.COMPLETED for r in (r2, r3)
-    ))
+    await _until(
+        lambda: all(
+            app.handles[r.id].state is TransferState.COMPLETED for r in (r2, r3)
+        )
+    )
 
     await app.apply(TransferPlan(ranges=[r2, r3], serial="s3"))
     assert r1.id not in app.handles
@@ -849,7 +1000,9 @@ async def test_wait_also_awaits_ranges_of_plans_applied_while_waiting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = _applicator("dst", _FakePeerPool({}), _Storage())
-    r1, r2 = (RangeTransfer(segment=(pid, pid), src="src", dst="dst") for pid in range(2))
+    r1, r2 = (
+        RangeTransfer(segment=(pid, pid), src="src", dst="dst") for pid in range(2)
+    )
     gates = {r1.id: asyncio.Event(), r2.id: asyncio.Event()}
 
     async def do_transfer(handle: TransferHandle) -> None:
@@ -883,7 +1036,9 @@ async def test_cancel_stops_running_transfers_which_count_as_not_completed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = _applicator("dst", _FakePeerPool({}), _Storage(), max_concurrency=1)
-    r1, r2 = (RangeTransfer(segment=(pid, pid), src="src", dst="dst") for pid in range(2))
+    r1, r2 = (
+        RangeTransfer(segment=(pid, pid), src="src", dst="dst") for pid in range(2)
+    )
 
     async def do_transfer(handle: TransferHandle) -> None:
         await asyncio.Event().wait()
@@ -925,9 +1080,13 @@ def test_resumes_after_keeps_only_the_pids_left_to_receive() -> None:
 @pytest.mark.tourillon
 def test_transfer_planner_plan_and_helpers() -> None:
     partitioner = Partitioner(pshift=4, gshift=1, hashspace=HashSpace(bits=8))
-    planner = TransferPlanner(node_id="node-b", partitioner=partitioner, replication_factor=1)
+    planner = TransferPlanner(
+        node_id="node-b", partitioner=partitioner, replication_factor=1
+    )
     current = Ring([VNode(token=0, node_id="node-a")])
-    target = Ring([VNode(token=0, node_id="node-a"), VNode(token=128, node_id="node-b")])
+    target = Ring(
+        [VNode(token=0, node_id="node-a"), VNode(token=128, node_id="node-b")]
+    )
 
     plan = planner.plan(current, target)
 
@@ -937,21 +1096,32 @@ def test_transfer_planner_plan_and_helpers() -> None:
 
     assert planner._pair_segments((1, 2), {"node-a"}, {"node-a"}) == []  # noqa: SLF001
     assert planner._pair_segments((1, 2), {"node-a"}, {"node-c"}) == []  # noqa: SLF001
-    assert planner._pair_segments((1, 2), {"node-a", "node-b"}, {"node-b", "node-c", "node-d"}) == [  # noqa: SLF001
+    assert planner._pair_segments(
+        (1, 2), {"node-a", "node-b"}, {"node-b", "node-c", "node-d"}
+    ) == [  # noqa: SLF001
         RangeTransfer(segment=(1, 2), src="node-a", dst="node-c"),
         RangeTransfer(segment=(1, 2), src="node-a", dst="node-d"),
     ]
-    planner_rf2 = TransferPlanner(node_id="node-b", partitioner=partitioner, replication_factor=2)
-    assert planner_rf2._replicaset(VNode(token=0, node_id="node-a"), Ring([  # noqa: SLF001
+    planner_rf2 = TransferPlanner(
+        node_id="node-b", partitioner=partitioner, replication_factor=2
+    )
+    assert planner_rf2._replicaset(
         VNode(token=0, node_id="node-a"),
-        VNode(token=1, node_id="node-a"),
-        VNode(token=2, node_id="node-b"),
-    ])) == frozenset({"node-a", "node-b"})
+        Ring(
+            [  # noqa: SLF001
+                VNode(token=0, node_id="node-a"),
+                VNode(token=1, node_id="node-a"),
+                VNode(token=2, node_id="node-b"),
+            ]
+        ),
+    ) == frozenset({"node-a", "node-b"})
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_runner_plans_runs_replans_and_cancels(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_runner_plans_runs_replans_and_cancels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runner = TransferRunner(
         node_id="node-b",
         replication_factor=1,
@@ -977,14 +1147,3 @@ async def test_runner_plans_runs_replans_and_cancels(monkeypatch: pytest.MonkeyP
     await runner.cancel()
 
     assert await runner.wait() == ([], ["0-3:node-a->node-b", "4-7:node-a->node-b"])
-
-
-
-
-
-
-
-
-
-
-

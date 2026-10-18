@@ -19,7 +19,6 @@ from tourlib.constant import MAX_NODE_ID_LEN_BYTES
 from tourlib.exceptions import ValidationError
 
 
-
 def validate_node_id_size(node_id: str) -> None:
     node_id_size = len(node_id.encode("utf-8"))
     if node_id_size > MAX_NODE_ID_LEN_BYTES:

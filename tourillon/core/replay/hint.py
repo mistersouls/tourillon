@@ -17,15 +17,15 @@ import contextlib
 import random
 import time
 from dataclasses import dataclass
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from typing import Any
 
 from tourillon.core.exceptions import StoreOperationError
 from tourillon.core.log import logger
 from tourillon.core.models.retry import BackoffRetry
-from tourillon.core.models.storageschema import Tag, Record
+from tourillon.core.models.storageschema import Record, Tag
 from tourillon.core.peer import PeerPool
-from tourillon.core.ports.storage import Storage, SessionProvider
+from tourillon.core.ports.storage import SessionProvider, Storage
 from tourillon.core.storage.group import PartitionGroupHint
 from tourlib import Serializer
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT
@@ -73,7 +73,9 @@ class _TargetBackoff:
         jitter = self._backoff.jitter
         pause = max(0.0, delay * (1 + random.uniform(-jitter, jitter)))
         self._until[target_node_id] = time.monotonic() + pause
-        self._delay[target_node_id] = min(delay * self._backoff.factor, self._backoff.max_delay)
+        self._delay[target_node_id] = min(
+            delay * self._backoff.factor, self._backoff.max_delay
+        )
 
 
 class HintReplayer:
@@ -99,16 +101,13 @@ class HintReplayer:
         self._task: asyncio.Task | None = None
         self._stats = HintReplayStats()
 
-
     async def start(self) -> None:
         """Start the hint replay process."""
         if self._task and not self._task.done():
             return
 
         self._stop.clear()
-        self._task = asyncio.create_task(
-            self._replay_loop(), name="hint-replay-loop"
-        )
+        self._task = asyncio.create_task(self._replay_loop(), name="hint-replay-loop")
 
     async def stop(self) -> None:
         """Stop the hint replay process."""
@@ -132,8 +131,12 @@ class HintReplayer:
             data = self._serializer.decode(response.payload)
             return data if isinstance(data, dict) else {}
         if response.kind == "replication.write.reject":
-            raise StoreOperationError.from_dict(self._serializer.decode(response.payload))
-        raise ProtocolError(f"unexpected response kind {response.kind!r}, expected {kind!r}")
+            raise StoreOperationError.from_dict(
+                self._serializer.decode(response.payload)
+            )
+        raise ProtocolError(
+            f"unexpected response kind {response.kind!r}, expected {kind!r}"
+        )
 
     async def _replay_loop(self) -> None:
         """Continuously poll for hints and replay them."""

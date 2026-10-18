@@ -80,7 +80,9 @@ def init_loggers(config: LoggingConfig) -> None:
         config_logger.setLevel(_resolve_level(logger_config.level))
         config_logger.disabled = not logger_config.enabled
 
-    enabled = [name for name, logger_config in config.loggers.items() if logger_config.enabled]
+    enabled = [
+        name for name, logger_config in config.loggers.items() if logger_config.enabled
+    ]
     logger.debug(
         "Loggers initialized (root_level=%s, enabled=%s)",
         config.level,

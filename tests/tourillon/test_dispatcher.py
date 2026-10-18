@@ -92,5 +92,3 @@ def test_dispatcher_rejects_duplicate_registration() -> None:
 
     with pytest.raises(ValueError, match="already registered"):
         dispatcher.register("kv.put", second)
-
-

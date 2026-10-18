@@ -129,7 +129,9 @@ class GossipDigest:
             raise ValidationError(f"digest[{index}] must be a table")
         return GossipNodeDigest(
             node_id=require_str(raw, "node_id"),
-            epoch=GossipPush.as_int(raw.get("epoch"), f"digest[{index}].epoch", min_value=0),
+            epoch=GossipPush.as_int(
+                raw.get("epoch"), f"digest[{index}].epoch", min_value=0
+            ),
         )
 
 

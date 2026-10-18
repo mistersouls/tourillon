@@ -61,18 +61,12 @@ class PartitionAddress:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a dictionary representation of the PartitionAddress."""
-        return {
-            "pid": self.pid.value,
-            "address": self.address.to_dict()
-        }
+        return {"pid": self.pid.value, "address": self.address.to_dict()}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PartitionAddress":
         """Create a PartitionAddress instance from a dictionary representation."""
-        return cls(
-            pid=Pid(data["pid"]),
-            address=Address.from_dict(data["address"])
-        )
+        return cls(pid=Pid(data["pid"]), address=Address.from_dict(data["address"]))
 
     def to_bytes(self) -> bytes:
         """Return a bytes representation of the PartitionAddress."""
@@ -94,18 +88,12 @@ class MetaKey:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a dictionary representation of the Key."""
-        return {
-            "pid": self.pid.value,
-            "address": self.address.to_dict()
-        }
+        return {"pid": self.pid.value, "address": self.address.to_dict()}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MetaKey":
         """Create a MetaKey instance from a dictionary representation."""
-        return cls(
-            pid=Pid(data["pid"]),
-            address=Address.from_dict(data["address"])
-        )
+        return cls(pid=Pid(data["pid"]), address=Address.from_dict(data["address"]))
 
     def to_bytes(self) -> bytes:
         return self.pid.to_bytes() + self.address.to_bytes()
@@ -134,7 +122,7 @@ class Key:
         return {
             "pid": self.pid.value,
             "address": self.address.to_dict(),
-            "ts": self.ts.to_dict()
+            "ts": self.ts.to_dict(),
         }
 
     @classmethod
@@ -143,7 +131,7 @@ class Key:
         return cls(
             pid=Pid(data["pid"]),
             address=Address.from_dict(data["address"]),
-            ts=HLCTimestamp.from_dict(data["ts"])
+            ts=HLCTimestamp.from_dict(data["ts"]),
         )
 
     def to_bytes(self, ks: Keyspace) -> bytes:
@@ -195,7 +183,7 @@ class Key:
         key = self.to_bytes(ks)
 
         for i in range(len(key) - 1, -1, -1):
-            if key[i] != 0xff:
+            if key[i] != 0xFF:
                 return key[:i] + bytes([key[i] + 1])
         return key + b"\x00"
 
@@ -210,7 +198,9 @@ class Value:
 
     def __post_init__(self) -> None:
         if len(self.data) > MAX_VALUE_DATA_LEN:
-            raise OverflowError(f"Value.data length {len(self.data)} exceeds {MAX_VALUE_DATA_LEN} bytes")
+            raise OverflowError(
+                f"Value.data length {len(self.data)} exceeds {MAX_VALUE_DATA_LEN} bytes"
+            )
 
     def to_bytes(self) -> bytes:
         """Return a bytes representation of the Value."""
@@ -235,19 +225,12 @@ class Value:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a dictionary representation of the Value."""
-        return {
-            "data": self.data,
-            "quorum_write": self.quorum_write
-        }
+        return {"data": self.data, "quorum_write": self.quorum_write}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Value":
         """Create a Value instance from a dictionary representation."""
-        return cls(
-            data=data["data"],
-            quorum_write=data["quorum_write"]
-        )
-
+        return cls(data=data["data"], quorum_write=data["quorum_write"])
 
 
 class TagKind(Enum):
@@ -282,10 +265,7 @@ class TagPayload:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a dictionary representation of the TagPayload."""
-        return {
-            "sub": self.sub.name if self.sub else None,
-            "payload": self.payload
-        }
+        return {"sub": self.sub.name if self.sub else None, "payload": self.payload}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TagPayload":
@@ -313,12 +293,14 @@ class TagPayload:
         Returns a tuple of `(source, original_payload_bytes)`.
         """
         if len(self.payload) < 2:
-            raise ValueError("Source-prefixed payload too short to contain source length")
+            raise ValueError(
+                "Source-prefixed payload too short to contain source length"
+            )
         len_src = int.from_bytes(self.payload[0:2], "big")
         if len(self.payload) < 2 + len_src:
             raise ValueError("Source-prefixed payload too short to contain full source")
-        src = self.payload[2:2 + len_src]
-        return src.decode("utf-8"), self.payload[2 + len_src:]
+        src = self.payload[2 : 2 + len_src]
+        return src.decode("utf-8"), self.payload[2 + len_src :]
 
 
 @dataclass(frozen=True, slots=True, eq=True)
@@ -377,7 +359,9 @@ class Tag:
             raise ValueError("Cannot unstaging a non-STAGING tag")
 
         if staged.payload.sub is None:
-            raise ValueError("Invalid STAGING tag: missing original kind in payload.sub")
+            raise ValueError(
+                "Invalid STAGING tag: missing original kind in payload.sub"
+            )
 
         staged_source, original_payload = staged.payload.extract_source_prefix()
         if source is not None and staged_source != source:
@@ -405,10 +389,7 @@ class Tag:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a dictionary representation of the Tag."""
-        return {
-            "kind": self.kind.name,
-            "payload": self.payload.to_dict()
-        }
+        return {"kind": self.kind.name, "payload": self.payload.to_dict()}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Tag":
@@ -429,10 +410,7 @@ class KeyTag:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a dictionary representation of the KeyTag."""
-        return {
-            "key": self.key.to_dict(),
-            "tag": self.tag.to_dict()
-        }
+        return {"key": self.key.to_dict(), "tag": self.tag.to_dict()}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "KeyTag":
@@ -453,10 +431,7 @@ class KeyValue:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a dictionary representation of the KeyValue."""
-        return {
-            "key": self.key.to_dict(),
-            "value": self.value.to_dict()
-        }
+        return {"key": self.key.to_dict(), "value": self.value.to_dict()}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "KeyValue":
@@ -488,7 +463,7 @@ class Record(KeyTag):
         return {
             "key": self.key.to_dict(),
             "value": self.value.to_dict(),
-            "tag": self.tag.to_dict()
+            "tag": self.tag.to_dict(),
         }
 
     @classmethod
@@ -506,9 +481,7 @@ class MetaStaging:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a dictionary representation of the MetaStaging."""
-        return {
-            "digest": self.digest
-        }
+        return {"digest": self.digest}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MetaStaging":
@@ -531,7 +504,9 @@ class MetaValue:
     def from_dict(cls, data: dict[str, Any]) -> "MetaValue":
         """Create a MetaValue instance from a dictionary representation."""
         staging_data = data.get("staging", {})
-        staging = {source: MetaStaging.from_dict(meta) for source, meta in staging_data.items()}
+        staging = {
+            source: MetaStaging.from_dict(meta) for source, meta in staging_data.items()
+        }
         return cls(staging=staging)
 
 

@@ -41,7 +41,9 @@ def _normalize_attributes(attributes: Attributes | None) -> _AttributesKey:
     return tuple(sorted(attributes.items()))
 
 
-def _materialize_attributes(attributes: Attributes | None) -> dict[str, AttributeValue] | None:
+def _materialize_attributes(
+    attributes: Attributes | None,
+) -> dict[str, AttributeValue] | None:
     normalized = _normalize_attributes(attributes)
     if not normalized:
         return None
@@ -141,7 +143,9 @@ class _Span(Span):
 
 
 class _SpanContext(AbstractContextManager[Span]):
-    def __init__(self, tracer: Tracer, name: str, attributes: Attributes | None) -> None:
+    def __init__(
+        self, tracer: Tracer, name: str, attributes: Attributes | None
+    ) -> None:
         self._span_cm = tracer.start_as_current_span(
             name,
             attributes=dict(attributes or {}),
@@ -331,7 +335,9 @@ class OpenTelemetryTelemetry(Telemetry):
         metric_name = f"{self._prefix}_{name}"
         metric = self._metrics.get(metric_name)
         if metric is None:
-            instrument = self._meter.create_counter(name=metric_name, description=description, unit="1")
+            instrument = self._meter.create_counter(
+                name=metric_name, description=description, unit="1"
+            )
             metric = _CounterMetric(instrument=instrument, _bound_by_attributes={})
             self._metrics[metric_name] = metric
         assert isinstance(metric, _CounterMetric)

@@ -52,7 +52,9 @@ async def _build_tourconf(
     return result.config_path
 
 
-def _build_server_ssl_from_ca(tmp_path: Path, ca_cert_path: Path, ca_key_path: Path) -> ssl.SSLContext:
+def _build_server_ssl_from_ca(
+    tmp_path: Path, ca_cert_path: Path, ca_key_path: Path
+) -> ssl.SSLContext:
     crypto = CryptographyMtlsAdapter()
     server_cert_pem, server_key_pem = crypto.generate_cert(
         common_name="tourillon-server",
@@ -119,7 +121,9 @@ async def test_init_client_uses_explicit_tourconf_path(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_init_client_uses_tourconf_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_init_client_uses_tourconf_env_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     tourconf = await _build_tourconf(tmp_path)
     monkeypatch.setenv("TOURCONF", str(tourconf))
 
@@ -139,7 +143,9 @@ def test_resolve_tourconf_path_raises_clear_error_when_missing(
 
 
 @pytest.mark.asyncio
-async def test_init_client_with_service_on_default_client_endpoint(tmp_path: Path) -> None:
+async def test_init_client_with_service_on_default_client_endpoint(
+    tmp_path: Path,
+) -> None:
     """Client initialization with service='probe' on default 'client' endpoint."""
     ca_cert_path, ca_key_path = generate_ca(tmp_path)
     server_ssl = _build_server_ssl_from_ca(tmp_path, ca_cert_path, ca_key_path)
@@ -305,6 +311,6 @@ async def test_tour_client_unknown_service_raises_error(tmp_path: Path) -> None:
         async with client(tourconf=tourconf) as tc:
             # Try to access unknown service
             with pytest.raises(AttributeError, match="has no service 'nonexistent'"):
-                tc.nonexistent
+                _ = tc.nonexistent
     finally:
         await server.stop()

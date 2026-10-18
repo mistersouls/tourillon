@@ -56,9 +56,8 @@ def test_ranges_for_two_vnodes_contains_empty_arc_and_wrap_multi_arc() -> None:
 
     assert any(partition_range.arc is None for partition_range in ranges)
     assert any(
-        _expand_arc(partition_range.arc, partitioner.total_partitions) == set(
-        range(partitioner.total_partitions)
-        )
+        _expand_arc(partition_range.arc, partitioner.total_partitions)
+        == set(range(partitioner.total_partitions))
         for partition_range in ranges
     )
 
@@ -90,7 +89,9 @@ def test_ranges_for_two_vnodes_contains_single_wrap_arc() -> None:
 
 
 @pytest.mark.tourillon
-def test_ranges_for_two_vnodes_can_produce_wrap_empty_arc_with_duplicate_tokens() -> None:
+def test_ranges_for_two_vnodes_can_produce_wrap_empty_arc_with_duplicate_tokens() -> (
+    None
+):
     partitioner = Partitioner(pshift=4, gshift=2, hashspace=HashSpace(bits=8))
     ring = Ring([VNode(10, "A"), VNode(10, "B")])
 
@@ -105,7 +106,9 @@ def test_ranges_for_two_vnodes_can_produce_wrap_empty_arc_with_duplicate_tokens(
 
 
 @pytest.mark.tourillon
-def test_ranges_for_n_vnodes_covers_empty_one_multi_wrap_multi_without_arc_duplicates() -> None:
+def test_ranges_for_n_vnodes_covers_empty_one_multi_wrap_multi_without_arc_duplicates() -> (
+    None
+):
     partitioner = Partitioner(pshift=4, gshift=2, hashspace=HashSpace(bits=8))
     ring = Ring(
         [
@@ -132,7 +135,11 @@ def test_ranges_for_n_vnodes_covers_empty_one_multi_wrap_multi_without_arc_dupli
         for partition_range, values in zip(ranges, expanded, strict=True)
     )
 
-    concrete_arcs = [partition_range.arc for partition_range in ranges if partition_range.arc is not None]
+    concrete_arcs = [
+        partition_range.arc
+        for partition_range in ranges
+        if partition_range.arc is not None
+    ]
     assert len(concrete_arcs) == len(set(concrete_arcs))
 
 
@@ -222,8 +229,3 @@ def test_partitioner_partition_for_returns_logical_partition() -> None:
 
     assert isinstance(partition, LogicalPartition)
     assert partition.pid == 0
-
-
-
-
-

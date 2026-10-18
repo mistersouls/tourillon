@@ -112,4 +112,3 @@ def test_hlc_clock_update_resets_counter_when_now_is_max(
 
     assert merged.wall_ms == 2000
     assert merged.counter == 0
-

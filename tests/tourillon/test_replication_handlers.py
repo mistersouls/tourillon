@@ -17,7 +17,15 @@ import pytest
 import tourillon.bootstrap.handlers.replication as replication_handler
 from tests.helpers import make_envelope
 from tourillon.core.exceptions import StoreOperationError
-from tourillon.core.models.storageschema import Key, PartitionAddress, Pid, Record, Tag, TagKind, Value
+from tourillon.core.models.storageschema import (
+    Key,
+    PartitionAddress,
+    Pid,
+    Record,
+    Tag,
+    TagKind,
+    Value,
+)
 from tourlib.adapter import MsgPackSerializer
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
@@ -71,7 +79,9 @@ def _replication_error(operation: str) -> StoreOperationError:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_replication_read_handler_decodes_and_returns_accept(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_replication_read_handler_decodes_and_returns_accept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _ManagerStub()
     monkeypatch.setattr(replication_handler, "get_manager", lambda: manager)
 
@@ -92,12 +102,16 @@ async def test_replication_read_handler_decodes_and_returns_accept(monkeypatch: 
     assert len(responses) == 1
     assert responses[0].kind == "replication.read.accept"
     assert manager.serializer.decode(responses[0].payload) is None
-    assert manager.store.read_requests[0].address == Address(namespace=b"ns", key=b"key")
+    assert manager.store.read_requests[0].address == Address(
+        namespace=b"ns", key=b"key"
+    )
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_replication_write_handler_decodes_and_returns_version(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_replication_write_handler_decodes_and_returns_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _ManagerStub()
     monkeypatch.setattr(replication_handler, "get_manager", lambda: manager)
 
@@ -112,13 +126,16 @@ async def test_replication_write_handler_decodes_and_returns_version(monkeypatch
 
     assert responses[0].kind == "replication.write.accept"
     assert payload["value"]["data"] == b"value"
-    assert manager.store.write_requests[0].key.address == Address(namespace=b"ns", key=b"key")
-
+    assert manager.store.write_requests[0].key.address == Address(
+        namespace=b"ns", key=b"key"
+    )
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_replication_write_handler_rejects_invalid_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_replication_write_handler_rejects_invalid_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _ManagerStub()
     monkeypatch.setattr(replication_handler, "get_manager", lambda: manager)
 
@@ -133,7 +150,9 @@ async def test_replication_write_handler_rejects_invalid_payload(monkeypatch: py
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_replication_read_handler_returns_reject_for_aggregate_error(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_replication_read_handler_returns_reject_for_aggregate_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _ManagerStub()
     manager.store.read_error = _replication_error("read")
     monkeypatch.setattr(replication_handler, "get_manager", lambda: manager)
@@ -160,7 +179,9 @@ async def test_replication_read_handler_returns_reject_for_aggregate_error(monke
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_replication_write_handler_returns_reject_for_aggregate_error(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_replication_write_handler_returns_reject_for_aggregate_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _ManagerStub()
     manager.store.write_error = _replication_error("write")
     monkeypatch.setattr(replication_handler, "get_manager", lambda: manager)
@@ -177,10 +198,6 @@ async def test_replication_write_handler_returns_reject_for_aggregate_error(monk
     assert responses[0].kind == "replication.write.reject"
     assert payload["operation"] == "write"
     assert payload["errors"][1]["message"] == "node-c unavailable"
-
-
-
-
 
 
 class _LookupSpy(_StoreSpy):

@@ -88,7 +88,9 @@ async def test_envelope_transport_surfaces_transport_error_payload(
         )
         await transport.connect()
 
-        with pytest.raises(ProtocolError, match="transport error: unknown kind: kv.get"):
+        with pytest.raises(
+            ProtocolError, match="transport error: unknown kind: kv.get"
+        ):
             await transport.request("kv.get", {})
     finally:
         if transport is not None:
@@ -131,7 +133,9 @@ async def test_envelope_transport_keeps_other_in_flight_request_alive_after_tran
                 transport.request("kv.get", {"namespace": "default", "key": "missing"})
             )
 
-            with pytest.raises(ProtocolError, match="transport error: unknown kind: kv.get"):
+            with pytest.raises(
+                ProtocolError, match="transport error: unknown kind: kv.get"
+            ):
                 await in_flight_error
 
             ok_response = await in_flight_ok

@@ -63,15 +63,17 @@ def _read_frames(raw: bytes) -> tuple[list[bytes], bytes]:
     offset = 0
 
     while offset + _LENGTH_BYTES <= len(raw):
-        size = int.from_bytes(raw[offset: offset + _LENGTH_BYTES], "big")
+        size = int.from_bytes(raw[offset : offset + _LENGTH_BYTES], "big")
         if size > MAX_FRAME_SIZE:
-            raise ProcessError(f"record frame of {size} bytes exceeds {MAX_FRAME_SIZE} bytes")
+            raise ProcessError(
+                f"record frame of {size} bytes exceeds {MAX_FRAME_SIZE} bytes"
+            )
 
         end = offset + _LENGTH_BYTES + size
         if end > len(raw):
             break
 
-        frames.append(raw[offset + _LENGTH_BYTES: end])
+        frames.append(raw[offset + _LENGTH_BYTES : end])
         offset = end
 
     return frames, raw[offset:]
@@ -143,7 +145,9 @@ class TransferStreamer:
         for group, group_records in self._by_group(records).items():
             staging = self._staging(await self._storage.session_provider_for(group))
             for start in range(0, len(group_records), STAGE_BATCH_SIZE):
-                staged += await staging.stage(group_records[start: start + STAGE_BATCH_SIZE])
+                staged += await staging.stage(
+                    group_records[start : start + STAGE_BATCH_SIZE]
+                )
         return staged
 
     async def commit(self) -> int:
@@ -163,7 +167,9 @@ class TransferStreamer:
         lo, hi = self._transfer.segment
         pid = record.key.pid.value
         if not lo <= pid <= hi:
-            raise ProcessError(f"range={self._transfer.id} received pid {pid} outside its segment")
+            raise ProcessError(
+                f"range={self._transfer.id} received pid {pid} outside its segment"
+            )
         if record.tag.kind not in TRANSFERABLE_KINDS:
             raise ProcessError(
                 f"range={self._transfer.id} received a {record.tag.kind.name} record"
@@ -238,7 +244,7 @@ class _ChunkWriter:
         full = len(data) - len(data) % self._max_chunk_size
         self._buffer = bytearray(data[full:])
         return [
-            self._chunk(data[offset: offset + self._max_chunk_size])
+            self._chunk(data[offset : offset + self._max_chunk_size])
             for offset in range(0, full, self._max_chunk_size)
         ]
 
@@ -248,7 +254,9 @@ class _ChunkWriter:
         self._buffer = bytearray()
         return self._chunk(raw, last=True, more=more)
 
-    def _chunk(self, raw: bytes, *, last: bool = False, more: bool = False) -> TransferChunk:
+    def _chunk(
+        self, raw: bytes, *, last: bool = False, more: bool = False
+    ) -> TransferChunk:
         chunk = TransferChunk(
             range=self._transfer,
             raw=raw,
@@ -314,9 +322,13 @@ class TransferReceiver:
     def _check(self, chunk: TransferChunk) -> None:
         transfer_id = self._streamer.transfer.id
         if chunk.range.id != transfer_id:
-            raise ProcessError(f"range={transfer_id} received a chunk of range {chunk.range.id}")
+            raise ProcessError(
+                f"range={transfer_id} received a chunk of range {chunk.range.id}"
+            )
         if self._complete:
-            raise TransferError(f"range={transfer_id} received chunk {chunk.seq} after the last one")
+            raise TransferError(
+                f"range={transfer_id} received chunk {chunk.seq} after the last one"
+            )
         if chunk.seq != self._next_seq:
             raise TransferError(
                 f"range={transfer_id} expected chunk {self._next_seq}, received {chunk.seq}"
@@ -330,4 +342,3 @@ class TransferReceiver:
             )
         self._complete = True
         self._more = more
-

@@ -72,6 +72,8 @@ def test_decode_token_rejects_a_truncated_handle() -> None:
 
 @pytest.mark.tourillon
 def test_repair_result_roundtrips_through_its_document() -> None:
-    result = RepairResult(issue=RepairIssue.ALREADY_DURABLE, replicas=3, token=encode_token(_key()))
+    result = RepairResult(
+        issue=RepairIssue.ALREADY_DURABLE, replicas=3, token=encode_token(_key())
+    )
 
     assert RepairResult.from_dict(result.to_dict()) == result

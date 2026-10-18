@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import asynccontextmanager
 import pickle
 import time
+from contextlib import asynccontextmanager
 from typing import cast
 
 import pytest
@@ -207,16 +207,32 @@ def _live_at(idx: int) -> Record:
         address=Address(namespace=b"ns", key=f"live{idx}".encode()),
         ts=HLCTimestamp(wall_ms=200 + idx, counter=idx, node_id="node-a"),
     )
-    return Record(key=key, value=Value(data=b"x", quorum_write=1), tag=Tag(kind=TagKind.LIVE))
+    return Record(
+        key=key, value=Value(data=b"x", quorum_write=1), tag=Tag(kind=TagKind.LIVE)
+    )
 
 
 def _seed(store: _FakeStore, record: Record) -> None:
-    store.put(KVPair(key=record.key.to_bytes(Keyspace.TAGS), value=record.tag.to_bytes(), keyspace=Keyspace.TAGS))
-    store.put(KVPair(key=record.key.to_bytes(Keyspace.LOGS), value=record.value.to_bytes(), keyspace=Keyspace.LOGS))
+    store.put(
+        KVPair(
+            key=record.key.to_bytes(Keyspace.TAGS),
+            value=record.tag.to_bytes(),
+            keyspace=Keyspace.TAGS,
+        )
+    )
+    store.put(
+        KVPair(
+            key=record.key.to_bytes(Keyspace.LOGS),
+            value=record.value.to_bytes(),
+            keyspace=Keyspace.LOGS,
+        )
+    )
 
 
 def _stored_tag(store: _FakeStore, record: Record) -> Tag:
-    kv = store.get(KVRef(key=record.key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS))
+    kv = store.get(
+        KVRef(key=record.key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS)
+    )
     assert kv is not None
     return Tag.from_bytes(kv.value)
 
@@ -241,7 +257,9 @@ async def test_replay_once_restores_original_tag_after_successful_write() -> Non
 
     assert client.requests[0].kind == "replication.write"
     original = Record(key=record.key, value=record.value, tag=Tag.unhint(record.tag))
-    assert serializer.decode(client.requests[0].payload) == {"record": original.to_dict()}
+    assert serializer.decode(client.requests[0].payload) == {
+        "record": original.to_dict()
+    }
     assert _stored_tag(store, record) == Tag(kind=TagKind.LIVE)
     assert replayer._stats.applied_total == 1
     assert replayer._stats.failed_total == 0
@@ -268,7 +286,9 @@ async def test_replay_once_batches_satisfied_hints_per_group() -> None:
     await replayer._replay_once()
 
     assert provider.write_sessions == 1
-    assert all(_stored_tag(store, record) == Tag(kind=TagKind.LIVE) for record in records)
+    assert all(
+        _stored_tag(store, record) == Tag(kind=TagKind.LIVE) for record in records
+    )
 
 
 @pytest.mark.tourillon
@@ -362,7 +382,9 @@ def test_target_backoff_defers_after_failure_and_resets_after_success() -> None:
 
 @pytest.mark.tourillon
 def test_target_backoff_grows_the_delay_while_the_target_stays_down() -> None:
-    backoff = _TargetBackoff(BackoffRetry(initial_delay=1.0, factor=2.0, max_delay=4.0, jitter=0.0))
+    backoff = _TargetBackoff(
+        BackoffRetry(initial_delay=1.0, factor=2.0, max_delay=4.0, jitter=0.0)
+    )
 
     delays = []
     for _ in range(4):

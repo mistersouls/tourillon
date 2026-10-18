@@ -15,11 +15,10 @@
 import asyncio
 import queue
 import threading
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator
-from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -34,8 +33,10 @@ class AsyncExecutor:
         if loop is None:
             try:
                 loop = asyncio.get_running_loop()
-            except RuntimeError:
-                raise RuntimeError("AsyncExecutor must be created in a running event loop")
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "AsyncExecutor must be created in a running event loop"
+                ) from exc
 
         self._loop = loop
         self._queue: queue.SimpleQueue[WorkItem | None] = queue.SimpleQueue()
@@ -142,7 +143,7 @@ class AsyncThreadPool:
         self.busy = set()
 
     @asynccontextmanager
-    async def executor(self) -> AsyncGenerator[AsyncExecutor, None]:
+    async def executor(self) -> AsyncGenerator[AsyncExecutor]:
         if self._closed:
             raise RuntimeError("Thread pool closed")
 
@@ -152,10 +153,7 @@ class AsyncThreadPool:
             self._sema.release()
             raise RuntimeError("Thread pool closed")
 
-        if self.free:
-            executor = self.free.pop()
-        else:
-            executor = AsyncExecutor()
+        executor = self.free.pop() if self.free else AsyncExecutor()
 
         self.busy.add(executor)
 

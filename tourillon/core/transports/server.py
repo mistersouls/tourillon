@@ -23,6 +23,7 @@ from tourlib.constant import MAX_IN_FLIGHT
 
 logger = _logger.transport()
 
+
 class EnvelopeServer:
     """Async envelope-aware TCP server.
 

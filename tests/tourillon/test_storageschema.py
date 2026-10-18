@@ -39,11 +39,17 @@ class _FakeTimestamp:
 
 @pytest.mark.tourillon
 def test_keyvalue_to_bytes_appends_value_after_key() -> None:
-    key = Key(pid=Pid(5), address=Address(key=b"k", namespace=b"ns"), ts=cast(Any, _FakeTimestamp()))
+    key = Key(
+        pid=Pid(5),
+        address=Address(key=b"k", namespace=b"ns"),
+        ts=cast(Any, _FakeTimestamp()),
+    )
     value = Value(data=b"payload", quorum_write=3)
     item = KeyValue(key=key, value=value)
 
-    assert item.to_bytes(Keyspace.LOGS) == key.to_bytes(Keyspace.LOGS) + value.to_bytes()
+    assert (
+        item.to_bytes(Keyspace.LOGS) == key.to_bytes(Keyspace.LOGS) + value.to_bytes()
+    )
 
 
 @pytest.mark.tourillon
@@ -138,5 +144,3 @@ def test_unhint_rejects_foreign_and_non_hint_tags() -> None:
         Tag.unhint(hinted, "node-c")
     with pytest.raises(ValueError, match="non-HINT"):
         Tag.unhint(Tag(kind=TagKind.LIVE))
-
-

@@ -44,7 +44,10 @@ def _service_with_response(response_kind: str, message: str) -> NodeService:
         payload=serializer.encode({"message": message}),
         schema_id=serializer.schema_id,
     )
-    return NodeService(transport=cast(Transport, cast(object, _TransportStub(response))), serializer=serializer)
+    return NodeService(
+        transport=cast(Transport, cast(object, _TransportStub(response))),
+        serializer=serializer,
+    )
 
 
 @asynccontextmanager
@@ -54,10 +57,14 @@ async def _service_ctx(service: object) -> AsyncIterator[object]:
 
 @pytest.mark.tourctl
 @pytest.mark.asyncio
-async def test_run_join_forwards_seeds_and_returns_response(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_run_join_forwards_seeds_and_returns_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     service = _service_with_response("node.join.accept", "ok")
 
-    monkeypatch.setattr("tourctl.core.nodejoin.client", lambda *args, **kwargs: _service_ctx(service))
+    monkeypatch.setattr(
+        "tourctl.core.nodejoin.client", lambda *args, **kwargs: _service_ctx(service)
+    )
 
     result = await _run_join(
         "127.0.0.1:7701",
@@ -74,7 +81,9 @@ async def test_run_join_forwards_seeds_and_returns_response(monkeypatch: pytest.
 
 @pytest.mark.tourctl
 @pytest.mark.asyncio
-async def test_join_raises_system_exit_when_join_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_join_raises_system_exit_when_join_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def fake_run_join(*args, **kwargs) -> JoinResponse:
         return JoinResponse(success=False, message="rejected")
 
@@ -86,8 +95,12 @@ async def test_join_raises_system_exit_when_join_is_rejected(monkeypatch: pytest
 
 @pytest.mark.tourctl
 @pytest.mark.asyncio
-async def test_run_join_raises_when_client_returns_wrong_service(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("tourctl.core.nodejoin.client", lambda *args, **kwargs: _service_ctx(object()))
+async def test_run_join_raises_when_client_returns_wrong_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "tourctl.core.nodejoin.client", lambda *args, **kwargs: _service_ctx(object())
+    )
 
     with pytest.raises(UnknownServiceError, match="Unknown service: node"):
         await _run_join("127.0.0.1:7701", seeds=None, tourconf=None, context_name=None)
@@ -95,7 +108,9 @@ async def test_run_join_raises_when_client_returns_wrong_service(monkeypatch: py
 
 @pytest.mark.tourctl
 @pytest.mark.asyncio
-async def test_join_returns_message_when_successful(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_join_returns_message_when_successful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def fake_run_join(*args, **kwargs) -> JoinResponse:
         return JoinResponse(success=True, message="joined")
 
@@ -108,7 +123,9 @@ async def test_join_returns_message_when_successful(monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.tourctl
 @pytest.mark.asyncio
-async def test_join_wraps_internal_exception_as_system_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_join_wraps_internal_exception_as_system_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def fake_run_join(*args, **kwargs) -> JoinResponse:
         raise RuntimeError("boom")
 
@@ -120,7 +137,9 @@ async def test_join_wraps_internal_exception_as_system_exit(monkeypatch: pytest.
 
 @pytest.mark.tourctl
 @pytest.mark.asyncio
-async def test_join_formats_missing_context_error(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_join_formats_missing_context_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def fake_run_join(*args, **kwargs) -> JoinResponse:
         raise KeyError("prod")
 
@@ -128,6 +147,3 @@ async def test_join_formats_missing_context_error(monkeypatch: pytest.MonkeyPatc
 
     with pytest.raises(SystemExit, match="Unknown client context 'prod'"):
         await join("127.0.0.1:7701", seeds=None, tourconf=None, context_name="prod")
-
-
-

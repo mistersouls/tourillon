@@ -13,10 +13,11 @@
 # limitations under the License.
 
 import asyncio
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Callable, Any, Mapping
+from typing import Any
 
-from tourillon.core.models.storageschema import KVRef, KVPair, Keyspace
+from tourillon.core.models.storageschema import Keyspace, KVPair, KVRef
 from tourillon.core.ports.storage import Batch
 from tourillon.infra.storage.lmdb_transaction import LmdbTransaction
 from tourlib.contrib.threadpool import AsyncExecutor
@@ -35,13 +36,15 @@ class LmdbBatch:
         self,
         txn: LmdbTransaction,
         executor: AsyncExecutor,
-        loop: asyncio.AbstractEventLoop | None = None
+        loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         if loop is None:
             try:
                 loop = asyncio.get_running_loop()
-            except RuntimeError:
-                raise RuntimeError("No running event loop found. Please provide an event loop.")
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "No running event loop found. Please provide an event loop."
+                ) from exc
 
         self._txn = txn
         self._executor = executor
@@ -126,12 +129,8 @@ class LmdbBatch:
                 result = item.fn(*item.args, **item.kwargs)
                 results.append(result)
         except Exception as exc:
-            self._loop.call_soon_threadsafe(
-                self._result_future.set_exception, exc
-            )
+            self._loop.call_soon_threadsafe(self._result_future.set_exception, exc)
         else:
-            self._loop.call_soon_threadsafe(
-                self._result_future.set_result, results
-        )
+            self._loop.call_soon_threadsafe(self._result_future.set_result, results)
 
         self._items.clear()

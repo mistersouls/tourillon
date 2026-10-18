@@ -40,7 +40,9 @@ class Member:
 
     @property
     def vnodes(self) -> list[VNode]:
-        return [VNode(token=int(token, 16), node_id=self.node_id) for token in self.tokens]
+        return [
+            VNode(token=int(token, 16), node_id=self.node_id) for token in self.tokens
+        ]
 
     def supersedes(self, other: "Member") -> bool:
         return self.epoch > other.epoch

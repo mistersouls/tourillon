@@ -70,7 +70,9 @@ class _PlacementStub:
         self._preferences = preferences
         self._placement = PartitionPlacement(
             group=0,
-            vnode=VNode(token=0, node_id=preferences[0].node_id if preferences else "node-a"),
+            vnode=VNode(
+                token=0, node_id=preferences[0].node_id if preferences else "node-a"
+            ),
             partition=LogicalPartition(pid=pid, start=0, end=1),
         )
 
@@ -106,15 +108,19 @@ class _SessionStub:
         self.store = store
         self._pairs: dict[tuple[Keyspace, bytes], KVPair] = {}
         if store.record is not None:
-            self._pairs[(Keyspace.LOGS, store.record.key.to_bytes(Keyspace.LOGS))] = KVPair(
-                key=store.record.key.to_bytes(Keyspace.LOGS),
-                value=store.record.value.to_bytes(),
-                keyspace=Keyspace.LOGS,
+            self._pairs[(Keyspace.LOGS, store.record.key.to_bytes(Keyspace.LOGS))] = (
+                KVPair(
+                    key=store.record.key.to_bytes(Keyspace.LOGS),
+                    value=store.record.value.to_bytes(),
+                    keyspace=Keyspace.LOGS,
+                )
             )
-            self._pairs[(Keyspace.TAGS, store.record.key.to_bytes(Keyspace.TAGS))] = KVPair(
-                key=store.record.key.to_bytes(Keyspace.TAGS),
-                value=store.record.tag.to_bytes(),
-                keyspace=Keyspace.TAGS,
+            self._pairs[(Keyspace.TAGS, store.record.key.to_bytes(Keyspace.TAGS))] = (
+                KVPair(
+                    key=store.record.key.to_bytes(Keyspace.TAGS),
+                    value=store.record.tag.to_bytes(),
+                    keyspace=Keyspace.TAGS,
+                )
             )
 
     async def get(self, ref: KVRef) -> KVPair | None:
@@ -129,7 +135,11 @@ class _SessionStub:
             self.store.record = Record(
                 key=key,
                 value=value,
-                tag=self.store.record.tag if self.store.record is not None else Tag(kind=TagKind.LIVE),
+                tag=(
+                    self.store.record.tag
+                    if self.store.record is not None
+                    else Tag(kind=TagKind.LIVE)
+                ),
             )
         if kv.keyspace == Keyspace.TAGS and self.store.record is not None:
             self.store.record = Record(
@@ -238,7 +248,10 @@ class _PeerClientStub:
     ) -> None:
         self._serializer = serializer
         self._responses = responses
-        self._delays = {kind: (value.copy() if isinstance(value, list) else value) for kind, value in (delays or {}).items()}
+        self._delays = {
+            kind: (value.copy() if isinstance(value, list) else value)
+            for kind, value in (delays or {}).items()
+        }
         self.requests: list[Envelope] = []
 
     async def request(self, envelope: Envelope) -> Envelope:
@@ -296,7 +309,10 @@ def _version(addr: Address, data: bytes = b"value", wall_ms: int = 3) -> Version
     return Version(
         address=addr,
         data=data,
-        meta=Meta(ts=HLCTimestamp(wall_ms=wall_ms, counter=0, node_id="node-a"), quorum_write=1),
+        meta=Meta(
+            ts=HLCTimestamp(wall_ms=wall_ms, counter=0, node_id="node-a"),
+            quorum_write=1,
+        ),
     )
 
 
@@ -309,7 +325,11 @@ def _record(
 ) -> Record:
     tag = Tag(kind=TagKind.TOMBSTONE if tombstone else TagKind.LIVE)
     return Record(
-        key=Key(pid=Pid(pid), address=addr, ts=HLCTimestamp(wall_ms=wall_ms, counter=0, node_id="node-a")),
+        key=Key(
+            pid=Pid(pid),
+            address=addr,
+            ts=HLCTimestamp(wall_ms=wall_ms, counter=0, node_id="node-a"),
+        ),
         value=Value(data=data, quorum_write=1),
         tag=tag,
     )
@@ -327,7 +347,11 @@ def _hint_record(
 ) -> Record:
     original = Tag(kind=original_kind)
     return Record(
-        key=Key(pid=Pid(pid), address=addr, ts=HLCTimestamp(wall_ms=wall_ms, counter=0, node_id="node-a")),
+        key=Key(
+            pid=Pid(pid),
+            address=addr,
+            ts=HLCTimestamp(wall_ms=wall_ms, counter=0, node_id="node-a"),
+        ),
         value=Value(data=data, quorum_write=1),
         tag=Tag.hint(original, target_node_id),
     )
@@ -344,7 +368,9 @@ def _build_store(
     response_delay: float = 0.05,
     partitioner_pid: int = 7,
     read_repair: ReadRepairConfig | None = None,
-) -> tuple[StoreService, _StorageStub, _PeerPoolStub, MsgPackSerializer, _PeerClientStub]:
+) -> tuple[
+    StoreService, _StorageStub, _PeerPoolStub, MsgPackSerializer, _PeerClientStub
+]:
     serializer = MsgPackSerializer()
     client = _PeerClientStub(serializer, remote_responses, remote_delays)
     peer_pool = _PeerPoolStub(client, known_peers=set(members))
@@ -353,7 +379,9 @@ def _build_store(
         node_id=node_id,
         storage=cast(Storage, cast(object, storage)),
         partitioner=cast(Partitioner, cast(object, _PartitionerStub(partitioner_pid))),
-        placement_strategy=cast(PlacementStrategy, cast(object, _PlacementStub(preferences))),
+        placement_strategy=cast(
+            PlacementStrategy, cast(object, _PlacementStub(preferences))
+        ),
         clock=HLCClock(node_id),
         serializer=cast(Serializer, serializer),
         peer_pool=cast(PeerPool, cast(object, peer_pool)),
@@ -457,7 +485,10 @@ async def test_get_fans_out_to_all_available_preference_targets() -> None:
     assert storage.open_calls == []
     assert peer_pool.acquire_calls == ["node-b", "node-c"]
     assert peer_pool.release_calls == ["node-b", "node-c"]
-    assert [request.kind for request in client.requests] == ["replication.read", "replication.read"]
+    assert [request.kind for request in client.requests] == [
+        "replication.read",
+        "replication.read",
+    ]
     payload = serializer.decode(client.requests[1].payload)
     assert payload["addr"]["address"] == {"namespace": b"ns", "key": b"key"}
 
@@ -491,7 +522,10 @@ async def test_put_coordinates_and_uses_handoff_target() -> None:
     assert version.data == b"value"
     assert version.meta.quorum_write == 0
     assert storage.open_calls == [7]
-    assert [request.kind for request in client.requests] == ["replication.write", "replication.write"]
+    assert [request.kind for request in client.requests] == [
+        "replication.write",
+        "replication.write",
+    ]
     second_payload = serializer.decode(client.requests[1].payload)
     assert second_payload["record"]["tag"]["kind"] == "HINT"
     assert second_payload["record"]["tag"]["payload"]["sub"] == "LIVE"
@@ -524,7 +558,10 @@ async def test_put_replicates_to_handoff_and_readable_targets() -> None:
     assert version == _version(addr, data=b"hinted")
     assert storage.open_calls == []
     assert peer_pool.acquire_calls == ["node-z", "node-c"]
-    assert [request.kind for request in client.requests] == ["replication.write", "replication.write"]
+    assert [request.kind for request in client.requests] == [
+        "replication.write",
+        "replication.write",
+    ]
 
 
 @pytest.mark.tourillon
@@ -544,7 +581,9 @@ async def test_delete_returns_unique_versions() -> None:
             "node-d": _member("node-d", "127.0.0.1:9003"),
         },
         local_store=_StoreStub(tombstone),
-        remote_responses={"replication.write": [tombstone.to_dict(), tombstone.to_dict()]},
+        remote_responses={
+            "replication.write": [tombstone.to_dict(), tombstone.to_dict()]
+        },
     )
 
     version = await store.delete(DeleteRequest(namespace=b"ns", key=b"key"))
@@ -554,7 +593,10 @@ async def test_delete_returns_unique_versions() -> None:
     assert version.data == b""
     assert version.meta.quorum_write == 0
     assert storage.open_calls == [7]
-    assert [request.kind for request in client.requests] == ["replication.write", "replication.write"]
+    assert [request.kind for request in client.requests] == [
+        "replication.write",
+        "replication.write",
+    ]
     assert peer_pool.acquire_calls == ["node-b", "node-d"]
 
 
@@ -580,13 +622,18 @@ async def test_put_returns_after_quorum_without_waiting_for_slow_replicas() -> N
     )
 
     started = perf_counter()
-    version = await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"quorum", quorum_write=1))
+    version = await store.put(
+        PutRequest(namespace=b"ns", key=b"key", value=b"quorum", quorum_write=1)
+    )
     elapsed = perf_counter() - started
 
     assert version == _version(addr, data=b"quorum")
     assert elapsed < 0.1
     assert peer_pool.acquire_calls == ["node-b", "node-c"]
-    assert [request.kind for request in client.requests] == ["replication.write", "replication.write"]
+    assert [request.kind for request in client.requests] == [
+        "replication.write",
+        "replication.write",
+    ]
 
 
 @pytest.mark.tourillon
@@ -618,7 +665,9 @@ async def test_get_raises_when_no_replication_targets_available() -> None:
         remote_responses={"replication.read": None},
     )
 
-    with pytest.raises(NoReplicaAvailableError, match="preference list has no replication target") as exc_info:
+    with pytest.raises(
+        NoReplicaAvailableError, match="preference list has no replication target"
+    ) as exc_info:
         await store.get(GetRequest(namespace=b"ns", key=b"key"))
     assert exc_info.value.to_dict()["code"] == "no_replica_available"
     assert exc_info.value.to_dict()["operation"] == "read"
@@ -670,7 +719,9 @@ async def test_put_raises_when_remote_response_kind_is_invalid() -> None:
 
     serializer = MsgPackSerializer()
     client = _BadPeerClient(serializer)
-    peer_pool = _PeerPoolStub(cast(_PeerClientStub, cast(object, client)), known_peers={"node-b"})
+    peer_pool = _PeerPoolStub(
+        cast(_PeerClientStub, cast(object, client)), known_peers={"node-b"}
+    )
     storage = _StorageStub(_StoreStub())
     service = StoreService(
         node_id="node-a",
@@ -678,14 +729,21 @@ async def test_put_raises_when_remote_response_kind_is_invalid() -> None:
         partitioner=cast(Partitioner, cast(object, _PartitionerStub())),
         placement_strategy=cast(
             PlacementStrategy,
-            cast(object, _PlacementStub((Preference(node_id="node-b", readable=True, handoff=None),))),
+            cast(
+                object,
+                _PlacementStub(
+                    (Preference(node_id="node-b", readable=True, handoff=None),)
+                ),
+            ),
         ),
         clock=HLCClock("node-a"),
         serializer=cast(Serializer, serializer),
         peer_pool=cast(PeerPool, cast(object, peer_pool)),
     )
 
-    with pytest.raises(StoreOperationError, match="write replication failed") as exc_info:
+    with pytest.raises(
+        StoreOperationError, match="write replication failed"
+    ) as exc_info:
         await service.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
     assert exc_info.value.to_dict()["errors"][0]["message"] == (
         "invalid response kind for replication.write: replication.write.reject"
@@ -739,9 +797,13 @@ async def test_get_forward_raises_when_peer_is_unknown() -> None:
         remote_responses={"replication.read": None},
     )
 
-    with pytest.raises(StoreOperationError, match="read replication failed") as exc_info:
+    with pytest.raises(
+        StoreOperationError, match="read replication failed"
+    ) as exc_info:
         await store.get(GetRequest(namespace=b"ns", key=b"key"))
-    assert [error["message"] for error in exc_info.value.to_dict()["errors"]] == ["unknown peer: node-b"]
+    assert [error["message"] for error in exc_info.value.to_dict()["errors"]] == [
+        "unknown peer: node-b"
+    ]
 
 
 @pytest.mark.tourillon
@@ -784,7 +846,9 @@ async def test_put_raises_when_quorum_write_not_met() -> None:
     )
 
     with pytest.raises(StoreOperationError, match="write quorum not met") as exc_info:
-        await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value", quorum_write=2))
+        await store.put(
+            PutRequest(namespace=b"ns", key=b"key", value=b"value", quorum_write=2)
+        )
     payload = exc_info.value.to_dict()
     assert payload["operation"] == "write"
     assert payload["errors"][0]["message"] == "unknown peer: node-c"
@@ -870,7 +934,9 @@ async def test_put_raises_when_no_write_target_available() -> None:
         remote_responses={},
     )
 
-    with pytest.raises(NoReplicaAvailableError, match="preference list has no replication target") as exc_info:
+    with pytest.raises(
+        NoReplicaAvailableError, match="preference list has no replication target"
+    ) as exc_info:
         await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
     assert exc_info.value.to_dict()["operation"] == "write"
     assert client.requests == []
@@ -894,7 +960,9 @@ async def test_get_counts_empty_replica_toward_read_quorum() -> None:
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(),
-        remote_responses={"replication.read": _record(addr, data=b"v2", wall_ms=9).to_dict()},
+        remote_responses={
+            "replication.read": _record(addr, data=b"v2", wall_ms=9).to_dict()
+        },
     )
 
     version = await store.get(GetRequest(namespace=b"ns", key=b"key", quorum_read=2))
@@ -920,7 +988,9 @@ async def test_get_counts_disagreeing_replicas_toward_read_quorum() -> None:
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(_record(addr, data=b"v1", wall_ms=3)),
-        remote_responses={"replication.read": _record(addr, data=b"v2", wall_ms=9).to_dict()},
+        remote_responses={
+            "replication.read": _record(addr, data=b"v2", wall_ms=9).to_dict()
+        },
     )
 
     version = await store.get(GetRequest(namespace=b"ns", key=b"key", quorum_read=2))
@@ -950,12 +1020,17 @@ async def test_get_reports_unanswered_replica_as_timeout_error() -> None:
     with pytest.raises(QuorumNotMetError, match="read quorum not met") as exc_info:
         await store.get(GetRequest(namespace=b"ns", key=b"key", quorum_read=2))
     errors = exc_info.value.to_dict()["errors"]
-    assert errors == [{"type": "TimeoutError", "message": "no response from node-b within 0.05s"}]
+    assert errors == [
+        {"type": "TimeoutError", "message": "no response from node-b within 0.05s"}
+    ]
 
 
 class _HintRejectingStore(_StoreStub):
     def on_put(self, kv: KVPair) -> None:
-        if kv.keyspace == Keyspace.TAGS and Tag.from_bytes(kv.value).kind == TagKind.HINT:
+        if (
+            kv.keyspace == Keyspace.TAGS
+            and Tag.from_bytes(kv.value).kind == TagKind.HINT
+        ):
             raise RuntimeError("no space left on device")
         super().on_put(kv)
 
@@ -1037,7 +1112,9 @@ async def test_hint_write_failure_does_not_mask_the_replication_error() -> None:
     )
 
     with pytest.raises(QuorumNotMetError) as exc_info:
-        await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value", quorum_write=2))
+        await store.put(
+            PutRequest(namespace=b"ns", key=b"key", value=b"value", quorum_write=2)
+        )
 
     messages = [error["message"] for error in exc_info.value.to_dict()["errors"]]
     assert any("unknown peer: node-b" in message for message in messages)
@@ -1139,7 +1216,9 @@ async def test_delete_persists_the_requested_write_quorum() -> None:
         remote_responses={},
     )
 
-    version = await store.delete(DeleteRequest(namespace=b"ns", key=b"key", quorum_write=1))
+    version = await store.delete(
+        DeleteRequest(namespace=b"ns", key=b"key", quorum_write=1)
+    )
 
     assert version is not None
     assert version.meta.quorum_write == 1
@@ -1161,7 +1240,9 @@ async def test_put_refuses_a_quorum_the_store_cannot_record(quorum: int) -> None
     )
 
     with pytest.raises(InvalidQuorumError) as exc_info:
-        await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"v", quorum_write=quorum))
+        await store.put(
+            PutRequest(namespace=b"ns", key=b"key", value=b"v", quorum_write=quorum)
+        )
 
     assert exc_info.value.to_dict()["code"] == "invalid_quorum"
     assert exc_info.value.to_dict()["quorum"] == quorum
@@ -1195,7 +1276,9 @@ async def test_get_refuses_a_quorum_the_store_cannot_record() -> None:
     )
 
     with pytest.raises(InvalidQuorumError):
-        await store.get(GetRequest(namespace=b"ns", key=b"key", quorum_read=MAX_QUORUM + 1))
+        await store.get(
+            GetRequest(namespace=b"ns", key=b"key", quorum_read=MAX_QUORUM + 1)
+        )
 
 
 @pytest.mark.tourillon
@@ -1520,7 +1603,9 @@ async def test_repair_reports_already_durable_without_writing_anything() -> None
         remote_responses={"replication.lookup": record.to_dict()},
     )
 
-    result = await store.repair(RepairRequest(token=_repair_token(record), quorum_write=2))
+    result = await store.repair(
+        RepairRequest(token=_repair_token(record), quorum_write=2)
+    )
 
     assert result.issue is RepairIssue.ALREADY_DURABLE
     assert result.replicas == 2
@@ -1592,7 +1677,9 @@ async def test_repair_rejects_a_token_that_is_not_a_version_key() -> None:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_repair_rejects_a_token_whose_partition_id_contradicts_its_address() -> None:
+async def test_repair_rejects_a_token_whose_partition_id_contradicts_its_address() -> (
+    None
+):
     addr = Address(namespace=b"ns", key=b"key")
     foreign = _record(addr, pid=9, data=b"v1", wall_ms=9)
     store, _, _, _, client = _build_store(
@@ -1615,7 +1702,9 @@ async def test_repair_rejects_a_token_whose_partition_id_contradicts_its_address
 @pytest.mark.asyncio
 async def test_repair_rejects_a_timestamp_no_clock_here_could_have_emitted() -> None:
     addr = Address(namespace=b"ns", key=b"key")
-    future = _record(addr, data=b"v1", wall_ms=int(time.time() * 1000) + MAX_CLOCK_SKEW_MS * 10)
+    future = _record(
+        addr, data=b"v1", wall_ms=int(time.time() * 1000) + MAX_CLOCK_SKEW_MS * 10
+    )
     store, _, _, _, client = _build_store(
         node_id="node-a",
         preferences=_two_owners(),
@@ -1702,7 +1791,9 @@ async def test_put_quorum_failure_hands_back_a_resumable_token() -> None:
     )
 
     with pytest.raises(QuorumNotMetError) as excinfo:
-        await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"v1", quorum_write=2))
+        await store.put(
+            PutRequest(namespace=b"ns", key=b"key", value=b"v1", quorum_write=2)
+        )
 
     token = excinfo.value.token
     assert token is not None

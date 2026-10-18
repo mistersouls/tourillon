@@ -62,7 +62,9 @@ class EnvelopeSession:
         try:
             while True:
                 try:
-                    envelope = await read_envelope(self._reader, max_payload=self._max_payload)
+                    envelope = await read_envelope(
+                        self._reader, max_payload=self._max_payload
+                    )
                 except EOFError:
                     logger.debug("Session closed by peer %s", peer)
                     break
@@ -71,7 +73,9 @@ class EnvelopeSession:
                     break
                 except ProtocolError as exc:
                     logger.warning("Protocol error from %s: %s", peer, exc)
-                    self._telemetry.protocol_errors_total.labels(endpoint=self._endpoint).inc()
+                    self._telemetry.protocol_errors_total.labels(
+                        endpoint=self._endpoint
+                    ).inc()
                     break
 
                 await semaphore.acquire()
@@ -81,7 +85,9 @@ class EnvelopeSession:
                 task.add_done_callback(tasks.discard)
         finally:
             if tasks:
-                logger.debug("Waiting for %s in-flight task(s) from %s", len(tasks), peer)
+                logger.debug(
+                    "Waiting for %s in-flight task(s) from %s", len(tasks), peer
+                )
                 await asyncio.gather(*tasks, return_exceptions=True)
 
             if not self._writer.is_closing():
@@ -111,7 +117,9 @@ class EnvelopeSession:
                 )
                 handler = self._dispatcher.lookup(envelope.kind)
                 if handler is None:
-                    self._telemetry.unknown_kind_total.labels(endpoint=self._endpoint).inc()
+                    self._telemetry.unknown_kind_total.labels(
+                        endpoint=self._endpoint
+                    ).inc()
                     logger.warning("No handler registered for kind '%s'", envelope.kind)
                     await self._send_unknown_kind_error(envelope)
                     return
@@ -168,7 +176,9 @@ class EnvelopeSession:
         await self._write_envelope(error)
 
     async def _send_internal_error(self, envelope: Envelope, message: str) -> None:
-        logger.warning("Sending internal error for kind '%s': %s", envelope.kind, message)
+        logger.warning(
+            "Sending internal error for kind '%s': %s", envelope.kind, message
+        )
         payload = f"internal error: {message}".encode()
         error = Envelope(
             proto_version=envelope.proto_version,
@@ -191,4 +201,6 @@ class EnvelopeSession:
 
     def _update_in_flight(self, delta: int) -> None:
         self._in_flight += delta
-        self._telemetry.in_flight_current.labels(endpoint=self._endpoint).set(self._in_flight)
+        self._telemetry.in_flight_current.labels(endpoint=self._endpoint).set(
+            self._in_flight
+        )

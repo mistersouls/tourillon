@@ -61,7 +61,9 @@ def _replication_error(operation: str) -> StoreOperationError:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_kv_put_handler_returns_reject_for_aggregate_error(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_kv_put_handler_returns_reject_for_aggregate_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _ManagerStub()
     manager.store.put_error = _replication_error("write")
     monkeypatch.setattr(kv_handler, "get_manager", lambda: manager)
@@ -88,7 +90,9 @@ async def test_kv_put_handler_returns_reject_for_aggregate_error(monkeypatch: py
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_kv_get_handler_returns_reject_for_aggregate_error(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_kv_get_handler_returns_reject_for_aggregate_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _ManagerStub()
     manager.store.get_error = _replication_error("read")
     monkeypatch.setattr(kv_handler, "get_manager", lambda: manager)
@@ -114,7 +118,9 @@ async def test_kv_get_handler_returns_reject_for_aggregate_error(monkeypatch: py
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_kv_delete_handler_returns_reject_for_aggregate_error(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_kv_delete_handler_returns_reject_for_aggregate_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _ManagerStub()
     manager.store.delete_error = _replication_error("write")
     monkeypatch.setattr(kv_handler, "get_manager", lambda: manager)
@@ -138,7 +144,6 @@ async def test_kv_delete_handler_returns_reject_for_aggregate_error(monkeypatch:
     assert len(payload["errors"]) == 2
 
 
-
 class _RepairSpy:
     def __init__(self, result: RepairResult | None = None) -> None:
         self.result = result
@@ -155,7 +160,9 @@ class _RepairSpy:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_kv_repair_handler_returns_the_repair_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_kv_repair_handler_returns_the_repair_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _ManagerStub()
     spy = _RepairSpy(RepairResult(issue=RepairIssue.REPAIRED, replicas=3, token="tok"))
     manager.store = spy

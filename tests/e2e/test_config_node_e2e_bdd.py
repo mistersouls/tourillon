@@ -225,7 +225,9 @@ def then_generated_node_config_uses_requested_endpoints(
 
 
 @then("the command fails with a file exists error")
-def then_command_fails_with_file_exists(node_command_context: dict[str, object]) -> None:
+def then_command_fails_with_file_exists(
+    node_command_context: dict[str, object],
+) -> None:
     result = node_command_context["result"]
     assert isinstance(result, subprocess.CompletedProcess)
     assert result.returncode != 0
@@ -246,5 +248,3 @@ def then_command_exits_non_zero(node_command_context: dict[str, object]) -> None
     result = node_command_context["result"]
     assert isinstance(result, subprocess.CompletedProcess)
     assert result.returncode != 0
-
-

@@ -180,10 +180,26 @@ async def test_probe_ping_reports_connection_refusal_clearly(tmp_path: Path) -> 
         (KeyError("prod"), "prod", "Unknown client context 'prod'"),
         (ValidationError("bad table"), None, "Invalid Tourillon client configuration"),
         (ValueError("bad endpoint"), None, "Invalid Tourillon client configuration"),
-        (ssl.SSLError("bad tls"), None, "TLS setup or handshake failed during probe ping"),
-        (OSError("network down"), None, "Unable to reach the Tourillon node for probe ping"),
-        (ResponseError("bad response"), None, "Tourillon node returned an invalid probe response"),
-        (ProtocolError("bad frame"), None, "Tourillon node returned an invalid probe response"),
+        (
+            ssl.SSLError("bad tls"),
+            None,
+            "TLS setup or handshake failed during probe ping",
+        ),
+        (
+            OSError("network down"),
+            None,
+            "Unable to reach the Tourillon node for probe ping",
+        ),
+        (
+            ResponseError("bad response"),
+            None,
+            "Tourillon node returned an invalid probe response",
+        ),
+        (
+            ProtocolError("bad frame"),
+            None,
+            "Tourillon node returned an invalid probe response",
+        ),
         (UnknownServiceError("Unknown service: probe"), None, "Unknown service: probe"),
         (RuntimeError("boom"), None, "Probe ping failed: boom"),
     ],
@@ -195,7 +211,3 @@ def test_probe_error_message_is_clear(
 ) -> None:
     message = _probe_error_message(exc, context_name)
     assert expected in message
-
-
-
-

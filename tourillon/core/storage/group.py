@@ -38,7 +38,9 @@ COMMIT_BATCH_SIZE = 256
 _HINT_KINDS = frozenset({TagKind.HINT})
 
 
-def _decode_tag_kv(kv: KVPair, kinds: frozenset[TagKind] | None) -> tuple[Key, Tag] | None:
+def _decode_tag_kv(
+    kv: KVPair, kinds: frozenset[TagKind] | None
+) -> tuple[Key, Tag] | None:
     """Decode a TAGS entry and drop it unless its kind is wanted.
 
     Filtering here, on the tag alone, is what keeps a scan proportional to the
@@ -56,17 +58,23 @@ def _decode_tag_kv(kv: KVPair, kinds: frozenset[TagKind] | None) -> tuple[Key, T
 
 def _build_record(key: Key, tag: Tag, kv_log: KVPair | None) -> Record | None:
     if kv_log is None:
-        logger.warning("Skipping tag entry without value: pid=%d key=%s", key.pid.value, key)
+        logger.warning(
+            "Skipping tag entry without value: pid=%d key=%s", key.pid.value, key
+        )
         return None
     try:
         value = Value.from_bytes(kv_log.value)
     except (ValueError, OverflowError) as exc:
-        logger.warning("Skipping unreadable value: pid=%d key=%s: %s", key.pid.value, key, exc)
+        logger.warning(
+            "Skipping unreadable value: pid=%d key=%s: %s", key.pid.value, key, exc
+        )
         return None
     return Record(key=key, tag=tag, value=value)
 
 
-async def _load_records(session: Session, selected: Sequence[tuple[Key, Tag]]) -> list[Record]:
+async def _load_records(
+    session: Session, selected: Sequence[tuple[Key, Tag]]
+) -> list[Record]:
     """Batch-load the LOGS payloads of already-selected tags."""
     if not selected:
         return []
@@ -93,12 +101,12 @@ class PartitionGroupStore:
             kv_tag = KVPair(
                 key=record.key.to_bytes(Keyspace.TAGS),
                 value=record.tag.to_bytes(),
-                keyspace=Keyspace.TAGS
+                keyspace=Keyspace.TAGS,
             )
             kv_log = KVPair(
                 key=record.key.to_bytes(Keyspace.LOGS),
                 value=record.value.to_bytes(),
-                keyspace=Keyspace.LOGS
+                keyspace=Keyspace.LOGS,
             )
             await session.put(kv_tag)
             await session.put(kv_log)
@@ -113,7 +121,9 @@ class PartitionGroupStore:
                 return None
 
             key = Key.from_bytes(kv_log.key, Keyspace.LOGS)
-            kv_tag = await session.get(KVRef(key=key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS))
+            kv_tag = await session.get(
+                KVRef(key=key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS)
+            )
             if kv_tag is None:
                 return None
 
@@ -129,11 +139,15 @@ class PartitionGroupStore:
         `pid|address|ts`, so the lookup is a point read, not a scan.
         """
         async with self._session_provider.session(write=False) as session:
-            kv_log = await session.get(KVRef(key=key.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS))
+            kv_log = await session.get(
+                KVRef(key=key.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)
+            )
             if kv_log is None:
                 return None
 
-            kv_tag = await session.get(KVRef(key=key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS))
+            kv_tag = await session.get(
+                KVRef(key=key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS)
+            )
             if kv_tag is None:
                 return None
 
@@ -189,7 +203,9 @@ class PartitionGroupStaging:
         jumps = self._resume_jumps(resumes or {})
         position: bytes | None = self._scan_origin(after)
         while position is not None:
-            records, position = await self._scan_page(position, jumps, kinds, batch_size)
+            records, position = await self._scan_page(
+                position, jumps, kinds, batch_size
+            )
             for record in records:
                 yield record
 
@@ -322,10 +338,16 @@ class PartitionGroupStaging:
             await batch.result()
 
     @staticmethod
-    async def _existing_tags(session: Session, records: Sequence[Record]) -> list[KVPair | None]:
+    async def _existing_tags(
+        session: Session, records: Sequence[Record]
+    ) -> list[KVPair | None]:
         async with session.batch() as batch:
             for record in records:
-                batch.get(KVRef(key=record.key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS))
+                batch.get(
+                    KVRef(
+                        key=record.key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS
+                    )
+                )
         return await batch.result()
 
     async def _put_staged(self, session: Session, records: Sequence[Record]) -> None:
@@ -430,7 +452,6 @@ class PartitionGroupStaging:
         return start, end
 
 
-
 class PartitionGroupHint:
     def __init__(self, session_provider: SessionProvider) -> None:
         self._session_provider = session_provider
@@ -486,10 +507,16 @@ class PartitionGroupHint:
         return True
 
     @staticmethod
-    async def _existing_tags(session: Session, records: Sequence[Record]) -> list[KVPair | None]:
+    async def _existing_tags(
+        session: Session, records: Sequence[Record]
+    ) -> list[KVPair | None]:
         async with session.batch() as batch:
             for record in records:
-                batch.get(KVRef(key=record.key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS))
+                batch.get(
+                    KVRef(
+                        key=record.key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS
+                    )
+                )
         return await batch.result()
 
     @staticmethod
@@ -503,11 +530,7 @@ class PartitionGroupHint:
                 return None
             restored = Tag.unhint(tag)
         except ValueError as exc:
-            logger.warning(
-                "Cannot satisfy hinted entry %s: %s",
-                record.key,
-                exc
-            )
+            logger.warning("Cannot satisfy hinted entry %s: %s", record.key, exc)
             return None
 
         return KVPair(

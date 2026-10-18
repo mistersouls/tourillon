@@ -30,4 +30,3 @@ class Walkable(Protocol):
     @classmethod
     def walk(cls, walker: BytesWalker) -> Self:
         """Create an instance of the object by reading from a BytesWalker."""
-

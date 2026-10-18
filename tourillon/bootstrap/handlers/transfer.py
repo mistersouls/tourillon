@@ -77,7 +77,9 @@ async def commit(request: Envelope) -> AsyncIterator[Envelope]:
     try:
         t_commit = _decode(serializer, request, TransferCommit.from_dict)
         activated = await manager.transfer.commit(t_commit)
-        yield _reply(serializer, request, "transfer.commit.accept", {"activated": activated})
+        yield _reply(
+            serializer, request, "transfer.commit.accept", {"activated": activated}
+        )
     except _REJECTED as exc:
         yield _reject(serializer, request, exc)
 
@@ -99,10 +101,11 @@ def _reply(
     kind: str,
     payload: dict[str, Any],
 ) -> Envelope:
-    return replay_envelope(kind=kind, request=request, payload=serializer.encode(payload))
+    return replay_envelope(
+        kind=kind, request=request, payload=serializer.encode(payload)
+    )
 
 
 def _reject(serializer: Serializer, request: Envelope, exc: Exception) -> Envelope:
     reject = TransferReject(reason=str(exc), fatal=isinstance(exc, ProcessError))
     return _reply(serializer, request, f"{request.kind}.reject", reject.to_dict())
-

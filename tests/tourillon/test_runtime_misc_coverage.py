@@ -13,36 +13,30 @@
 # limitations under the License.
 
 import asyncio
-import ssl
 import signal
-from contextlib import asynccontextmanager
+import ssl
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tests.tourillon.test_lifecycle import _DocumentStatePersistence, _build_config
+from tests.tourillon.test_lifecycle import _build_config, _DocumentStatePersistence
 from tourillon.core.gossip.bootstrapper import GossipBootstrapper
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.manager import Manager
-from tourillon.core.models.clock import HLCClock
 from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import SimplePlacementStrategy
 from tourillon.core.partition.types import PartitionPlacement
-from tourillon.core.peer.pool import PeerPool
-from tourillon.core.probe.detector import FailureDetectorProvider
+from tourillon.core.spaces.hashspace import HashSpace
+from tourillon.core.telemetry import build_noop_telemetry
 from tourillon.core.transports.client import PeerClient
 from tourillon.core.transports.dispatcher import Dispatcher
-from tourillon.core.spaces.hashspace import HashSpace
-from tourillon.core.spaces.ring import Ring
-from tourillon.core.spaces.vnode import VNode
 from tourlib.adapter import MsgPackSerializer
 from tourlib.envelope import build_envelope
 from tourlib.models.inspect import NodeInspectRequest
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
-from tourillon.core.telemetry import build_noop_telemetry
 
 
 class _FD:
@@ -97,7 +91,9 @@ class _TelemetryProvider:
 
 
 class _BootstrapClient:
-    def __init__(self, *, stream_items=None, connect_error: Exception | None = None) -> None:
+    def __init__(
+        self, *, stream_items=None, connect_error: Exception | None = None
+    ) -> None:
         self._stream_items = list(stream_items or [])
         self._connect_error = connect_error
         self.closed = False
@@ -135,7 +131,9 @@ def _build_manager(tmp_path: Path, storage: _Storage) -> Manager:
         client_dispatcher=Dispatcher(),
         tls_server=ssl.create_default_context(),
         tls_client=ssl.create_default_context(),
-        persistence=_DocumentStatePersistence({"node": {"node_id": "manager-node", "phase": "idle", "epoch": 0}}),
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "manager-node", "phase": "idle", "epoch": 0}}
+        ),
         serializer=MsgPackSerializer(),
         storage_provider=_StorageProvider(storage),
         telemetry_provider=_TelemetryProvider(),
@@ -144,14 +142,18 @@ def _build_manager(tmp_path: Path, storage: _Storage) -> Manager:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_gossip_bootstrapper_run_retry_and_attempt_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_gossip_bootstrapper_run_retry_and_attempt_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     serializer = MsgPackSerializer()
     topologymgr = TopologyManager()
     bootstrapper = GossipBootstrapper(
         node_id="node-a",
         serializer=serializer,
         topologymgr=topologymgr,
-        backoff=SimpleNamespace(initial_delay=0.01, max_retries=2, jitter=0.0, factor=2.0, max_delay=1.0),
+        backoff=SimpleNamespace(
+            initial_delay=0.01, max_retries=2, jitter=0.0, factor=2.0, max_delay=1.0
+        ),
         tls_client=ssl.create_default_context(),
     )
     attempts = {"count": 0}
@@ -160,6 +162,7 @@ async def test_gossip_bootstrapper_run_retry_and_attempt_paths(monkeypatch: pyte
         attempts["count"] += 1
         if attempts["count"] == 1:
             from tourillon.core.exceptions import BootstrapAttemptError
+
             raise BootstrapAttemptError("no seed")
         assert seeds == ("seed-1:9000",)
         return 1
@@ -169,7 +172,9 @@ async def test_gossip_bootstrapper_run_retry_and_attempt_paths(monkeypatch: pyte
 
     monkeypatch.setattr(bootstrapper, "_attempt", fake_attempt)
     monkeypatch.setattr("tourillon.core.gossip.bootstrapper.asyncio.sleep", no_sleep)
-    monkeypatch.setattr("tourillon.core.gossip.bootstrapper.random.uniform", lambda a, b: 0)
+    monkeypatch.setattr(
+        "tourillon.core.gossip.bootstrapper.random.uniform", lambda a, b: 0
+    )
 
     assert await bootstrapper.run(("seed-1:9000",)) == 1
     assert attempts["count"] == 2
@@ -180,20 +185,26 @@ async def test_gossip_bootstrapper_run_retry_and_attempt_paths(monkeypatch: pyte
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_gossip_bootstrapper_exchange_and_attempt_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_gossip_bootstrapper_exchange_and_attempt_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     serializer = MsgPackSerializer()
     topologymgr = TopologyManager()
     bootstrapper = GossipBootstrapper(
         node_id="node-a",
         serializer=serializer,
         topologymgr=topologymgr,
-        backoff=SimpleNamespace(initial_delay=0.01, max_retries=1, jitter=0.0, factor=2.0, max_delay=1.0),
+        backoff=SimpleNamespace(
+            initial_delay=0.01, max_retries=1, jitter=0.0, factor=2.0, max_delay=1.0
+        ),
         tls_client=ssl.create_default_context(),
     )
     good_member = _member("node-b", 1, MemberPhase.READY, 10)
     delta = build_envelope(
         kind="gossip.delta",
-        payload=serializer.encode({"members": [good_member.to_dict(), {"broken": True}], "has_more": False}),
+        payload=serializer.encode(
+            {"members": [good_member.to_dict(), {"broken": True}], "has_more": False}
+        ),
         schema_id=serializer.schema_id,
     )
     error = build_envelope(
@@ -207,15 +218,32 @@ async def test_gossip_bootstrapper_exchange_and_attempt_seed(monkeypatch: pytest
         schema_id=serializer.schema_id,
     )
 
-    assert await bootstrapper._exchange_digest(_BootstrapClient(stream_items=[delta]), "seed") == [good_member]  # noqa: SLF001
-    assert await bootstrapper._exchange_digest(_BootstrapClient(stream_items=[error]), "seed") == []  # noqa: SLF001
-    assert await bootstrapper._exchange_digest(_BootstrapClient(stream_items=[weird]), "seed") == []  # noqa: SLF001
+    assert await bootstrapper._exchange_digest(
+        _BootstrapClient(stream_items=[delta]), "seed"
+    ) == [
+        good_member
+    ]  # noqa: SLF001
+    assert (
+        await bootstrapper._exchange_digest(
+            _BootstrapClient(stream_items=[error]), "seed"
+        )
+        == []
+    )  # noqa: SLF001
+    assert (
+        await bootstrapper._exchange_digest(
+            _BootstrapClient(stream_items=[weird]), "seed"
+        )
+        == []
+    )  # noqa: SLF001
 
     clients = {
         "ok:9000": _BootstrapClient(stream_items=[delta]),
         "bad:9000": _BootstrapClient(connect_error=OSError("down")),
     }
-    monkeypatch.setattr("tourillon.core.gossip.bootstrapper.EnvelopeClient", lambda address, tls_ctx, logger: clients[address])
+    monkeypatch.setattr(
+        "tourillon.core.gossip.bootstrapper.EnvelopeClient",
+        lambda address, tls_ctx, logger: clients[address],
+    )
 
     results = [False, False]
     await bootstrapper._attempt_seed("ok:9000", results, 0)  # noqa: SLF001
@@ -286,7 +314,9 @@ async def test_simple_placement_strategy_builds_preference_list_and_handoffs() -
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_manager_start_stop_inspect_join_and_serve_forever(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_manager_start_stop_inspect_join_and_serve_forever(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     storage = _Storage()
     manager = _build_manager(tmp_path, storage)
     started = []
@@ -340,7 +370,9 @@ async def test_manager_start_stop_inspect_join_and_serve_forever(monkeypatch: py
     def fake_install(event: asyncio.Event) -> None:
         event.set()
 
-    monkeypatch.setattr(manager, "_install_signal_handlers", fake_install, raising=False)
+    monkeypatch.setattr(
+        manager, "_install_signal_handlers", fake_install, raising=False
+    )
     started.clear()
     stopped.clear()
     await manager.serve_forever()
@@ -396,7 +428,9 @@ async def test_manager_serve_forever_installs_sigint_and_sigterm_handlers(
     manager.start = fake_start  # type: ignore[method-assign]
     manager.stop = fake_stop  # type: ignore[method-assign]
     monkeypatch.setattr(asyncio.Event, "wait", immediate_wait)
-    monkeypatch.setattr(manager, "_install_signal_handlers", fake_install, raising=False)
+    monkeypatch.setattr(
+        manager, "_install_signal_handlers", fake_install, raising=False
+    )
 
     await manager.serve_forever()
 
@@ -425,7 +459,9 @@ async def test_manager_serve_forever_handles_keyboard_interrupt_fallback(
     manager.start = fake_start  # type: ignore[method-assign]
     manager.stop = fake_stop  # type: ignore[method-assign]
     monkeypatch.setattr(asyncio.Event, "wait", interrupted_wait)
-    monkeypatch.setattr(manager, "_install_signal_handlers", lambda event: None, raising=False)
+    monkeypatch.setattr(
+        manager, "_install_signal_handlers", lambda event: None, raising=False
+    )
 
     await manager.serve_forever()
 
@@ -446,7 +482,9 @@ async def test_manager_install_signal_handlers_registers_sigint_and_sigterm(
             registered.append(sig)
             assert callback is not None
 
-    monkeypatch.setattr("tourillon.core.manager.asyncio.get_running_loop", lambda: _LoopStub())
+    monkeypatch.setattr(
+        "tourillon.core.manager.asyncio.get_running_loop", lambda: _LoopStub()
+    )
 
     manager._install_signal_handlers(asyncio.Event())  # type: ignore[attr-defined]  # noqa: SLF001
 
@@ -455,7 +493,9 @@ async def test_manager_install_signal_handlers_registers_sigint_and_sigterm(
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_manager_stop_continues_shutdown_after_lifecycle_error(tmp_path: Path) -> None:
+async def test_manager_stop_continues_shutdown_after_lifecycle_error(
+    tmp_path: Path,
+) -> None:
     manager = _build_manager(tmp_path, _Storage())
     steps: list[str] = []
 
@@ -484,7 +524,9 @@ async def test_manager_stop_continues_shutdown_after_lifecycle_error(tmp_path: P
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_peer_client_reports_failures_to_detector(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_peer_client_reports_failures_to_detector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fd = _FD()
     client = PeerClient("127.0.0.1:9000", ssl.create_default_context(), fd)
     request_env = build_envelope(kind="probe.ping", payload=b"{}", schema_id=1)
@@ -509,20 +551,26 @@ async def test_peer_client_reports_failures_to_detector(monkeypatch: pytest.Monk
         raise ConnectionError("boom")
         yield reply_env  # pragma: no cover
 
-    monkeypatch.setattr("tourillon.core.transports.client.EnvelopeClient.request", ok_request)
+    monkeypatch.setattr(
+        "tourillon.core.transports.client.EnvelopeClient.request", ok_request
+    )
     assert await client.request(request_env) == reply_env
 
-    monkeypatch.setattr("tourillon.core.transports.client.EnvelopeClient.request", failing_request)
+    monkeypatch.setattr(
+        "tourillon.core.transports.client.EnvelopeClient.request", failing_request
+    )
     with pytest.raises(TimeoutError, match="boom"):
         await client.request(request_env)
     assert fd.runs[-1] is client
 
-    monkeypatch.setattr("tourillon.core.transports.client.EnvelopeClient.stream", ok_stream)
+    monkeypatch.setattr(
+        "tourillon.core.transports.client.EnvelopeClient.stream", ok_stream
+    )
     assert [item async for item in client.stream(request_env)] == [reply_env]
 
-    monkeypatch.setattr("tourillon.core.transports.client.EnvelopeClient.stream", failing_stream)
+    monkeypatch.setattr(
+        "tourillon.core.transports.client.EnvelopeClient.stream", failing_stream
+    )
     with pytest.raises(ConnectionError, match="boom"):
         [item async for item in client.stream(request_env)]
     assert fd.runs[-1] is client
-
-

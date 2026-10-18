@@ -15,7 +15,12 @@
 import pytest
 
 from tourillon.core.gossip.topology import TopologyManager
-from tourillon.core.models.gossip import GossipDigest, GossipNodeDigest, GossipPing, GossipPush
+from tourillon.core.models.gossip import (
+    GossipDigest,
+    GossipNodeDigest,
+    GossipPing,
+    GossipPush,
+)
 from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.services.gossip import GossipService
 
@@ -79,9 +84,12 @@ async def test_gossip_service_pong_not_same_when_fingerprint_differs() -> None:
 
     assert result.same is False
 
+
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_gossip_service_delta_returns_missing_and_newer_members_and_remote_only_wanted_nodes() -> None:
+async def test_gossip_service_delta_returns_missing_and_newer_members_and_remote_only_wanted_nodes() -> (
+    None
+):
     topologymgr = TopologyManager()
     await topologymgr.merge_registry(
         (
@@ -156,9 +164,13 @@ async def test_gossip_service_delta_paginates_with_after_node_id() -> None:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_gossip_service_delta_returns_empty_page_for_unknown_after_node_id() -> None:
+async def test_gossip_service_delta_returns_empty_page_for_unknown_after_node_id() -> (
+    None
+):
     topologymgr = TopologyManager()
-    await topologymgr.merge_registry((_member("node-a", epoch=2), _member("node-b", epoch=2)))
+    await topologymgr.merge_registry(
+        (_member("node-a", epoch=2), _member("node-b", epoch=2))
+    )
     service = GossipService(node_id="node-a", topologymgr=topologymgr)
 
     request = GossipDigest(
@@ -177,4 +189,3 @@ async def test_gossip_service_delta_returns_empty_page_for_unknown_after_node_id
     assert response.members == []
     assert response.has_more is False
     assert response.after_node_id == ""
-

@@ -300,7 +300,9 @@ async def _run_put(
     tourconf: str | Path | None,
     context_name: str | None,
 ) -> dict[str, Any] | None:
-    async with client("kv", endpoint="client", tourconf=tourconf, context_name=context_name) as kv_service:
+    async with client(
+        "kv", endpoint="client", tourconf=tourconf, context_name=context_name
+    ) as kv_service:
         if not isinstance(kv_service, KvService):
             raise UnknownServiceError("Unknown service: kv")
         version = await kv_service.put(
@@ -317,10 +319,14 @@ async def _run_get(
     tourconf: str | Path | None,
     context_name: str | None,
 ) -> dict[str, Any] | None:
-    async with client("kv", endpoint="client", tourconf=tourconf, context_name=context_name) as kv_service:
+    async with client(
+        "kv", endpoint="client", tourconf=tourconf, context_name=context_name
+    ) as kv_service:
         if not isinstance(kv_service, KvService):
             raise UnknownServiceError("Unknown service: kv")
-        response = await kv_service.get(namespace=namespace, key=key, quorum_read=quorum_read)
+        response = await kv_service.get(
+            namespace=namespace, key=key, quorum_read=quorum_read
+        )
         return None if response is None else _version_to_render_dict(response)
 
 
@@ -332,7 +338,9 @@ async def _run_delete(
     tourconf: str | Path | None,
     context_name: str | None,
 ) -> dict[str, Any] | None:
-    async with client("kv", endpoint="client", tourconf=tourconf, context_name=context_name) as kv_service:
+    async with client(
+        "kv", endpoint="client", tourconf=tourconf, context_name=context_name
+    ) as kv_service:
         if not isinstance(kv_service, KvService):
             raise UnknownServiceError("Unknown service: kv")
         version = await kv_service.delete(
@@ -348,7 +356,9 @@ async def _run_repair(
     tourconf: str | Path | None,
     context_name: str | None,
 ) -> dict[str, Any]:
-    async with client("kv", endpoint="client", tourconf=tourconf, context_name=context_name) as kv_service:
+    async with client(
+        "kv", endpoint="client", tourconf=tourconf, context_name=context_name
+    ) as kv_service:
         if not isinstance(kv_service, KvService):
             raise UnknownServiceError("Unknown service: kv")
         result = await kv_service.repair(token=token, quorum_write=quorum_write)
@@ -372,7 +382,12 @@ async def kv_put(
         typed_key = _parse_typed_value(key, key_type)
         typed_namespace = _parse_typed_value(namespace, namespace_type)
         typed_value = _parse_value(value, value_type)
-    except (FileNotFoundError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+    except (
+        FileNotFoundError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
         _raise_user_error(f"Invalid KV input: {exc}")
 
     try:
@@ -474,7 +489,9 @@ async def kv_repair(
         _raise_user_error(_kv_error_message(exc, context_name))
 
     if as_json:
-        return json.dumps(_json_safe(result), ensure_ascii=False, indent=2, sort_keys=True)
+        return json.dumps(
+            _json_safe(result), ensure_ascii=False, indent=2, sort_keys=True
+        )
     return _render_repair(result)
 
 
@@ -492,5 +509,3 @@ def _render_repair(result: Mapping[str, Any]) -> str:
             _format_labeled_block("Token:", result.get("token")),
         ]
     )
-
-

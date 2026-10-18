@@ -78,4 +78,3 @@ class TransferRunner:
     async def _plan(self, current: Ring, target: Ring) -> TransferPlan:
         """Plan the transfer from current to target ring."""
         return await asyncio.to_thread(self._planner.plan, current, target)
-

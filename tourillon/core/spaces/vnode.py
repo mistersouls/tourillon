@@ -26,4 +26,3 @@ class VNode:
 
     token: int  # [0, 2**bits)
     node_id: str
-

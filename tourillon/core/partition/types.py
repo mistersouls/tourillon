@@ -21,7 +21,7 @@ from tourillon.core.spaces.vnode import VNode
 class LogicalPartition:
     pid: int
     start: int
-    end: int # half open [start, end)
+    end: int  # half open [start, end)
 
     def contains(self, h: int) -> bool:
         if self.start < self.end:

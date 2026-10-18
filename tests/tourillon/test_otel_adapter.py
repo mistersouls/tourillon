@@ -30,7 +30,9 @@ class _FakeInstrument:
         self.unit = unit
         self.calls: list[tuple[int | float, dict[str, object] | None]] = []
 
-    def add(self, amount: int | float, attributes: dict[str, object] | None = None) -> None:
+    def add(
+        self, amount: int | float, attributes: dict[str, object] | None = None
+    ) -> None:
         self.calls.append((amount, attributes))
 
 
@@ -39,12 +41,16 @@ class _FakeMeter:
         self.counters: dict[str, _FakeInstrument] = {}
         self.up_down_counters: dict[str, _FakeInstrument] = {}
 
-    def create_counter(self, *, name: str, description: str, unit: str) -> _FakeInstrument:
+    def create_counter(
+        self, *, name: str, description: str, unit: str
+    ) -> _FakeInstrument:
         instrument = _FakeInstrument(name=name, description=description, unit=unit)
         self.counters[name] = instrument
         return instrument
 
-    def create_up_down_counter(self, *, name: str, description: str, unit: str) -> _FakeInstrument:
+    def create_up_down_counter(
+        self, *, name: str, description: str, unit: str
+    ) -> _FakeInstrument:
         instrument = _FakeInstrument(name=name, description=description, unit=unit)
         self.up_down_counters[name] = instrument
         return instrument
@@ -114,8 +120,7 @@ class _FakeTraceApi:
 
 
 @pytest.mark.tourillon
-def test_open_telemetry_adapter_records_metrics_and_spans_with_generic_labels(
-) -> None:
+def test_open_telemetry_adapter_records_metrics_and_spans_with_generic_labels() -> None:
     metrics_api = _FakeMetricsApi()
     trace_api = _FakeTraceApi()
 
@@ -200,7 +205,9 @@ def test_open_telemetry_adapter_records_metrics_and_spans_with_generic_labels(
     assert metrics_api.meter.counters["demo_gossip_ae_diverged"].calls == [
         (1, None),
     ]
-    assert metrics_api.meter.counters["demo_gossip_failed_announcements_total"].calls == [
+    assert metrics_api.meter.counters[
+        "demo_gossip_failed_announcements_total"
+    ].calls == [
         (1, None),
     ]
     assert metrics_api.meter.up_down_counters["demo_in_flight_current"].calls == [
@@ -232,8 +239,7 @@ def test_open_telemetry_adapter_records_metrics_and_spans_with_generic_labels(
 
 
 @pytest.mark.tourillon
-def test_open_telemetry_adapter_uses_manager_local_metric_cache(
-) -> None:
+def test_open_telemetry_adapter_uses_manager_local_metric_cache() -> None:
     first_metrics_api = _FakeMetricsApi()
     first = otel_adapter.OpenTelemetryTelemetry(prefix="demo", meter=first_metrics_api.meter)  # type: ignore[arg-type]
     first_metric = first.connections_accepted_total
@@ -245,14 +251,14 @@ def test_open_telemetry_adapter_uses_manager_local_metric_cache(
     assert first_metric is first.connections_accepted_total
     assert second_metric is second.connections_accepted_total
     assert first_metric is not second_metric
-    assert first_metrics_api.meter.counters["demo_connections_accepted_total"] is not second_metrics_api.meter.counters[
-        "demo_connections_accepted_total"
-    ]
+    assert (
+        first_metrics_api.meter.counters["demo_connections_accepted_total"]
+        is not second_metrics_api.meter.counters["demo_connections_accepted_total"]
+    )
 
 
 @pytest.mark.tourillon
-def test_open_telemetry_adapter_supports_disabled_metrics_and_tracing(
-) -> None:
+def test_open_telemetry_adapter_supports_disabled_metrics_and_tracing() -> None:
     telemetry = otel_adapter.OpenTelemetryTelemetry(
         prefix="demo",
     )
@@ -270,12 +276,14 @@ async def test_open_telemetry_adapter_close_flushes_and_shuts_down_providers() -
     events: list[str] = []
 
     async def close_hook() -> None:
-        events.extend([
-            "tracer.flush",
-            "tracer.shutdown",
-            "meter.flush",
-            "meter.shutdown",
-        ])
+        events.extend(
+            [
+                "tracer.flush",
+                "tracer.shutdown",
+                "meter.flush",
+                "meter.shutdown",
+            ]
+        )
 
     telemetry = otel_adapter.OpenTelemetryTelemetry(
         close_hook=close_hook,
@@ -319,8 +327,13 @@ class _FakeTelemetry:
 
 
 @pytest.mark.tourillon
-def test_open_telemetry_provider_creates_adapter_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("tourillon.infra.adapter.telemetry.otel_provider.OpenTelemetryTelemetry", _FakeTelemetry)
+def test_open_telemetry_provider_creates_adapter_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "tourillon.infra.adapter.telemetry.otel_provider.OpenTelemetryTelemetry",
+        _FakeTelemetry,
+    )
     provider = OpenTelemetryProvider()
     meter = _FakeMeter()
     setup_calls = {"metrics": 0}
@@ -372,7 +385,9 @@ def test_open_telemetry_provider_falls_back_to_noop_when_disabled() -> None:
 
 
 @pytest.mark.tourillon
-def test_open_telemetry_provider_rejects_reinitialization_with_different_config() -> None:
+def test_open_telemetry_provider_rejects_reinitialization_with_different_config() -> (
+    None
+):
     provider = OpenTelemetryProvider()
     first = TelemetryConfig(
         metrics_enabled=False,
@@ -388,12 +403,16 @@ def test_open_telemetry_provider_rejects_reinitialization_with_different_config(
 
     provider.create(first)
 
-    with pytest.raises(ValidationError, match="already initialized with a different telemetry config"):
+    with pytest.raises(
+        ValidationError, match="already initialized with a different telemetry config"
+    ):
         provider.create(second)
 
 
 @pytest.mark.tourillon
-def test_open_telemetry_provider_sets_up_metrics_and_tracing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_open_telemetry_provider_sets_up_metrics_and_tracing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     provider = OpenTelemetryProvider()
     metric_calls: dict[str, object] = {}
     trace_calls: dict[str, object] = {}
@@ -521,4 +540,3 @@ def test_open_telemetry_provider_requires_endpoint_option() -> None:
     assert provider._require_endpoint({"endpoint": "http://localhost:4318"}) == (
         "http://localhost:4318"
     )
-

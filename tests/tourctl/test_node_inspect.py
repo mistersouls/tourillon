@@ -107,7 +107,12 @@ def _node_info_payload() -> dict[str, object]:
             {"node_id": "node-2", "phase": "READY", "status": "SUSPECT", "epoch": 3},
             {"node_id": "node-3", "phase": "READY", "status": "-", "epoch": 3},
         ],
-        "self_member": {"node_id": "node-3", "phase": "READY", "status": "-", "epoch": 3},
+        "self_member": {
+            "node_id": "node-3",
+            "phase": "READY",
+            "status": "-",
+            "epoch": 3,
+        },
         "gossip_stats": {
             "known_members": 3,
             "ae_cycles_total": 128,
@@ -202,7 +207,9 @@ async def test_node_inspect_returns_json_output(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.tourctl
-async def test_node_inspect_keeps_identity_when_members_filtered_out(tmp_path: Path) -> None:
+async def test_node_inspect_keeps_identity_when_members_filtered_out(
+    tmp_path: Path,
+) -> None:
     ca_cert_path, ca_key_path = generate_ca(tmp_path)
     server_ssl = _build_server_ssl_from_ca(tmp_path, ca_cert_path, ca_key_path)
     serializer = MsgPackSerializer()
@@ -292,14 +299,18 @@ async def test_node_inspect_forwards_filters_to_request_payload(tmp_path: Path) 
 
 @pytest.mark.asyncio
 @pytest.mark.tourctl
-async def test_node_usecase_forwards_filter_options(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_node_usecase_forwards_filter_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict[str, Any] = {}
 
     async def fake_inspect_node(**kwargs: Any) -> str:
         captured.update(kwargs)
         return "ok"
 
-    monkeypatch.setattr("tourctl.bootstrap.usecases.node.inspect_node", fake_inspect_node)
+    monkeypatch.setattr(
+        "tourctl.bootstrap.usecases.node.inspect_node", fake_inspect_node
+    )
 
     result = await node_inspect(
         address="127.0.0.1:7701",
@@ -361,5 +372,3 @@ def test_tourctl_app_node_inspect_requires_address_argument() -> None:
             help_on_error=False,
             result_action="return_value",
         )
-
-

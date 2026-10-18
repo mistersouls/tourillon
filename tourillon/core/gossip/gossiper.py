@@ -141,11 +141,7 @@ class Gossiper:
 
     async def stop(self) -> None:
         """Stop gossip background loops."""
-        tasks = [
-            task
-            for task in (self._hot_task, self._ae_task)
-            if task is not None
-        ]
+        tasks = [task for task in (self._hot_task, self._ae_task) if task is not None]
         if not tasks:
             logger.debug(
                 "gossip.stop ignored; engine not running node_id=%s",
@@ -162,8 +158,7 @@ class Gossiper:
                 )
             except TimeoutError:
                 self._record_stop_failure(
-                    "hot queue drain timed out "
-                    f"after {timeout_s}s"
+                    "hot queue drain timed out " f"after {timeout_s}s"
                 )
                 logger.error(
                     "gossip.stop hot queue drain timed out node_id=%s timeout_s=%s pending=%s",
@@ -266,17 +261,21 @@ class Gossiper:
         self._telemetry.gossip_hot_queue_size.set(self._hot_queue.qsize())
 
     def _set_last_ae_metrics(self, peer_node_id: str) -> None:
-        self._telemetry.gossip_last_ae_peer.set(self._stable_peer_id_value(peer_node_id))
+        self._telemetry.gossip_last_ae_peer.set(
+            self._stable_peer_id_value(peer_node_id)
+        )
         self._telemetry.gossip_last_ae_at.set(self._unix_now())
 
-    def _build_envelope(self, kind: str, payload: Any, mode: int = Envelope.MODE_RPC) -> Envelope:
+    def _build_envelope(
+        self, kind: str, payload: Any, mode: int = Envelope.MODE_RPC
+    ) -> Envelope:
         return Envelope(
             kind=kind,
             correlation_id=uuid.uuid4(),
             mode=mode,
             proto_version=PROTOCOL_VERSION,
             schema_id=self._serializer.schema_id,
-            payload=self._serializer.encode(payload)
+            payload=self._serializer.encode(payload),
         )
 
     async def _hot_loop(self) -> None:
@@ -299,8 +298,7 @@ class Gossiper:
                 await self._run_ae_cycle()
             except Exception as exc:
                 logger.warning(
-                    "gossip.ae_cycle failed node_id=%s error=%s",
-                    self._node_id, exc
+                    "gossip.ae_cycle failed node_id=%s error=%s", self._node_id, exc
                 )
             await asyncio.sleep(self._config.ae_interval)
 
@@ -330,7 +328,7 @@ class Gossiper:
 
         await asyncio.gather(
             *(self._send_push(member, target) for target in targets),
-            return_exceptions=True
+            return_exceptions=True,
         )
 
     async def _send_push(self, member: Member, target: Member) -> None:
@@ -432,7 +430,7 @@ class Gossiper:
                 payload = {
                     "sender": self._node_id,
                     "fingerprint": fingerprint,
-                    "count": len(topology.registry)
+                    "count": len(topology.registry),
                 }
                 ping = self._build_envelope("gossip.ping", payload)
                 pong = await client.request(ping)
@@ -447,7 +445,10 @@ class Gossiper:
                 same = pong_data.get("same", True)
                 logger.debug(
                     "gossip.ping result node_id=%s peer=%s same=%s fingerprint=%.8s",
-                    self._node_id, peer.node_id, same, fingerprint
+                    self._node_id,
+                    peer.node_id,
+                    same,
+                    fingerprint,
                 )
 
                 if same:
@@ -461,7 +462,9 @@ class Gossiper:
                 span.set_status_error(str(exc))
                 logger.warning(
                     "gossip.ping failed node_id=%s peer=%s error=%s",
-                    self._node_id, peer.node_id, exc
+                    self._node_id,
+                    peer.node_id,
+                    exc,
                 )
 
     async def _ae_digest_delta(self, peer: Member, client: EnvelopeClient) -> None:
@@ -493,7 +496,9 @@ class Gossiper:
         except (EnvelopeError, ValidationError) as exc:
             logger.warning(
                 "gossip.digest/delta failed node_id=%s peer=%s error=%s",
-                self._node_id, peer.node_id, exc
+                self._node_id,
+                peer.node_id,
+                exc,
             )
 
     async def _build_digest(self) -> Envelope:
@@ -529,17 +534,16 @@ class Gossiper:
                 exc,
             )
 
-    async def _satisfy_wanted(self, peer: Member, client: EnvelopeClient, wanted: set[str]) -> None:
+    async def _satisfy_wanted(
+        self, peer: Member, client: EnvelopeClient, wanted: set[str]
+    ) -> None:
         topology = await self._topologymgr.snapshot()
-        to_send = [
-            m.to_dict()
-            for m in topology.registry
-            if m.node_id in wanted
-        ]
+        to_send = [m.to_dict() for m in topology.registry if m.node_id in wanted]
         if not to_send:
             logger.debug(
                 "gossip.satisfy_wanted no members to send node_id=%s peer=%s",
-                self._node_id, peer.node_id
+                self._node_id,
+                peer.node_id,
             )
             return
 
@@ -556,7 +560,9 @@ class Gossiper:
         except (EnvelopeError, ValidationError) as exc:
             logger.warning(
                 "gossip.satisfy_wanted failed node_id=%s peer=%s error=%s",
-                self._node_id, peer.node_id, exc
+                self._node_id,
+                peer.node_id,
+                exc,
             )
 
     async def _merge_delta(self, delta: Envelope, peer_node_id: str) -> None:
@@ -569,4 +575,6 @@ class Gossiper:
                 members.append(member)
             await self._topologymgr.merge_registry(members)
         except (EnvelopeError, ValidationError) as exc:
-            logger.warning("Failed to merge delta from peer node_id=%s error=%s", peer_node_id, exc)
+            logger.warning(
+                "Failed to merge delta from peer node_id=%s error=%s", peer_node_id, exc
+            )

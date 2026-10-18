@@ -24,4 +24,3 @@ Feature: tourctl node commands
     When I run the tourctl node join command against peer endpoint
     Then the node join command exits with zero code
     And the node join output confirms the operation was triggered
-

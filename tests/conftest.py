@@ -48,4 +48,3 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def mtls_contexts(tmp_path: Path) -> tuple[ssl.SSLContext, ssl.SSLContext]:
     """Shared mTLS contexts for transport tests."""
     return create_mtls_contexts(tmp_path)
-

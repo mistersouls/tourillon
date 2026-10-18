@@ -106,5 +106,3 @@ async def test_scan_decorator_with_async_function() -> None:
     result = await async_func(5)
     assert result == 15
     assert len(scan_calls) == 1
-
-

@@ -19,7 +19,6 @@ from tourillon.bootstrap.handlers import gossip
 from tourillon.core.models.gossip import (
     GossipDelta,
     GossipDigest,
-    GossipPing,
     GossipPong,
     GossipPush,
     GossipPushAccept,
@@ -86,7 +85,9 @@ class _ManagerStub:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_gossip_push_handler_decodes_member_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_gossip_push_handler_decodes_member_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     spy = _GossipSpy()
     manager = _ManagerStub(spy)
     monkeypatch.setattr(gossip, "get_manager", lambda: manager)
@@ -119,7 +120,9 @@ async def test_gossip_push_handler_decodes_member_payload(monkeypatch: pytest.Mo
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_gossip_ping_handler_returns_pong(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_gossip_ping_handler_returns_pong(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     spy = _GossipSpy()
     manager = _ManagerStub(spy)
     monkeypatch.setattr(gossip, "get_manager", lambda: manager)
@@ -145,7 +148,9 @@ async def test_gossip_ping_handler_returns_pong(monkeypatch: pytest.MonkeyPatch)
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_gossip_digest_handler_streams_all_delta_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_gossip_digest_handler_streams_all_delta_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     spy = _GossipSpy()
     manager = _ManagerStub(spy)
     monkeypatch.setattr(gossip, "get_manager", lambda: manager)
@@ -175,7 +180,9 @@ async def test_gossip_digest_handler_streams_all_delta_pages(monkeypatch: pytest
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_gossip_digest_handler_rejects_invalid_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_gossip_digest_handler_rejects_invalid_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     spy = _GossipSpy()
     manager = _ManagerStub(spy)
     monkeypatch.setattr(gossip, "get_manager", lambda: manager)
@@ -205,13 +212,17 @@ def test_gossip_push_from_document_rejects_non_list_members() -> None:
 @pytest.mark.tourillon
 def test_gossip_push_from_document_rejects_non_mapping_member() -> None:
     with pytest.raises(ValidationError, match=r"members\[0\] must be a table"):
-        GossipPush.from_document({"sender": "node-a", "hop_limit": 1, "members": ["not-a-dict"]})
+        GossipPush.from_document(
+            {"sender": "node-a", "hop_limit": 1, "members": ["not-a-dict"]}
+        )
 
 
 @pytest.mark.tourillon
 def test_gossip_push_as_int_rejects_non_integer() -> None:
     with pytest.raises(ValidationError, match="hop_limit must be an integer"):
-        GossipPush.from_document({"sender": "node-a", "hop_limit": "one", "members": []})
+        GossipPush.from_document(
+            {"sender": "node-a", "hop_limit": "one", "members": []}
+        )
 
 
 @pytest.mark.tourillon
@@ -224,7 +235,12 @@ def test_gossip_push_as_int_rejects_below_min_value() -> None:
 def test_gossip_digest_from_document_rejects_non_list_digest() -> None:
     with pytest.raises(ValidationError, match="digest must be a list"):
         GossipDigest.from_document(
-            {"sender": "node-a", "has_more": False, "after_node_id": "", "digest": "bad"}
+            {
+                "sender": "node-a",
+                "has_more": False,
+                "after_node_id": "",
+                "digest": "bad",
+            }
         )
 
 
@@ -248,5 +264,10 @@ def test_gossip_digest_as_bool_rejects_non_bool() -> None:
 def test_gossip_digest_parse_node_digest_rejects_non_mapping() -> None:
     with pytest.raises(ValidationError, match=r"digest\[0\] must be a table"):
         GossipDigest.from_document(
-            {"sender": "node-a", "has_more": False, "after_node_id": "", "digest": ["not-a-dict"]}
+            {
+                "sender": "node-a",
+                "has_more": False,
+                "after_node_id": "",
+                "digest": ["not-a-dict"],
+            }
         )

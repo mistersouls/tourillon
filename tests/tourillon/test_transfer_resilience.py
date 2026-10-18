@@ -85,7 +85,11 @@ def _dataset() -> tuple[list[Record], list[Record]]:
         Tag(kind=TagKind.TOMBSTONE),
         Tag.hint(Tag(kind=TagKind.LIVE), "node-c"),
     ]
-    transferable = [_record(pid, idx, tags[(pid + idx) % 3]) for pid in range(16) for idx in range(6)]
+    transferable = [
+        _record(pid, idx, tags[(pid + idx) % 3])
+        for pid in range(16)
+        for idx in range(6)
+    ]
     left_behind = [
         _record(3, 99, Tag.staging(Tag(kind=TagKind.LIVE), "node-z")),
         _record(9, 99, Tag(kind=TagKind.STALE)),
@@ -100,7 +104,9 @@ def _storage(tmp_path: Path, name: str) -> Storage:
 
 async def _seed(storage: Storage, records: list[Record]) -> None:
     for record in records:
-        provider = await storage.session_provider_for(PARTITIONER.group_for(record.key.pid.value))
+        provider = await storage.session_provider_for(
+            PARTITIONER.group_for(record.key.pid.value)
+        )
         await PartitionGroupStore(provider).put(record)
 
 
@@ -120,16 +126,22 @@ async def _staged_keys(storage: Storage) -> dict[int, Key]:
     staged: dict[int, Key] = {}
     for group in range(PARTITIONER.total_groups):
         provider = await storage.session_provider_for(group)
-        staging = PartitionGroupStaging(RANGE.src, provider, PARTITIONER, segment=RANGE.segment)
+        staging = PartitionGroupStaging(
+            RANGE.src, provider, PARTITIONER, segment=RANGE.segment
+        )
         staged.update(await staging.last_keys())
     return staged
 
 
 async def _assert_transferred(storage: Storage, records: list[Record]) -> None:
-    assert await _tags(storage) == {record.key.to_bytes(Keyspace.TAGS): record.tag for record in records}
+    assert await _tags(storage) == {
+        record.key.to_bytes(Keyspace.TAGS): record.tag for record in records
+    }
     assert await _staged_keys(storage) == {}
     for record in records:
-        provider = await storage.session_provider_for(PARTITIONER.group_for(record.key.pid.value))
+        provider = await storage.session_provider_for(
+            PARTITIONER.group_for(record.key.pid.value)
+        )
         address = PartitionAddress(pid=record.key.pid, address=record.key.address)
         assert await PartitionGroupStore(provider).get(address) == record
 
@@ -150,14 +162,18 @@ def _service(storage: Storage, **kwargs) -> TransferService:
     )
 
 
-def _applicator(pool: _FakePeerPool, storage: Storage, max_retries: int = 0, **kwargs) -> TransferApplicator:
+def _applicator(
+    pool: _FakePeerPool, storage: Storage, max_retries: int = 0, **kwargs
+) -> TransferApplicator:
     return TransferApplicator(
         node_id=RANGE.dst,
         peer_pool=pool,  # type: ignore[arg-type]
         storage=storage,
         serializer=SERIALIZER,
         partitioner=PARTITIONER,
-        backoff=BackoffRetry(initial_delay=0.0, max_delay=0.0, max_retries=max_retries, jitter=0.0),
+        backoff=BackoffRetry(
+            initial_delay=0.0, max_delay=0.0, max_retries=max_retries, jitter=0.0
+        ),
         **kwargs,
     )
 
@@ -198,8 +214,12 @@ async def test_join_over_lmdb_survives_resets_a_crash_and_a_restart(
         assert client.claims[2].resumes == staged
         assert len(client.claims) > 3
         before_crash = _decode(dest, client.served[0])
-        after_restart = _decode(dest, [chunk for served in client.served[2:] for chunk in served])
-        assert before_crash + after_restart == transferable  # nothing lost, nothing sent twice
+        after_restart = _decode(
+            dest, [chunk for served in client.served[2:] for chunk in served]
+        )
+        assert (
+            before_crash + after_restart == transferable
+        )  # nothing lost, nothing sent twice
         await _assert_transferred(dest, transferable)
     finally:
         await source.close()
@@ -237,13 +257,17 @@ async def test_commit_interrupted_by_a_crash_is_completed_without_hiding_active_
         await _seed(source, transferable)
         client = _LoopbackClient(_service(source), monkeypatch)
 
-        handle = await _run(_applicator(_FakePeerPool({RANGE.src: client}), dest, max_retries=1))
+        handle = await _run(
+            _applicator(_FakePeerPool({RANGE.src: client}), dest, max_retries=1)
+        )
 
         assert handle.state is TransferState.COMPLETED
         assert handle.attempts == 2
         assert handle.last_error == "disk unavailable"
         assert client.claims[1].resumes  # the staged remainder is resumed...
-        assert writes_after_crash and sum(writes_after_crash) == 0  # ...activated data is not re-staged
+        assert (
+            writes_after_crash and sum(writes_after_crash) == 0
+        )  # ...activated data is not re-staged
         await _assert_transferred(dest, transferable)
     finally:
         await source.close()
@@ -260,7 +284,9 @@ async def test_pull_over_a_real_connection_resumes_after_the_link_drops(
     server_ssl, client_ssl = mtls_contexts
     transferable, left_behind = _dataset()
     source, dest = _storage(tmp_path, "source"), _storage(tmp_path, "dest")
-    manager = SimpleNamespace(serializer=SERIALIZER, transfer=_service(source, max_chunk_size=512))
+    manager = SimpleNamespace(
+        serializer=SERIALIZER, transfer=_service(source, max_chunk_size=512)
+    )
     monkeypatch.setattr(transfer_handlers, "get_manager", lambda: manager)
     claims: list[Envelope] = []
     peers: dict[str, EnvelopeClient] = {}
@@ -270,7 +296,9 @@ async def test_pull_over_a_real_connection_resumes_after_the_link_drops(
         sent = 0
         async for response in transfer_handlers.claim(request):
             if len(claims) == 1 and sent == 3:
-                await peers[RANGE.src].close()  # the link drops in the middle of the stream
+                await peers[
+                    RANGE.src
+                ].close()  # the link drops in the middle of the stream
                 return
             sent += 1
             yield response
@@ -293,4 +321,3 @@ async def test_pull_over_a_real_connection_resumes_after_the_link_drops(
         await server.stop()
         await source.close()
         await dest.close()
-

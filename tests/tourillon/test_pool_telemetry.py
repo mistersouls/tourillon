@@ -120,7 +120,9 @@ def _as_topologymgr(stub: _TopologyManagerStub) -> TopologyManager:
 # ---------------------------------------------------------------------------
 
 
-def _label_key(attributes: Mapping[str, AttributeValue] | None = None) -> tuple[tuple[str, AttributeValue], ...]:
+def _label_key(
+    attributes: Mapping[str, AttributeValue] | None = None,
+) -> tuple[tuple[str, AttributeValue], ...]:
     if not attributes:
         return ()
     return tuple(sorted(attributes.items()))
@@ -146,9 +148,16 @@ class _BoundGauge(BoundGauge):
 
 class _CounterRecorder(CounterMetric):
     def __init__(self) -> None:
-        self.values: dict[tuple[tuple[str, AttributeValue], ...], float] = defaultdict(float)
+        self.values: dict[tuple[tuple[str, AttributeValue], ...], float] = defaultdict(
+            float
+        )
 
-    def add(self, amount: int | float = 1, *, attributes: Mapping[str, AttributeValue] | None = None) -> None:
+    def add(
+        self,
+        amount: int | float = 1,
+        *,
+        attributes: Mapping[str, AttributeValue] | None = None,
+    ) -> None:
         self.values[_label_key(attributes)] += float(amount)
 
     def labels(self, **labels: AttributeValue) -> BoundCounter:
@@ -159,7 +168,12 @@ class _GaugeRecorder(GaugeMetric):
     def __init__(self) -> None:
         self.values: dict[tuple[tuple[str, AttributeValue], ...], float] = {}
 
-    def set(self, value: int | float, *, attributes: Mapping[str, AttributeValue] | None = None) -> None:
+    def set(
+        self,
+        value: int | float,
+        *,
+        attributes: Mapping[str, AttributeValue] | None = None,
+    ) -> None:
         self.values[_label_key(attributes)] = float(value)
 
     def labels(self, **labels: AttributeValue) -> BoundGauge:
@@ -183,7 +197,12 @@ class _SpanRecorder(Span):
 
 
 class _SpanCtx(AbstractContextManager[Span]):
-    def __init__(self, store: list[tuple[str, dict[str, AttributeValue]]], name: str, attributes: Attributes | None) -> None:
+    def __init__(
+        self,
+        store: list[tuple[str, dict[str, AttributeValue]]],
+        name: str,
+        attributes: Attributes | None,
+    ) -> None:
         self._store = store
         self._name = name
         self._attributes = dict(attributes or {})
@@ -309,7 +328,12 @@ async def test_pool_telemetry_records_new_permanent_connection(
     topologymgr: _TopologyManagerStub,
 ) -> None:
     telemetry = _TelemetryRecorder()
-    pool = PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, telemetry=telemetry)
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        telemetry=telemetry,
+    )
 
     await pool.acquire("peer-a")
 
@@ -326,7 +350,14 @@ async def test_pool_telemetry_records_new_overflow_connection(
     topologymgr: _TopologyManagerStub,
 ) -> None:
     telemetry = _TelemetryRecorder()
-    pool = PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, max_size=1, max_overflow=1, telemetry=telemetry)
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        max_size=1,
+        max_overflow=1,
+        telemetry=telemetry,
+    )
 
     await pool.acquire("peer-a")
     await pool.acquire("peer-b")
@@ -344,7 +375,14 @@ async def test_pool_telemetry_records_lru_eviction(
     topologymgr: _TopologyManagerStub,
 ) -> None:
     telemetry = _TelemetryRecorder()
-    pool = PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, max_size=1, max_overflow=0, telemetry=telemetry)
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        max_size=1,
+        max_overflow=0,
+        telemetry=telemetry,
+    )
 
     await pool.acquire("peer-a")
     await pool.acquire("peer-b")
@@ -361,7 +399,14 @@ async def test_pool_telemetry_records_overflow_release_eviction(
     topologymgr: _TopologyManagerStub,
 ) -> None:
     telemetry = _TelemetryRecorder()
-    pool = PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, max_size=1, max_overflow=1, telemetry=telemetry)
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        max_size=1,
+        max_overflow=1,
+        telemetry=telemetry,
+    )
 
     await pool.acquire("peer-a")
     await pool.acquire("peer-b")
@@ -380,7 +425,14 @@ async def test_pool_telemetry_records_idle_expired_eviction(
     topologymgr: _TopologyManagerStub,
 ) -> None:
     telemetry = _TelemetryRecorder()
-    pool = PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, min_size=0, idle_ttl=0.01, telemetry=telemetry)
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        min_size=0,
+        idle_ttl=0.01,
+        telemetry=telemetry,
+    )
 
     await pool.acquire("peer-a")
     await pool.release("peer-a")
@@ -437,7 +489,13 @@ async def test_pool_telemetry_records_acquire_error_on_timeout(
     topologymgr: _TopologyManagerStub,
 ) -> None:
     telemetry = _TelemetryRecorder()
-    pool = PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, connection_timeout=0.01, telemetry=telemetry)
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        connection_timeout=0.01,
+        telemetry=telemetry,
+    )
 
     def slow_client(
         bind: str,
@@ -466,7 +524,12 @@ async def test_pool_telemetry_records_refresh_eviction_and_new_connection(
     topologymgr: _TopologyManagerStub,
 ) -> None:
     telemetry = _TelemetryRecorder()
-    pool = PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, telemetry=telemetry)
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        telemetry=telemetry,
+    )
 
     await pool.acquire("peer-a")
     topologymgr.binds["peer-a"] = "127.0.0.1:5000"
@@ -486,7 +549,14 @@ async def test_pool_telemetry_records_pool_close_evictions(
     topologymgr: _TopologyManagerStub,
 ) -> None:
     telemetry = _TelemetryRecorder()
-    pool = PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, max_size=2, max_overflow=1, telemetry=telemetry)
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        max_size=2,
+        max_overflow=1,
+        telemetry=telemetry,
+    )
 
     await pool.acquire("peer-a")
     await pool.acquire("peer-b")
@@ -514,7 +584,12 @@ async def test_pool_telemetry_acquire_emits_span(
     topologymgr: _TopologyManagerStub,
 ) -> None:
     telemetry = _TelemetryRecorder()
-    pool = PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, telemetry=telemetry)
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        telemetry=telemetry,
+    )
 
     await pool.acquire("peer-a")
 
@@ -535,7 +610,13 @@ async def test_pool_telemetry_acquire_span_records_error_on_timeout(
     topologymgr: _TopologyManagerStub,
 ) -> None:
     telemetry = _TelemetryRecorder()
-    pool = PeerPool(tls_ctx=tls_ctx, topologymgr=_as_topologymgr(topologymgr), fd_provider=fd_provider, connection_timeout=0.01, telemetry=telemetry)
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        connection_timeout=0.01,
+        telemetry=telemetry,
+    )
 
     def slow_client(
         bind: str,
@@ -555,6 +636,3 @@ async def test_pool_telemetry_acquire_span_records_error_on_timeout(
     # The span should have been opened (name recorded)
     span_names = [name for name, _ in telemetry.spans]
     assert "pool.acquire" in span_names
-
-
-

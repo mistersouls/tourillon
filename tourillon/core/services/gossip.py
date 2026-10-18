@@ -49,14 +49,14 @@ class GossipService:
                 ignored += 1
 
         return GossipPushAccept(
-            sender=self._node_id,
-            accepted=accepted,
-            ignored=ignored
+            sender=self._node_id, accepted=accepted, ignored=ignored
         )
 
     async def delta(self, request: GossipDigest) -> AsyncIterator[GossipDelta]:
         topology = await self._topologymgr.snapshot()
-        remote_epochs: dict[str, int] = {item.node_id: item.epoch for item in request.digest}
+        remote_epochs: dict[str, int] = {
+            item.node_id: item.epoch for item in request.digest
+        }
         delta_members: list[Member] = []
         local_node_ids: set[str] = set()
 
@@ -95,7 +95,7 @@ class GossipService:
                 members=members,
                 has_more=has_more,
                 after_node_id=after_node_id,
-                wanted=wanted
+                wanted=wanted,
             )
 
             if not has_more:
@@ -112,4 +112,3 @@ class GossipService:
             sender=self._node_id,
             same=same,
         )
-

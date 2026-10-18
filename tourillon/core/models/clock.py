@@ -27,6 +27,7 @@ class HLCClock:
     guarantee that the returned timestamp is strictly greater than any
     previously returned timestamp.
     """
+
     def __init__(self, node_id: str) -> None:
         validate_node_id_size(node_id)
         self.node_id = node_id

@@ -91,7 +91,7 @@ class NodeLifecycle:
             topologymgr=topologymgr,
             peer_pool=self._peer_pool,
             serializer=serializer,
-            telemetry=telemetry
+            telemetry=telemetry,
         )
         self._transfer_runner = TransferRunner(
             node_id=config.node.id,
@@ -99,7 +99,7 @@ class NodeLifecycle:
             partitioner=partitioner,
             peer_pool=peer_pool,
             serializer=serializer,
-            storage=storage
+            storage=storage,
         )
 
         self._state_file = Path(self._config.storage.data_dir) / NODE_STATE_FILENAME
@@ -157,15 +157,19 @@ class NodeLifecycle:
             state = await self._load_state()
             effective_seeds = seeds or state.seeds or self._config.node.seeds or []
             if not effective_seeds:
-                logger.error("No seed peers provided for join operation, 'seeds' are required")
-                raise JoinError("No seed peers provided for join operation, 'seeds' are required.")
+                logger.error(
+                    "No seed peers provided for join operation, 'seeds' are required"
+                )
+                raise JoinError(
+                    "No seed peers provided for join operation, 'seeds' are required."
+                )
 
             logger.debug("Reloading node state from '%s'", self._state_file)
             joining_state = await self._transition_to(
                 state,
                 MemberPhase.JOINING,
                 with_tokens=True,
-                with_seeds=list(effective_seeds)
+                with_seeds=list(effective_seeds),
             )
             self._log_tokens(joining_state)
             logger.info("Triggering join operation for node '%s'", self._config.node.id)
@@ -178,10 +182,7 @@ class NodeLifecycle:
 
     def _generate_tokens(self) -> tuple[str, ...]:
         count = self._config.node.size.to_value()
-        return tuple(
-            hex(token)
-            for token in self._partitioner.space.position(count)
-        )
+        return tuple(hex(token) for token in self._partitioner.space.position(count))
 
     async def _load_state(self) -> NodeState:
         raw_state = await self._persistence.load(self._state_file)
@@ -229,13 +230,13 @@ class NodeLifecycle:
             if failed:
                 logger.error(
                     "Data transfer failed for %d partitions; node will transition to FAILED",
-                    len(failed)
+                    len(failed),
                 )
                 final = await self._transition_to(state, MemberPhase.FAILED)
             else:
                 logger.info(
                     "Data transfer completed successfully for %d partitions",
-                    len(success)
+                    len(success),
                 )
                 final = await self._transition_to(state, MemberPhase.READY)
                 await self._start_client()
@@ -261,7 +262,9 @@ class NodeLifecycle:
         topology = await self._topologymgr.snapshot()
         current_ring = topology.ring
         transfer = asyncio.create_task(
-            self._transfer_runner.run(current_ring, current_ring.add_vnodes(member.vnodes)),
+            self._transfer_runner.run(
+                current_ring, current_ring.add_vnodes(member.vnodes)
+            ),
             name="transfer-run",
         )
         ring_change: asyncio.Task[Ring] | None = None
@@ -272,15 +275,21 @@ class NodeLifecycle:
                     name="wait-for-ring-change",
                 )
                 ring_change = next_ring_change
-                await asyncio.wait((transfer, next_ring_change), return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait(
+                    (transfer, next_ring_change), return_when=asyncio.FIRST_COMPLETED
+                )
                 if not ring_change.done():
                     return transfer.result()
 
                 current_ring = ring_change.result()
                 logger.info("Ring changed during join; updating transfer plan")
-                await self._transfer_runner.apply(current_ring, current_ring.add_vnodes(member.vnodes))
+                await self._transfer_runner.apply(
+                    current_ring, current_ring.add_vnodes(member.vnodes)
+                )
                 if transfer.done():
-                    transfer = asyncio.create_task(self._transfer_runner.wait(), name="transfer-wait")
+                    transfer = asyncio.create_task(
+                        self._transfer_runner.wait(), name="transfer-wait"
+                    )
         finally:
             if ring_change is not None:
                 ring_change.cancel()
@@ -294,7 +303,7 @@ class NodeLifecycle:
             peer_address=self._config.server_peer.advertise,
             epoch=state.epoch,
             phase=state.phase,
-            tokens=state.tokens
+            tokens=state.tokens,
         )
         await self._topologymgr.apply_member(member)
         await self._gossiper.announce(member)
@@ -311,7 +320,9 @@ class NodeLifecycle:
         await self._start_client()
         await self._hint_replayer.start()
 
-    async def _startup_idle(self, state: NodeState, seeds: list[str] | None = None) -> None:
+    async def _startup_idle(
+        self, state: NodeState, seeds: list[str] | None = None
+    ) -> None:
         await self._start_peer()
         effective_seeds = seeds or self._config.node.seeds
         if effective_seeds:
@@ -327,27 +338,31 @@ class NodeLifecycle:
         self._log_tokens(ready_state)
         await self._start_ready(ready_state)
 
-    async def _startup_joining(self, state: NodeState, seeds: list[str] | None = None) -> None:
+    async def _startup_joining(
+        self, state: NodeState, seeds: list[str] | None = None
+    ) -> None:
         await self._start_peer()
         self._log_tokens(state)
 
         if seeds:
             async with self._persistence.edit(self._state_file) as document:
-                node =document.setdefault("node", {})
+                node = document.setdefault("node", {})
                 node["seeds"] = seeds
-                state =NodeState.from_document(document)
+                state = NodeState.from_document(document)
 
         async with self._join_lock:
             await self._perform_join(state)
 
-    async def _startup_ready(self, state: NodeState, seeds: list[str] | None = None) -> None:
+    async def _startup_ready(
+        self, state: NodeState, seeds: list[str] | None = None
+    ) -> None:
         await self._start_peer()
 
         if seeds:
             async with self._persistence.edit(self._state_file) as document:
-                node =document.setdefault("node", {})
+                node = document.setdefault("node", {})
                 node["seeds"] = seeds
-                state =NodeState.from_document(document)
+                state = NodeState.from_document(document)
 
         await self._start_ready(state)
 
@@ -445,7 +460,7 @@ class NodeLifecycle:
         new_phase: MemberPhase,
         *,
         with_tokens: bool = False,
-        with_seeds: list[str] | None = None
+        with_seeds: list[str] | None = None,
     ) -> NodeState:
         logger.info("Transitioning node phase to '%s'", new_phase.value)
 
@@ -461,5 +476,9 @@ class NodeLifecycle:
                 node["seeds"] = with_seeds
 
             document["node"] = node
-            logger.debug("Persisted node phase transition to '%s' in '%s'", new_phase.value, self._state_file)
+            logger.debug(
+                "Persisted node phase transition to '%s' in '%s'",
+                new_phase.value,
+                self._state_file,
+            )
             return NodeState.from_document(document)

@@ -23,13 +23,15 @@ from uuid import UUID
 
 from tourlib.constant import (
     ENVELOPE_HEADER_LEN as _ENVELOPE_HEADER_LEN,
-    PROTOCOL_VERSION,
 )
 from tourlib.constant import (
     MAX_ENVELOPE_PAYLOAD as _MAX_PAYLOAD,
 )
 from tourlib.constant import (
     MAX_KIND_LEN as _MAX_KIND_LEN,
+)
+from tourlib.constant import (
+    PROTOCOL_VERSION,
 )
 from tourlib.exceptions import ProtocolError
 
@@ -60,7 +62,9 @@ class Envelope:
     MODE_FNF: ClassVar[int] = 1
 
     HEADER_STRUCT: ClassVar[struct.Struct] = struct.Struct(">B H B 16s I B 7s")
-    KIND_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$")
+    KIND_PATTERN: ClassVar[re.Pattern[str]] = re.compile(
+        r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$"
+    )
 
     def __post_init__(self) -> None:
         self._validate()
@@ -212,11 +216,7 @@ async def read_envelope(
     return Envelope.from_bytes(header + body)
 
 
-def replay_envelope(
-    kind: str,
-    request: Envelope,
-    payload: bytes
-) -> Envelope:
+def replay_envelope(kind: str, request: Envelope, payload: bytes) -> Envelope:
     return Envelope(
         proto_version=request.proto_version,
         schema_id=request.schema_id,

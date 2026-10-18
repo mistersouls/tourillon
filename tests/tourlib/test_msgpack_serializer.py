@@ -58,5 +58,3 @@ def test_msgpack_serializer_encode_rejects_unserializable_object() -> None:
 
     with pytest.raises(ValueError, match="encode document with msgpack"):
         serializer.encode(Unserializable())
-
-

@@ -39,12 +39,12 @@ class ServiceRegistration:
 SERVICE_REGISTRY: dict[str, ServiceRegistration] = {
     "probe": ServiceRegistration(
         name="probe",
-        supported_endpoints=frozenset(["client", "peer"]), # type: ignore[arg-type]
+        supported_endpoints=frozenset(["client", "peer"]),  # type: ignore[arg-type]
         factory=ProbeService,
     ),
     "inspect": ServiceRegistration(
         name="inspect",
-        supported_endpoints=frozenset(["peer"]), # type: ignore[arg-type]
+        supported_endpoints=frozenset(["peer"]),  # type: ignore[arg-type]
         factory=InspectService,
     ),
     "node": ServiceRegistration(
@@ -56,7 +56,7 @@ SERVICE_REGISTRY: dict[str, ServiceRegistration] = {
         name="kv",
         supported_endpoints=frozenset(["client", "peer"]),  # type: ignore[arg-type]
         factory=KvService,
-    )
+    ),
 }
 
 
@@ -134,4 +134,3 @@ def validate_service_endpoint(
             f"Service '{service}' is not available on endpoint '{endpoint}'. "
             f"Supported endpoints: {supported}"
         )
-

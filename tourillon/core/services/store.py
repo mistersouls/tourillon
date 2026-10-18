@@ -134,7 +134,9 @@ class StoreService:
             address=addr,
         )
         targets = self._replication_targets(preflist.preferences)
-        answers, errors = await self._collect_reads(targets, p_address, request.quorum_read)
+        answers, errors = await self._collect_reads(
+            targets, p_address, request.quorum_read
+        )
         records = list(answers.values())
         if not records and errors:
             raise self._replication_error("read", errors)
@@ -155,15 +157,27 @@ class StoreService:
         addr = Address(key=request.key, namespace=request.namespace)
         preflist = await self._placement_strategy.preference_list(addr)
         record = self._write_record(
-            addr, request.value, preflist.placement.partition.pid, False, request.quorum_write
+            addr,
+            request.value,
+            preflist.placement.partition.pid,
+            False,
+            request.quorum_write,
         )
-        records, errors = await self._replicate_write(record, preflist.preferences, request.quorum_write)
+        records, errors = await self._replicate_write(
+            record, preflist.preferences, request.quorum_write
+        )
         if not records and errors:
             raise self._replication_error("write", errors)
-        version, version_count = self._select_version(self._versions_from_records(records))
+        version, version_count = self._select_version(
+            self._versions_from_records(records)
+        )
         if request.quorum_write is not None:
             self._ensure_quorum(
-                version_count, request.quorum_write, "write", errors, encode_token(record.key)
+                version_count,
+                request.quorum_write,
+                "write",
+                errors,
+                encode_token(record.key),
             )
         return version
 
@@ -174,13 +188,21 @@ class StoreService:
         record = self._write_record(
             addr, b"", preflist.placement.partition.pid, True, request.quorum_write
         )
-        records, errors = await self._replicate_write(record, preflist.preferences, request.quorum_write)
+        records, errors = await self._replicate_write(
+            record, preflist.preferences, request.quorum_write
+        )
         if not records and errors:
             raise self._replication_error("write", errors)
-        version, version_count = self._select_version(self._versions_from_records(records))
+        version, version_count = self._select_version(
+            self._versions_from_records(records)
+        )
         if request.quorum_write is not None:
             self._ensure_quorum(
-                version_count, request.quorum_write, "write", errors, encode_token(record.key)
+                version_count,
+                request.quorum_write,
+                "write",
+                errors,
+                encode_token(record.key),
             )
         return version
 
@@ -276,7 +298,9 @@ class StoreService:
         """Let the client decide again whether the durability reached is enough."""
         if request.quorum_write is None:
             return
-        StoreService._ensure_quorum(durable, request.quorum_write, "repair", errors, token)
+        StoreService._ensure_quorum(
+            durable, request.quorum_write, "repair", errors, token
+        )
 
     def _repair_key(self, token: str) -> Key:
         """Decode and vet a handle before it costs a single RPC.
@@ -303,7 +327,10 @@ class StoreService:
                 f"partition id {key.pid.value} does not match address (expected {expected})"
             )
 
-        horizon = max(int(time.time() * 1000), self._clock.snapshot().wall_ms) + MAX_CLOCK_SKEW_MS
+        horizon = (
+            max(int(time.time() * 1000), self._clock.snapshot().wall_ms)
+            + MAX_CLOCK_SKEW_MS
+        )
         if key.ts.wall_ms > horizon:
             # No clock here could have emitted it, so no write here produced it.
             self._stats.repairs_rejected += 1
@@ -387,11 +414,15 @@ class StoreService:
         if hinted is None:
             return None
         try:
-            return Record(key=hinted.key, value=hinted.value, tag=Tag.unhint(hinted.tag))
+            return Record(
+                key=hinted.key, value=hinted.value, tag=Tag.unhint(hinted.tag)
+            )
         except ValueError:
             return None
 
-    async def _read_at_from_target(self, target_node_id: str, key: Key) -> Record | None:
+    async def _read_at_from_target(
+        self, target_node_id: str, key: Key
+    ) -> Record | None:
         if target_node_id == self._node_id:
             return await self._local_read_at(key)
         return await self._remote_read_at(target_node_id, key)
@@ -434,7 +465,9 @@ class StoreService:
         def quorum_met() -> bool:
             if quorum is None:
                 return False
-            _, version_count = self._select_version(self._versions_from_records(applied))
+            _, version_count = self._select_version(
+                self._versions_from_records(applied)
+            )
             return version_count >= quorum
 
         unanswered = await self._drain_parallel_tasks(
@@ -478,11 +511,15 @@ class StoreService:
                 return False
             return len(records) >= quorum
 
-        unanswered = await self._drain_parallel_tasks(tasks, collect, quorum_met if quorum is not None else None)
+        unanswered = await self._drain_parallel_tasks(
+            tasks, collect, quorum_met if quorum is not None else None
+        )
         errors.extend(self._unanswered(unanswered))
         return records, errors
 
-    async def _read_from_target(self, target_node_id: str, addr: PartitionAddress) -> Record | None:
+    async def _read_from_target(
+        self, target_node_id: str, addr: PartitionAddress
+    ) -> Record | None:
         if target_node_id == self._node_id:
             return await self._local_read(addr)
         return await self._remote_read(target_node_id, addr)
@@ -512,7 +549,10 @@ class StoreService:
         targets = self._repair_targets(answers, preferences, record)
         if not targets:
             return
-        if self._read_repair.sample_rate < 1.0 and random.random() >= self._read_repair.sample_rate:
+        if (
+            self._read_repair.sample_rate < 1.0
+            and random.random() >= self._read_repair.sample_rate
+        ):
             # The valve: when a node comes back from a long outage, repairing
             # on every read is exactly when the cluster can least afford it.
             self._stats.read_repairs_skipped += len(targets)
@@ -521,7 +561,9 @@ class StoreService:
             self._start_repair(node_id, record)
 
     @staticmethod
-    def _winning_record(records: Iterable[Record | None], winner: Version) -> Record | None:
+    def _winning_record(
+        records: Iterable[Record | None], winner: Version
+    ) -> Record | None:
         """Return the record the elected version came from, never a hinted one.
 
         A hint is data owed to another node. Replaying it as a plain write
@@ -548,7 +590,9 @@ class StoreService:
         and are covered by hints rather than by repair.
         """
         owners = {
-            entry.node_id for entry in preferences if entry.handoff is None and entry.readable
+            entry.node_id
+            for entry in preferences
+            if entry.handoff is None and entry.readable
         }
         targets = [
             node_id
@@ -596,7 +640,9 @@ class StoreService:
         hinted_node_id: str | None,
     ) -> Record:
         if hinted_node_id is not None:
-            return await self._apply_write(target_node_id, self._hint_record(record, hinted_node_id))
+            return await self._apply_write(
+                target_node_id, self._hint_record(record, hinted_node_id)
+            )
         try:
             return await self._apply_write(target_node_id, record)
         except Exception:
@@ -634,13 +680,17 @@ class StoreService:
             )
 
     async def _remote_read(self, node_id: str, addr: PartitionAddress) -> Record | None:
-        payload = await self._remote_request("replication.read", node_id, {"addr": addr.to_dict()})
+        payload = await self._remote_request(
+            "replication.read", node_id, {"addr": addr.to_dict()}
+        )
         if payload is None:
             return None
         return Record.from_dict(payload)
 
     async def _remote_write(self, node_id: str, record: Record) -> Record:
-        payload = await self._remote_request("replication.write", node_id, {"record": record.to_dict()})
+        payload = await self._remote_request(
+            "replication.write", node_id, {"record": record.to_dict()}
+        )
         return Record.from_dict(payload)
 
     async def _remote_read_at(self, node_id: str, key: Key) -> Record | None:
@@ -651,7 +701,9 @@ class StoreService:
             return None
         return Record.from_dict(payload)
 
-    async def _remote_request(self, kind: str, node_id: str, payload: dict[str, Any]) -> Any:
+    async def _remote_request(
+        self, kind: str, node_id: str, payload: dict[str, Any]
+    ) -> Any:
         client = await self._peer_pool.acquire(node_id)
         try:
             envelope = build_envelope(
@@ -668,7 +720,6 @@ class StoreService:
             raise RuntimeError(f"invalid response kind for {kind}: {response.kind}")
         return self._serializer.decode(response.payload)
 
-
     @staticmethod
     def _replication_targets(preferences: Sequence[Preference]) -> list[str]:
         targets: list[str] = []
@@ -682,7 +733,9 @@ class StoreService:
         return targets
 
     @staticmethod
-    def _write_targets(preferences: Sequence[Preference]) -> list[tuple[str, str | None]]:
+    def _write_targets(
+        preferences: Sequence[Preference],
+    ) -> list[tuple[str, str | None]]:
         targets: list[tuple[str, str | None]] = []
         for entry in preferences:
             target = StoreService._write_target(entry)
@@ -715,7 +768,6 @@ class StoreService:
         message: str | None = None,
     ) -> StoreOperationError:
         return StoreOperationError(operation=operation, errors=errors, message=message)
-
 
     async def _local_read(self, addr: PartitionAddress) -> Record | None:
         group = self._partitioner.group_for(addr.pid.value)
@@ -763,7 +815,9 @@ class StoreService:
         pending = set(tasks)
         try:
             if pending:
-                done, pending = await asyncio.wait(pending, timeout=self._response_delay)
+                done, pending = await asyncio.wait(
+                    pending, timeout=self._response_delay
+                )
                 collect(done)
 
             loop = asyncio.get_running_loop()
@@ -840,7 +894,11 @@ class StoreService:
     def _validate_quorum(operation: str, quorum: int | None) -> None:
         if quorum is None:
             return
-        if not isinstance(quorum, int) or isinstance(quorum, bool) or not 1 <= quorum <= MAX_QUORUM:
+        if (
+            not isinstance(quorum, int)
+            or isinstance(quorum, bool)
+            or not 1 <= quorum <= MAX_QUORUM
+        ):
             raise InvalidQuorumError(operation, quorum)
 
     @staticmethod
@@ -857,13 +915,19 @@ class StoreService:
     def _visible_versions(self, records: Sequence[Record | None]) -> list[Version]:
         versions: list[Version] = []
         for record in records:
-            if record is None or record.tag.kind not in {TagKind.LIVE, TagKind.TOMBSTONE, TagKind.HINT}:
+            if record is None or record.tag.kind not in {
+                TagKind.LIVE,
+                TagKind.TOMBSTONE,
+                TagKind.HINT,
+            }:
                 continue
             versions.append(self._version_from_record(record))
         return versions
 
     @staticmethod
-    def _is_tombstone(version: Version | None, records: Sequence[Record | None]) -> bool:
+    def _is_tombstone(
+        version: Version | None, records: Sequence[Record | None]
+    ) -> bool:
         """Return True when the elected version is a delete, hinted or not."""
         if version is None:
             return False
@@ -901,4 +965,3 @@ class StoreService:
             version.data,
             version.meta.quorum_write,
         )
-

@@ -68,7 +68,9 @@ def probe_command_context(tmp_path: Path) -> dict[str, object]:
             process.wait(timeout=TERMINATION_TIMEOUT_SECONDS)
 
 
-@scenario("features/tourillon_tourctl_probe.feature", "Display help for tourctl probe ping")
+@scenario(
+    "features/tourillon_tourctl_probe.feature", "Display help for tourctl probe ping"
+)
 def test_tourctl_probe_ping_help_e2e() -> None:
     pass
 
@@ -175,7 +177,9 @@ def given_generated_client_config(probe_command_context: dict[str, object]) -> N
 
 
 @given("node and client configs have been generated for a running probe target")
-def given_running_probe_target_configs(probe_command_context: dict[str, object]) -> None:
+def given_running_probe_target_configs(
+    probe_command_context: dict[str, object],
+) -> None:
     output_dir = probe_command_context["output_dir"]
     tourillon_cli = probe_command_context["tourillon_cli"]
     assert isinstance(output_dir, Path)
@@ -355,7 +359,9 @@ def then_probe_fails(probe_command_context: dict[str, object]) -> None:
 
 
 @then("the probe error reports an unreachable node")
-def then_probe_reports_unreachable_node(probe_command_context: dict[str, object]) -> None:
+def then_probe_reports_unreachable_node(
+    probe_command_context: dict[str, object],
+) -> None:
     result = probe_command_context["result"]
     assert isinstance(result, subprocess.CompletedProcess)
     output = f"{result.stdout}\n{result.stderr}".lower()
@@ -376,5 +382,3 @@ def then_probe_output_has_node_id(probe_command_context: dict[str, object]) -> N
     assert isinstance(result, subprocess.CompletedProcess)
     assert isinstance(node_id, str)
     assert f'"node_id": "{node_id}"' in result.stdout
-
-

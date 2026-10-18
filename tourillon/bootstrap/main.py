@@ -29,4 +29,3 @@ app.command(node_app, name="node")
 
 if __name__ == "__main__":
     app()
-

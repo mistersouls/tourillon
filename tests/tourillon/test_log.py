@@ -83,13 +83,16 @@ def test_log_info_supports_transport_scope(caplog: pytest.LogCaptureFixture) -> 
     logger.transport().info("hello transport")
 
     assert any(
-        record.name == "tourillon.transport" and record.getMessage() == "hello transport"
+        record.name == "tourillon.transport"
+        and record.getMessage() == "hello transport"
         for record in caplog.records
     )
 
 
 @pytest.mark.tourillon
-def test_log_info_supports_global_format_arguments(caplog: pytest.LogCaptureFixture) -> None:
+def test_log_info_supports_global_format_arguments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     caplog.set_level(logging.INFO, logger="tourillon.global")
 
     logger.info("hello %s", "world")
@@ -101,7 +104,9 @@ def test_log_info_supports_global_format_arguments(caplog: pytest.LogCaptureFixt
 
 
 @pytest.mark.tourillon
-def test_log_info_supports_scoped_format_arguments(caplog: pytest.LogCaptureFixture) -> None:
+def test_log_info_supports_scoped_format_arguments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     caplog.set_level(logging.INFO, logger="tourillon.transport")
 
     logger.transport().info("hello %s", "wire")
@@ -110,5 +115,3 @@ def test_log_info_supports_scoped_format_arguments(caplog: pytest.LogCaptureFixt
         record.name == "tourillon.transport" and record.getMessage() == "hello wire"
         for record in caplog.records
     )
-
-

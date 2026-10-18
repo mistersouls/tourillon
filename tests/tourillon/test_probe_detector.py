@@ -41,7 +41,12 @@ class _ClientStub:
 
 @pytest.mark.tourillon
 def test_failure_detector_provider_creates_detector() -> None:
-    provider = FailureDetectorProvider(serializer=MsgPackSerializer(), threshold=3.0, probe_interval=1.0, probe_jitter=0.0)
+    provider = FailureDetectorProvider(
+        serializer=MsgPackSerializer(),
+        threshold=3.0,
+        probe_interval=1.0,
+        probe_jitter=0.0,
+    )
 
     detector = provider.create("peer-a")
 
@@ -51,7 +56,9 @@ def test_failure_detector_provider_creates_detector() -> None:
 
 @pytest.mark.tourillon
 def test_failure_detector_status_branches() -> None:
-    detector = PeerFailureDetector(peer_id="peer-a", serializer=MsgPackSerializer(), threshold=3.0)
+    detector = PeerFailureDetector(
+        peer_id="peer-a", serializer=MsgPackSerializer(), threshold=3.0
+    )
 
     detector._active = True
     assert detector.status() == PeerStatus.SUSPECT
@@ -91,14 +98,18 @@ async def test_failure_detector_run_and_stop_manage_probe_task() -> None:
 async def test_failure_detector_probe_raises_without_client() -> None:
     detector = PeerFailureDetector(peer_id="peer-a", serializer=MsgPackSerializer())
 
-    with pytest.raises(RuntimeError, match="Cannot probe peer without an EnvelopeClient"):
+    with pytest.raises(
+        RuntimeError, match="Cannot probe peer without an EnvelopeClient"
+    ):
         await detector._probe_peer()
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
 async def test_failure_detector_probe_records_success_and_exits() -> None:
-    detector = PeerFailureDetector(peer_id="peer-a", serializer=MsgPackSerializer(), probe_interval=0.01)
+    detector = PeerFailureDetector(
+        peer_id="peer-a", serializer=MsgPackSerializer(), probe_interval=0.01
+    )
     detector._active = True
     detector._client = cast(EnvelopeClient, _ClientStub())
 

@@ -14,5 +14,3 @@ Feature: tourillon config ca command
     When I run the tourillon config ca command
     Then the command fails with a file exists error
     And the error message mentions overwrite refusal
-
-

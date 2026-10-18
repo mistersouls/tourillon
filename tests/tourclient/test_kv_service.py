@@ -208,7 +208,12 @@ async def test_kv_service_raises_rejected_error_with_server_details(
                     "operation": "read",
                     "code": "quorum_not_met",
                     "message": "read quorum not met: successes=1, required=2",
-                    "errors": [{"type": "TimeoutError", "message": "no response from node-b within 30.0s"}],
+                    "errors": [
+                        {
+                            "type": "TimeoutError",
+                            "message": "no response from node-b within 30.0s",
+                        }
+                    ],
                     "required": 2,
                     "received": 1,
                 }
@@ -242,5 +247,3 @@ async def test_kv_service_raises_rejected_error_with_server_details(
     assert str(error) == (
         "read quorum not met: successes=1, required=2 (no response from node-b within 30.0s)"
     )
-
-

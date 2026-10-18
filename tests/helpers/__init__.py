@@ -19,5 +19,9 @@ from tests.helpers.envelope import make_envelope
 from tests.helpers.mtls import create_mtls_contexts
 from tests.helpers.server import start_envelope_server
 
-__all__ = ["create_mtls_contexts", "generate_ca", "make_envelope", "start_envelope_server"]
-
+__all__ = [
+    "create_mtls_contexts",
+    "generate_ca",
+    "make_envelope",
+    "start_envelope_server",
+]

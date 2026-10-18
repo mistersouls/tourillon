@@ -70,4 +70,3 @@ def test_hlc_timestamp_walk_rejects_invalid_node_id_encoding() -> None:
 
     with pytest.raises(UnicodeDecodeError):
         HLCTimestamp.from_bytes(data)
-

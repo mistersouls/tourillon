@@ -71,13 +71,9 @@ def test_generate_client_config_use_case_writes_toml_with_base64_material(
         "client": "127.0.0.1:9000",
         "peer": "127.0.0.1:9001",
     }
-    assert base64.b64decode(auth["ca_data"]).startswith(
-        b"-----BEGIN CERTIFICATE-----"
-    )
+    assert base64.b64decode(auth["ca_data"]).startswith(b"-----BEGIN CERTIFICATE-----")
     assert cert_pem.startswith(b"-----BEGIN CERTIFICATE-----")
-    assert base64.b64decode(auth["key_data"]).startswith(
-        b"-----BEGIN PRIVATE KEY-----"
-    )
+    assert base64.b64decode(auth["key_data"]).startswith(b"-----BEGIN PRIVATE KEY-----")
     assert ExtendedKeyUsageOID.CLIENT_AUTH in eku
     assert ExtendedKeyUsageOID.SERVER_AUTH not in eku
     assert isinstance(asyncio.run(config.tls_client()), object)
@@ -215,12 +211,26 @@ def test_client_config_roundtrip_multi_cluster_schema() -> None:
             "version": "1",
             "current-context": "prod-eu",
             "contexts": {
-                "prod-eu": {"cluster": "prod-eu", "namespace": "default", "auth": "souls"},
-                "staging-us": {"cluster": "staging-us", "namespace": "sandbox", "auth": "souls"},
+                "prod-eu": {
+                    "cluster": "prod-eu",
+                    "namespace": "default",
+                    "auth": "souls",
+                },
+                "staging-us": {
+                    "cluster": "staging-us",
+                    "namespace": "sandbox",
+                    "auth": "souls",
+                },
             },
             "clusters": {
-                "prod-eu": {"client": "eu1.tourillon.io:9000", "peer": "eu1.tourillon.io:9001"},
-                "staging-us": {"client": "us-staging.tourillon.io:9000", "peer": "us-staging.tourillon.io:9001"},
+                "prod-eu": {
+                    "client": "eu1.tourillon.io:9000",
+                    "peer": "eu1.tourillon.io:9001",
+                },
+                "staging-us": {
+                    "client": "us-staging.tourillon.io:9000",
+                    "peer": "us-staging.tourillon.io:9001",
+                },
             },
             "auth": {
                 "souls": {
@@ -248,10 +258,22 @@ def test_client_config_rejects_unknown_current_context() -> None:
                 "version": "1",
                 "current-context": "missing",
                 "contexts": {
-                    "ctx": {"cluster": "cluster", "namespace": "default", "auth": "auth"}
+                    "ctx": {
+                        "cluster": "cluster",
+                        "namespace": "default",
+                        "auth": "auth",
+                    }
                 },
-                "clusters": {"cluster": {"client": "127.0.0.1:9000", "peer": "127.0.0.1:9001"}},
-                "auth": {"auth": {"ca_data": "Y2E=", "cert_data": "Y2VydA==", "key_data": "a2V5"}},
+                "clusters": {
+                    "cluster": {"client": "127.0.0.1:9000", "peer": "127.0.0.1:9001"}
+                },
+                "auth": {
+                    "auth": {
+                        "ca_data": "Y2E=",
+                        "cert_data": "Y2VydA==",
+                        "key_data": "a2V5",
+                    }
+                },
             }
         )
 
@@ -270,8 +292,16 @@ def test_client_config_rejects_unknown_cluster_reference() -> None:
                         "auth": "auth",
                     }
                 },
-                "clusters": {"cluster": {"client": "127.0.0.1:9000", "peer": "127.0.0.1:9001"}},
-                "auth": {"auth": {"ca_data": "Y2E=", "cert_data": "Y2VydA==", "key_data": "a2V5"}},
+                "clusters": {
+                    "cluster": {"client": "127.0.0.1:9000", "peer": "127.0.0.1:9001"}
+                },
+                "auth": {
+                    "auth": {
+                        "ca_data": "Y2E=",
+                        "cert_data": "Y2VydA==",
+                        "key_data": "a2V5",
+                    }
+                },
             }
         )
 
@@ -290,8 +320,16 @@ def test_client_config_rejects_unknown_auth_reference() -> None:
                         "auth": "missing-auth",
                     }
                 },
-                "clusters": {"cluster": {"client": "127.0.0.1:9000", "peer": "127.0.0.1:9001"}},
-                "auth": {"auth": {"ca_data": "Y2E=", "cert_data": "Y2VydA==", "key_data": "a2V5"}},
+                "clusters": {
+                    "cluster": {"client": "127.0.0.1:9000", "peer": "127.0.0.1:9001"}
+                },
+                "auth": {
+                    "auth": {
+                        "ca_data": "Y2E=",
+                        "cert_data": "Y2VydA==",
+                        "key_data": "a2V5",
+                    }
+                },
             }
         )
 
@@ -305,7 +343,9 @@ def test_client_auth_write_material_rejects_invalid_base64(tmp_path: Path) -> No
             "contexts": {
                 "ctx": {"cluster": "cluster", "namespace": "default", "auth": "bad"}
             },
-            "clusters": {"cluster": {"client": "127.0.0.1:9000", "peer": "127.0.0.1:9001"}},
+            "clusters": {
+                "cluster": {"client": "127.0.0.1:9000", "peer": "127.0.0.1:9001"}
+            },
             "auth": {
                 "bad": {
                     "ca_data": "not-base64!",
@@ -318,5 +358,3 @@ def test_client_auth_write_material_rejects_invalid_base64(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="ca_data must be valid base64 data"):
         config.auth_config()._write_material_sync(tmp_path)
-
-

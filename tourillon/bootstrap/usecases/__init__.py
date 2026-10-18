@@ -16,4 +16,3 @@ from tourillon.bootstrap.usecases.config import config_app
 from tourillon.bootstrap.usecases.node import node_app
 
 __all__ = ["config_app", "node_app"]
-

@@ -80,7 +80,11 @@ def _build_leaf_certificate(
     is_client: bool,
 ) -> x509.Certificate:
     now = dt.datetime.now(dt.UTC)
-    usage = ExtendedKeyUsageOID.CLIENT_AUTH if is_client else ExtendedKeyUsageOID.SERVER_AUTH
+    usage = (
+        ExtendedKeyUsageOID.CLIENT_AUTH
+        if is_client
+        else ExtendedKeyUsageOID.SERVER_AUTH
+    )
     return (
         x509.CertificateBuilder()
         .subject_name(
@@ -186,9 +190,10 @@ def create_mtls_contexts(tmp_path: Path) -> tuple[ssl.SSLContext, ssl.SSLContext
     server_ssl.load_verify_locations(cafile=str(ca_path))
     server_ssl.verify_mode = ssl.CERT_REQUIRED
 
-    client_ssl = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(ca_path))
+    client_ssl = ssl.create_default_context(
+        ssl.Purpose.SERVER_AUTH, cafile=str(ca_path)
+    )
     client_ssl.load_cert_chain(str(client_cert_path), str(client_key_path))
     client_ssl.check_hostname = False
 
     return server_ssl, client_ssl
-

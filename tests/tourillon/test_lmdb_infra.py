@@ -17,8 +17,21 @@ import asyncio
 import pytest
 
 from tourillon.core.config import StorageConfig
-from tourillon.core.models.storageschema import Key, Keyspace, KVPair, KVRef, Pid, Tag, TagKind, Value
-from tourillon.infra.storage.lmdb_session import LmdbConfig, LmdbSession, LmdbSessionProvider
+from tourillon.core.models.storageschema import (
+    Key,
+    Keyspace,
+    KVPair,
+    KVRef,
+    Pid,
+    Tag,
+    TagKind,
+    Value,
+)
+from tourillon.infra.storage.lmdb_session import (
+    LmdbConfig,
+    LmdbSession,
+    LmdbSessionProvider,
+)
 from tourillon.infra.storage.lmdb_storage import LMDBStorage, LMDBStorageProvider
 from tourillon.infra.storage.lmdb_transaction import LmdbTransaction
 from tourlib.models.ts import HLCTimestamp
@@ -37,11 +50,15 @@ def _record(pid: int, idx: int, kind: TagKind = TagKind.LIVE):
 
 
 def _tag_kv(key: Key, tag: Tag) -> KVPair:
-    return KVPair(key=key.to_bytes(Keyspace.TAGS), value=tag.to_bytes(), keyspace=Keyspace.TAGS)
+    return KVPair(
+        key=key.to_bytes(Keyspace.TAGS), value=tag.to_bytes(), keyspace=Keyspace.TAGS
+    )
 
 
 def _log_kv(key: Key, value: Value) -> KVPair:
-    return KVPair(key=key.to_bytes(Keyspace.LOGS), value=value.to_bytes(), keyspace=Keyspace.LOGS)
+    return KVPair(
+        key=key.to_bytes(Keyspace.LOGS), value=value.to_bytes(), keyspace=Keyspace.LOGS
+    )
 
 
 def _provider(tmp_path, group: int = 0) -> LmdbSessionProvider:
@@ -70,7 +87,9 @@ async def test_lmdb_transaction_round_trips_and_filters_records(tmp_path) -> Non
             store.put(_tag_kv(key3, tag3))
             store.put(_log_kv(key1, value1))
 
-            assert store.get(KVRef(key=key1.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)) == _log_kv(key1, value1)
+            assert store.get(
+                KVRef(key=key1.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)
+            ) == _log_kv(key1, value1)
             assert store.list(Keyspace.TAGS, prefix=Pid(1), limit=0) == []
 
             listed = store.list(Keyspace.TAGS, prefix=Pid(1), limit=10)
@@ -97,8 +116,15 @@ async def test_lmdb_transaction_round_trips_and_filters_records(tmp_path) -> Non
             )
             assert last_live == _tag_kv(key1, tag1)
 
-            store.delete(KVRef(key=key1.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS))
-            assert store.get(KVRef(key=key1.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)) is None
+            store.delete(
+                KVRef(key=key1.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)
+            )
+            assert (
+                store.get(
+                    KVRef(key=key1.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)
+                )
+                is None
+            )
     finally:
         await provider.close()
 
@@ -121,7 +147,9 @@ async def test_lmdb_session_iter_last_and_abort_paths(tmp_path) -> None:
             await session.put(_log_kv(key3, value3))
 
         async with provider.session(write=False) as session:
-            assert await session.get(KVRef(key=key1.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)) == _log_kv(key1, value1)
+            assert await session.get(
+                KVRef(key=key1.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)
+            ) == _log_kv(key1, value1)
 
             forward = [
                 kv
@@ -167,7 +195,16 @@ async def test_lmdb_session_iter_last_and_abort_paths(tmp_path) -> None:
                 raise RuntimeError("boom")
 
         async with provider.session(write=False) as session:
-            aborted = await session.get(KVRef(key=Key(pid=Pid(2), address=Address(namespace=b"ns", key=b"k-2-4"), ts=HLCTimestamp(wall_ms=104, counter=4, node_id="n")).to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS))
+            aborted = await session.get(
+                KVRef(
+                    key=Key(
+                        pid=Pid(2),
+                        address=Address(namespace=b"ns", key=b"k-2-4"),
+                        ts=HLCTimestamp(wall_ms=104, counter=4, node_id="n"),
+                    ).to_bytes(Keyspace.TAGS),
+                    keyspace=Keyspace.TAGS,
+                )
+            )
             assert aborted is None
 
         assert LmdbSession._next_page_key(b"\x00\xff", reverse=False) == b"\x01"
@@ -192,7 +229,9 @@ async def test_lmdb_session_provider_rejects_new_sessions_after_close(tmp_path) 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_lmdb_storage_caches_providers_reports_latest_hlc_and_closes(tmp_path) -> None:
+async def test_lmdb_storage_caches_providers_reports_latest_hlc_and_closes(
+    tmp_path,
+) -> None:
     config = StorageConfig(data_dir=str(tmp_path), group_size="8Mi")
     storage = LMDBStorage(config)
 
@@ -220,16 +259,22 @@ async def test_lmdb_storage_caches_providers_reports_latest_hlc_and_closes(tmp_p
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_lmdb_storage_wraps_provider_initialization_failures(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_lmdb_storage_wraps_provider_initialization_failures(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = StorageConfig(data_dir=str(tmp_path), group_size="8Mi")
     storage = LMDBStorage(config)
 
     def boom(*args, **kwargs):
         raise OSError("broken")
 
-    monkeypatch.setattr("tourillon.infra.storage.lmdb_storage.LmdbSessionProvider", boom)
+    monkeypatch.setattr(
+        "tourillon.infra.storage.lmdb_storage.LmdbSessionProvider", boom
+    )
 
-    with pytest.raises(RuntimeError, match="Failed to initialize LMDB session provider"):
+    with pytest.raises(
+        RuntimeError, match="Failed to initialize LMDB session provider"
+    ):
         await storage.session_provider_for(0)
 
 
@@ -269,8 +314,7 @@ def test_lmdb_session_abort_on_cancelled_error() -> None:
         buggy_exception_handler()
 
     # Verify abort was NOT called (this is the bug)
-    assert not abort_called_buggy, \
-        "Buggy code: abort should NOT have been called"
+    assert not abort_called_buggy, "Buggy code: abort should NOT have been called"
 
     # FIXED CODE: abort IS called
     abort_called_fixed = False
@@ -288,9 +332,11 @@ def test_lmdb_session_abort_on_cancelled_error() -> None:
         fixed_exception_handler()
 
     # Verify abort WAS called (this is the fix)
-    assert abort_called_fixed, \
-        "Fixed code: abort SHOULD be called with except BaseException"
+    assert (
+        abort_called_fixed
+    ), "Fixed code: abort SHOULD be called with except BaseException"
 
     # Final verification
-    assert not abort_called_buggy and abort_called_fixed, \
-        "Test verifies: buggy code doesn't call abort, fixed code does"
+    assert (
+        not abort_called_buggy and abort_called_fixed
+    ), "Test verifies: buggy code doesn't call abort, fixed code does"

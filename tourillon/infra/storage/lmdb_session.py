@@ -13,18 +13,18 @@
 # limitations under the License.
 
 import asyncio
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Callable
 
 import lmdb
 
-from tourillon.core.models.storageschema import Keyspace, KVRef, KVPair
-from tourillon.core.ports.storage import Session, SessionProvider, Batch
+from tourillon.core.models.storageschema import Keyspace, KVPair, KVRef
+from tourillon.core.ports.storage import Batch, Session, SessionProvider
 from tourillon.infra.storage.lmdb_batch import LmdbBatch
 from tourillon.infra.storage.lmdb_transaction import LmdbTransaction
-from tourlib.contrib.threadpool import AsyncThreadPool, AsyncExecutor
+from tourlib.contrib.threadpool import AsyncExecutor, AsyncThreadPool
 from tourlib.models.types import SupportsBytes
 
 
@@ -47,13 +47,10 @@ class LmdbSession(Session):
         executor: AsyncExecutor,
         dbi_logs: lmdb._Database,
         dbi_tags: lmdb._Database,
-        dbi_meta: lmdb._Database
+        dbi_meta: lmdb._Database,
     ) -> None:
         self._txn = LmdbTransaction(
-            txn=txn,
-            dbi_logs=dbi_logs,
-            dbi_tags=dbi_tags,
-            dbi_meta=dbi_meta
+            txn=txn, dbi_logs=dbi_logs, dbi_tags=dbi_tags, dbi_meta=dbi_meta
         )
         self._executor = executor
 
@@ -86,12 +83,7 @@ class LmdbSession(Session):
 
         while True:
             batch = await self._executor.execute(
-                self._txn.list,
-                keyspace,
-                prefix,
-                next_key,
-                batch_size,
-                reverse
+                self._txn.list, keyspace, prefix, next_key, batch_size, reverse
             )
 
             if not batch:
@@ -111,14 +103,9 @@ class LmdbSession(Session):
         self,
         keyspace: Keyspace,
         prefix: SupportsBytes | None = None,
-        predicate: Callable[[KVPair], bool] | None = None
+        predicate: Callable[[KVPair], bool] | None = None,
     ) -> KVPair | None:
-        return await self._executor.execute(
-            self._txn.last,
-            keyspace,
-            prefix,
-            predicate
-        )
+        return await self._executor.execute(self._txn.last, keyspace, prefix, predicate)
 
     @staticmethod
     def _next_page_key(key: bytes, reverse: bool) -> bytes:
@@ -129,7 +116,7 @@ class LmdbSession(Session):
             return b""
         else:
             for i in range(len(key) - 1, -1, -1):
-                if key[i] != 0xff:
+                if key[i] != 0xFF:
                     return key[:i] + bytes([key[i] + 1])
             return key + b"\x00"
 
@@ -159,7 +146,7 @@ class LmdbSessionProvider(SessionProvider):
             readahead=config.readahead,
             max_readers=config.max_readers,
             subdir=True,
-            max_dbs=3
+            max_dbs=3,
         )
         self._group = group
         self._dbi_logs = self._env.open_db(Keyspace.LOGS.encode())
@@ -187,7 +174,7 @@ class LmdbSessionProvider(SessionProvider):
                 executor=executor,
                 dbi_logs=self._dbi_logs,
                 dbi_tags=self._dbi_tags,
-                dbi_meta=self._dbi_meta
+                dbi_meta=self._dbi_meta,
             )
             try:
                 yield session
@@ -197,7 +184,6 @@ class LmdbSessionProvider(SessionProvider):
             else:
                 finalize = txn.commit if write else txn.abort
                 await asyncio.shield(executor.execute(finalize))
-
 
     async def close(self) -> None:
         if self._closed:

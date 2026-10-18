@@ -46,11 +46,7 @@ class Transport:
         self._proto_version = proto_version
         self._max_payload = max_payload
         self._connection_timeout = connection_timeout
-        self._client = EnvelopeClient(
-            bind=bind,
-            tls_ctx=ssl_context,
-            logger=logger
-        )
+        self._client = EnvelopeClient(bind=bind, tls_ctx=ssl_context, logger=logger)
 
     async def connect(self) -> None:
         """Open the connection, failing with TimeoutError past the deadline.

@@ -15,4 +15,3 @@ Feature: tourillon node start command
     When I run the tourillon node start command
     Then the command reports node startup
     And the generated node config preserves the requested endpoints
-

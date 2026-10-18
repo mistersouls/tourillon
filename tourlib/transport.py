@@ -70,14 +70,20 @@ class EnvelopeClient:
 
             await self._close_connection()
             host, port = parse_bind(self._bind)
-            self._reader, self._writer = await asyncio.open_connection(host, port, ssl=self._tls_ctx)
+            self._reader, self._writer = await asyncio.open_connection(
+                host, port, ssl=self._tls_ctx
+            )
             reader = self._reader
 
             if reader is None:
-                raise RuntimeError(f"Failed to create reader after connection {self._bind}")
+                raise RuntimeError(
+                    f"Failed to create reader after connection {self._bind}"
+                )
 
             loop = asyncio.get_running_loop()
-            read_task = loop.create_task(self._read_loop(), name="envelope-client-read-loop")
+            read_task = loop.create_task(
+                self._read_loop(), name="envelope-client-read-loop"
+            )
             read_task.add_done_callback(consume_task_exception)
             self._read_task = read_task
             self._logger.debug("Connected to %s:%d", host, port)
@@ -92,9 +98,7 @@ class EnvelopeClient:
                 self._closing = False
 
     async def request(
-        self,
-        envelope: Envelope,
-        timeout: float = ENVELOPE_RESPONSE_TIMEOUT
+        self, envelope: Envelope, timeout: float = ENVELOPE_RESPONSE_TIMEOUT
     ) -> Envelope:
         if envelope.mode != Envelope.MODE_RPC:
             raise ValueError("request envelope mode must be RPC")
@@ -123,9 +127,7 @@ class EnvelopeClient:
         await self._send(envelope)
 
     async def stream(
-        self,
-        envelope: Envelope,
-        timeout: float = ENVELOPE_RESPONSE_TIMEOUT
+        self, envelope: Envelope, timeout: float = ENVELOPE_RESPONSE_TIMEOUT
     ) -> AsyncIterator[Envelope]:
         if envelope.mode != Envelope.MODE_RPC:
             raise ValueError("Stream envelope mode must be RPC")
@@ -168,7 +170,7 @@ class EnvelopeClient:
     async def _dequeue_with_timeout(
         queue: asyncio.Queue[Envelope | BaseException | None],
         correlation_id: uuid.UUID,
-        timeout: float
+        timeout: float,
     ) -> Envelope | BaseException | None:
         try:
             async with asyncio.timeout(timeout):
@@ -218,7 +220,9 @@ class EnvelopeClient:
 
         self._logger.warning(
             "Received unsolicited %s with cid=%.8s bind=%s; ignoring.",
-            envelope.kind, envelope.correlation_id, self._bind
+            envelope.kind,
+            envelope.correlation_id,
+            self._bind,
         )
 
     async def _read_loop(self) -> None:
@@ -233,7 +237,9 @@ class EnvelopeClient:
                 self._last_activity = time.monotonic()
                 self._logger.debug(
                     "Received kind=%s cid=%.8s bind=%s",
-                    envelope.kind, envelope.correlation_id.bytes, self._bind
+                    envelope.kind,
+                    envelope.correlation_id.bytes,
+                    self._bind,
                 )
                 self._route(envelope)
         except (EOFError, OSError) as exc:
@@ -261,7 +267,9 @@ class EnvelopeClient:
                 self._last_activity = time.monotonic()
                 self._logger.debug(
                     "Sent %s cid=%.8s bind=%s",
-                    envelope.kind, envelope.correlation_id.bytes, self._bind
+                    envelope.kind,
+                    envelope.correlation_id.bytes,
+                    self._bind,
                 )
         except Exception as exc:
             self._logger.exception("Send error: %s", exc_info=exc)
@@ -287,4 +295,4 @@ class EnvelopeClient:
         if read_task is not None and read_task is not current_task:
             read_task.cancel()  # type: ignore[union-attr]
             with suppress(asyncio.CancelledError, ConnectionError, ProtocolError):
-                await read_task # type: ignore[union-attr]
+                await read_task  # type: ignore[union-attr]

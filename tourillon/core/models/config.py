@@ -95,7 +95,9 @@ class NodeConfig:
         seeds = document.get("seeds")
         if seeds is not None and not isinstance(seeds, list):
             raise ValidationError("seeds must be a list of strings")
-        if seeds is not None and not all(isinstance(seed, str) and seed for seed in seeds):
+        if seeds is not None and not all(
+            isinstance(seed, str) and seed for seed in seeds
+        ):
             raise ValidationError("seeds must be a list of strings")
 
         size_raw = document.get("size", NodeSize.M.value)
@@ -109,7 +111,7 @@ class NodeConfig:
         return cls(
             id=validate_node_id(require_str(document, "id"), "node.id"),
             size=size,
-            seeds=seeds
+            seeds=seeds,
         )
 
 
@@ -141,7 +143,9 @@ class StorageConfig:
     def from_document(cls, document: Mapping[str, Any]) -> "StorageConfig":
         return cls(
             data_dir=cls.validate_data_dir(require_str(document, "data_dir")),
-            group_size=validate_group_size(require_str(document, "group_size"), "storage.group_size"),
+            group_size=validate_group_size(
+                require_str(document, "group_size"), "storage.group_size"
+            ),
         )
 
     def group_size_bytes(self) -> int:
@@ -269,7 +273,9 @@ class LoggerConfig:
         if not isinstance(enabled, bool):
             raise ValidationError(f"{field_prefix}.enabled must be a boolean")
 
-        return cls(level=validate_log_level(level, f"{field_prefix}.level"), enabled=enabled)
+        return cls(
+            level=validate_log_level(level, f"{field_prefix}.level"), enabled=enabled
+        )
 
 
 def _default_logger_entries() -> dict[str, LoggerConfig]:
@@ -290,8 +296,7 @@ class LoggingConfig:
         return {
             "level": self.level,
             "loggers": {
-                name: logger.to_document()
-                for name, logger in self.loggers.items()
+                name: logger.to_document() for name, logger in self.loggers.items()
             },
         }
 
@@ -313,7 +318,9 @@ class LoggingConfig:
                 raise ValidationError("logging.loggers keys must be non-empty strings")
             if not isinstance(value, Mapping):
                 raise ValidationError(f"logging.loggers.{name} must be a table")
-            loggers[name] = LoggerConfig.from_document(value, field_prefix=f"logging.loggers.{name}")
+            loggers[name] = LoggerConfig.from_document(
+                value, field_prefix=f"logging.loggers.{name}"
+            )
 
         return cls(level=validate_log_level(level, "logging.level"), loggers=loggers)
 
@@ -445,7 +452,9 @@ class TransportPoolConfig:
             raise ValidationError("transport.pool.max_size must be an integer >= 1")
 
         if min_size > max_size:
-            raise ValidationError("transport.pool.min_size must be <= transport.pool.max_size")
+            raise ValidationError(
+                "transport.pool.min_size must be <= transport.pool.max_size"
+            )
 
         max_overflow = document.get("max_overflow", 8)
         if not isinstance(max_overflow, int) or max_overflow < 0:
@@ -505,14 +514,26 @@ class ReadRepairConfig:
         if not isinstance(enabled, bool):
             raise ValidationError("placement.read_repair.enabled must be a boolean")
         concurrency = document.get("concurrency", 16)
-        if not isinstance(concurrency, int) or isinstance(concurrency, bool) or concurrency < 1:
-            raise ValidationError("placement.read_repair.concurrency must be an integer >= 1")
+        if (
+            not isinstance(concurrency, int)
+            or isinstance(concurrency, bool)
+            or concurrency < 1
+        ):
+            raise ValidationError(
+                "placement.read_repair.concurrency must be an integer >= 1"
+            )
         sample_rate = document.get("sample_rate", 1.0)
         if isinstance(sample_rate, bool) or not isinstance(sample_rate, (int, float)):
-            raise ValidationError("placement.read_repair.sample_rate must be a number in [0.0, 1.0]")
+            raise ValidationError(
+                "placement.read_repair.sample_rate must be a number in [0.0, 1.0]"
+            )
         if not 0.0 <= float(sample_rate) <= 1.0:
-            raise ValidationError("placement.read_repair.sample_rate must be a number in [0.0, 1.0]")
-        return cls(enabled=enabled, concurrency=concurrency, sample_rate=float(sample_rate))
+            raise ValidationError(
+                "placement.read_repair.sample_rate must be a number in [0.0, 1.0]"
+            )
+        return cls(
+            enabled=enabled, concurrency=concurrency, sample_rate=float(sample_rate)
+        )
 
 
 @dataclass(frozen=True)
@@ -535,8 +556,14 @@ class RepairConfig:
     @classmethod
     def from_document(cls, document: Mapping[str, Any]) -> "RepairConfig":
         concurrency = document.get("concurrency", 4)
-        if not isinstance(concurrency, int) or isinstance(concurrency, bool) or concurrency < 1:
-            raise ValidationError("placement.repair.concurrency must be an integer >= 1")
+        if (
+            not isinstance(concurrency, int)
+            or isinstance(concurrency, bool)
+            or concurrency < 1
+        ):
+            raise ValidationError(
+                "placement.repair.concurrency must be an integer >= 1"
+            )
         return cls(concurrency=concurrency)
 
 
@@ -559,7 +586,9 @@ class PlacementConfig:
     def from_document(cls, document: Mapping[str, Any]) -> "PlacementConfig":
         replication_factor = document.get("replication_factor", 3)
         if not isinstance(replication_factor, int) or replication_factor < 1:
-            raise ValidationError("placement.replication_factor must be an integer >= 1")
+            raise ValidationError(
+                "placement.replication_factor must be an integer >= 1"
+            )
         read_repair_doc = document.get("read_repair", {})
         if not isinstance(read_repair_doc, Mapping):
             raise ValidationError("placement.read_repair must be a table")
@@ -571,6 +600,7 @@ class PlacementConfig:
             read_repair=ReadRepairConfig.from_document(read_repair_doc),
             repair=RepairConfig.from_document(repair_doc),
         )
+
 
 @dataclass(frozen=True)
 class TourillonConfig:

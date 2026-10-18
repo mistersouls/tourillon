@@ -90,7 +90,9 @@ def test_generate_node_config_use_case_writes_toml_with_base64_material(
 
 
 @pytest.mark.tourillon
-def test_generate_node_config_use_case_refuses_overwrite_by_default(tmp_path: Path) -> None:
+def test_generate_node_config_use_case_refuses_overwrite_by_default(
+    tmp_path: Path,
+) -> None:
     ca_cert_path, ca_key_path = generate_ca(tmp_path)
     generator = NodeConfigGenerator(
         CryptographyMtlsAdapter(),
@@ -107,7 +109,7 @@ def test_generate_node_config_use_case_refuses_overwrite_by_default(tmp_path: Pa
                 ca_certificate_path=ca_cert_path,
                 ca_private_key_path=ca_key_path,
                 data_dir="data",
-            group_size="8Mi",
+                group_size="8Mi",
                 validity_days=30,
                 key_size=2048,
                 overwrite=False,
@@ -173,12 +175,14 @@ async def test_tourillon_config_tls_contexts_enable_mtls(tmp_path: Path) -> None
         ca_certificate_path=ca_cert_path,
         ca_private_key_path=ca_key_path,
         data_dir="data",
-            group_size="8Mi",
+        group_size="8Mi",
         validity_days=30,
         key_size=2048,
         overwrite=False,
     )
-    config = TourillonConfig.from_document(await TomlPersistence().load(result.config_path))
+    config = TourillonConfig.from_document(
+        await TomlPersistence().load(result.config_path)
+    )
     server_ssl = await config.tls_server()
     client_ssl = await config.tls_client()
     received = bytearray()
@@ -193,7 +197,9 @@ async def test_tourillon_config_tls_contexts_enable_mtls(tmp_path: Path) -> None
         writer.close()
         await writer.wait_closed()
 
-    server = await asyncio.start_server(handle_client, host="127.0.0.1", port=0, ssl=server_ssl)
+    server = await asyncio.start_server(
+        handle_client, host="127.0.0.1", port=0, ssl=server_ssl
+    )
     try:
         socket = server.sockets[0]
         host, port = socket.getsockname()[:2]
@@ -235,12 +241,14 @@ async def test_tourillon_config_tls_context_removes_temp_material_immediately(
         ca_certificate_path=ca_cert_path,
         ca_private_key_path=ca_key_path,
         data_dir="data",
-            group_size="8Mi",
+        group_size="8Mi",
         validity_days=30,
         key_size=2048,
         overwrite=False,
     )
-    config = TourillonConfig.from_document(await TomlPersistence().load(result.config_path))
+    config = TourillonConfig.from_document(
+        await TomlPersistence().load(result.config_path)
+    )
     temp_dir = tmp_path / "tls-material"
 
     def fake_mkdtemp(*, prefix: str) -> str:
@@ -351,7 +359,7 @@ async def test_node_config_with_seeds(tmp_path: Path) -> None:
         ca_certificate_path=ca_cert_path,
         ca_private_key_path=ca_key_path,
         data_dir="data",
-            group_size="8Mi",
+        group_size="8Mi",
         seeds=["seed1:9001", "seed2:9001"],
         validity_days=30,
         key_size=2048,
@@ -378,7 +386,9 @@ async def test_node_config_generate_rejects_invalid_seeds(tmp_path: Path) -> Non
         TomlPersistence(),
     )
 
-    with pytest.raises(ValidationError, match="seeds must be a list of non-empty strings"):
+    with pytest.raises(
+        ValidationError, match="seeds must be a list of non-empty strings"
+    ):
         await generator.generate(
             output_file=tmp_path / "node.toml",
             node_id="node-a",
@@ -391,7 +401,6 @@ async def test_node_config_generate_rejects_invalid_seeds(tmp_path: Path) -> Non
             key_size=2048,
             overwrite=False,
         )
-
 
 
 @pytest.mark.tourillon
@@ -490,7 +499,9 @@ async def test_node_config_generate_rejects_invalid_node_size(tmp_path: Path) ->
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_node_config_generate_rejects_node_id_over_63_bytes(tmp_path: Path) -> None:
+async def test_node_config_generate_rejects_node_id_over_63_bytes(
+    tmp_path: Path,
+) -> None:
     ca_cert_path, ca_key_path = generate_ca(tmp_path)
     generator = NodeConfigGenerator(
         CryptographyMtlsAdapter(),
@@ -536,9 +547,7 @@ async def test_node_config_from_document_seeds_validation() -> None:
     """Test NodeConfig validates seeds is a list."""
     # Seeds must be a list, not a string
     with pytest.raises(ValidationError, match="seeds must be a list of strings"):
-        NodeConfig.from_document(
-            {"id": "node-x", "seeds": "not-a-list"}
-        )
+        NodeConfig.from_document({"id": "node-x", "seeds": "not-a-list"})
 
 
 @pytest.mark.tourillon
@@ -614,7 +623,9 @@ def test_tourillon_config_requires_servers_client() -> None:
             },
         },
     }
-    with pytest.raises(ValidationError, match="servers.client configuration is required"):
+    with pytest.raises(
+        ValidationError, match="servers.client configuration is required"
+    ):
         TourillonConfig.from_document(doc)
 
 
@@ -669,7 +680,9 @@ def test_tourillon_config_from_document_with_logging() -> None:
 
     assert config.logging.level == "INFO"
     assert config.logging.loggers["global"] == LoggerConfig(level="INFO", enabled=True)
-    assert config.logging.loggers["transport"] == LoggerConfig(level="DEBUG", enabled=True)
+    assert config.logging.loggers["transport"] == LoggerConfig(
+        level="DEBUG", enabled=True
+    )
 
 
 @pytest.mark.tourillon
@@ -853,7 +866,9 @@ def test_tourillon_config_rejects_invalid_gossip_and_transport_pool_values() -> 
         },
     }
 
-    with pytest.raises(ValidationError, match="gossip.ae_interval must be a number > 0"):
+    with pytest.raises(
+        ValidationError, match="gossip.ae_interval must be a number > 0"
+    ):
         TourillonConfig.from_document(
             {
                 **base_doc,
@@ -891,7 +906,9 @@ def test_tourillon_config_rejects_invalid_gossip_and_transport_pool_values() -> 
 
 @pytest.mark.tourillon
 def test_telemetry_config_rejects_non_boolean_metrics_enabled_flag() -> None:
-    with pytest.raises(ValidationError, match="telemetry.metrics_enabled must be a boolean"):
+    with pytest.raises(
+        ValidationError, match="telemetry.metrics_enabled must be a boolean"
+    ):
         TelemetryConfig.from_document(
             {
                 "metrics_enabled": "yes",
@@ -903,7 +920,9 @@ def test_telemetry_config_rejects_non_boolean_metrics_enabled_flag() -> None:
 
 @pytest.mark.tourillon
 def test_telemetry_config_rejects_blank_service_name() -> None:
-    with pytest.raises(ValidationError, match="telemetry.service_name must be a non-empty string"):
+    with pytest.raises(
+        ValidationError, match="telemetry.service_name must be a non-empty string"
+    ):
         TelemetryConfig.from_document(
             {
                 "metrics_enabled": True,
@@ -915,7 +934,9 @@ def test_telemetry_config_rejects_blank_service_name() -> None:
 
 @pytest.mark.tourillon
 def test_logging_config_rejects_non_boolean_logger_enabled_flag() -> None:
-    with pytest.raises(ValidationError, match="logging.loggers.global.enabled must be a boolean"):
+    with pytest.raises(
+        ValidationError, match="logging.loggers.global.enabled must be a boolean"
+    ):
         LoggingConfig.from_document(
             {
                 "level": "INFO",
@@ -938,7 +959,9 @@ def test_storage_config_to_document() -> None:
 
 @pytest.mark.tourillon
 def test_storage_config_from_document() -> None:
-    config = StorageConfig.from_document({"data_dir": "C:/tourillon/data", "group_size": "32Mi"})
+    config = StorageConfig.from_document(
+        {"data_dir": "C:/tourillon/data", "group_size": "32Mi"}
+    )
 
     assert config.data_dir == "C:/tourillon/data"
     assert config.group_size == "32Mi"
@@ -946,11 +969,15 @@ def test_storage_config_from_document() -> None:
 
 @pytest.mark.tourillon
 def test_storage_config_from_document_accepts_ti_and_larger_units() -> None:
-    config = StorageConfig.from_document({"data_dir": "C:/tourillon/data", "group_size": "2Ti"})
+    config = StorageConfig.from_document(
+        {"data_dir": "C:/tourillon/data", "group_size": "2Ti"}
+    )
 
     assert config.group_size == "2Ti"
 
-    bigger = StorageConfig.from_document({"data_dir": "C:/tourillon/data", "group_size": "1Pi"})
+    bigger = StorageConfig.from_document(
+        {"data_dir": "C:/tourillon/data", "group_size": "1Pi"}
+    )
 
     assert bigger.group_size == "1Pi"
 
@@ -964,22 +991,30 @@ def test_storage_config_from_document_accepts_relative_path() -> None:
 
 @pytest.mark.tourillon
 def test_storage_config_from_document_rejects_blank_path() -> None:
-    with pytest.raises(ValidationError, match="storage.data_dir must be a non-empty directory path"):
+    with pytest.raises(
+        ValidationError, match="storage.data_dir must be a non-empty directory path"
+    ):
         StorageConfig.from_document({"data_dir": "   ", "group_size": "8Mi"})
 
 
 @pytest.mark.tourillon
-def test_storage_config_from_document_rejects_existing_file_path(tmp_path: Path) -> None:
+def test_storage_config_from_document_rejects_existing_file_path(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "state.toml"
     path.write_text("x", encoding="utf-8")
 
-    with pytest.raises(ValidationError, match="storage.data_dir must reference a directory path"):
+    with pytest.raises(
+        ValidationError, match="storage.data_dir must reference a directory path"
+    ):
         StorageConfig.from_document({"data_dir": str(path), "group_size": "8Mi"})
 
 
 @pytest.mark.tourillon
 def test_storage_config_from_document_rejects_non_positive_group_size() -> None:
-    with pytest.raises(ValidationError, match="storage.group_size must be a positive size string"):
+    with pytest.raises(
+        ValidationError, match="storage.group_size must be a positive size string"
+    ):
         StorageConfig.from_document({"data_dir": "data", "group_size": "0Mi"})
 
 
@@ -996,7 +1031,9 @@ async def test_node_config_generate_rejects_data_dir_that_is_an_existing_file(
     data_file = tmp_path / "data-file"
     data_file.write_text("not-a-directory", encoding="utf-8")
 
-    with pytest.raises(ValidationError, match="storage.data_dir must reference a directory path"):
+    with pytest.raises(
+        ValidationError, match="storage.data_dir must reference a directory path"
+    ):
         await generator.generate(
             output_file=tmp_path / "node.toml",
             node_id="node-a",
@@ -1044,13 +1081,24 @@ def test_gossip_config_defaults_bootstrap_retry_when_missing() -> None:
 @pytest.mark.parametrize(
     ("document", "message"),
     [
-        ({"initial_delay": -1}, "gossip.bootstrap_retry.initial_delay must be a number >= 0"),
+        (
+            {"initial_delay": -1},
+            "gossip.bootstrap_retry.initial_delay must be a number >= 0",
+        ),
         ({"factor": "fast"}, "gossip.bootstrap_retry.factor must be a number >= 0"),
-        ({"max_retries": 0}, "gossip.bootstrap_retry.max_retries must be an integer >= 1"),
-        ({"max_retries": 1.5}, "gossip.bootstrap_retry.max_retries must be an integer >= 1"),
+        (
+            {"max_retries": 0},
+            "gossip.bootstrap_retry.max_retries must be an integer >= 1",
+        ),
+        (
+            {"max_retries": 1.5},
+            "gossip.bootstrap_retry.max_retries must be an integer >= 1",
+        ),
     ],
 )
-def test_gossip_config_rejects_invalid_bootstrap_retry(document: dict, message: str) -> None:
+def test_gossip_config_rejects_invalid_bootstrap_retry(
+    document: dict, message: str
+) -> None:
     with pytest.raises(ValidationError, match=re.escape(message)):
         GossipConfig.from_document({"bootstrap_retry": document})
 
@@ -1084,13 +1132,24 @@ def test_placement_config_parses_a_nested_read_repair_table() -> None:
     ("document", "message"),
     [
         ({"enabled": "yes"}, "placement.read_repair.enabled must be a boolean"),
-        ({"concurrency": 0}, "placement.read_repair.concurrency must be an integer >= 1"),
-        ({"concurrency": True}, "placement.read_repair.concurrency must be an integer >= 1"),
+        (
+            {"concurrency": 0},
+            "placement.read_repair.concurrency must be an integer >= 1",
+        ),
+        (
+            {"concurrency": True},
+            "placement.read_repair.concurrency must be an integer >= 1",
+        ),
         ({"sample_rate": 1.5}, r"placement.read_repair.sample_rate must be a number"),
-        ({"sample_rate": "half"}, r"placement.read_repair.sample_rate must be a number"),
+        (
+            {"sample_rate": "half"},
+            r"placement.read_repair.sample_rate must be a number",
+        ),
     ],
 )
-def test_read_repair_config_rejects_unusable_values(document: dict, message: str) -> None:
+def test_read_repair_config_rejects_unusable_values(
+    document: dict, message: str
+) -> None:
     with pytest.raises(ValidationError, match=message):
         ReadRepairConfig.from_document(document)
 
@@ -1121,9 +1180,13 @@ def test_placement_config_parses_a_nested_repair_table() -> None:
 
 
 @pytest.mark.tourillon
-@pytest.mark.parametrize("document", [{"concurrency": 0}, {"concurrency": True}, {"concurrency": "4"}])
+@pytest.mark.parametrize(
+    "document", [{"concurrency": 0}, {"concurrency": True}, {"concurrency": "4"}]
+)
 def test_repair_config_rejects_unusable_concurrencies(document: dict) -> None:
-    with pytest.raises(ValidationError, match="placement.repair.concurrency must be an integer >= 1"):
+    with pytest.raises(
+        ValidationError, match="placement.repair.concurrency must be an integer >= 1"
+    ):
         RepairConfig.from_document(document)
 
 

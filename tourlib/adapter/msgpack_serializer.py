@@ -49,5 +49,11 @@ class MsgPackSerializer:
     def decode(payload: bytes) -> Any:
         try:
             return msgpack.unpackb(payload, raw=False)
-        except (TypeError, ValueError, msgpack.ExtraData, msgpack.FormatError, msgpack.StackError) as exc:
+        except (
+            TypeError,
+            ValueError,
+            msgpack.ExtraData,
+            msgpack.FormatError,
+            msgpack.StackError,
+        ) as exc:
             raise ValueError("failed to decode msgpack payload") from exc

@@ -18,7 +18,6 @@ from typing import Any
 from tourclient.core import Transport
 from tourlib import Serializer
 from tourlib.exceptions import ResponseError
-from tourlib.models.inspect import MemberInspect
 from tourlib.models.node import JoinRequest, JoinResponse
 
 
@@ -33,10 +32,7 @@ class NodeService:
 
     async def join(self, req: JoinRequest) -> JoinResponse:
         req = req or JoinRequest()
-        response = await self._transport.request(
-            kind="node.join",
-            document=req
-        )
+        response = await self._transport.request(kind="node.join", document=req)
         data: Mapping[str, Any] = self._serializer.decode(response.payload)
         if response.kind == "node.join.accept":
             return JoinResponse(**data, success=True)

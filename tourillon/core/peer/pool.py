@@ -15,8 +15,8 @@
 import asyncio
 import contextlib
 import ssl
-from collections.abc import AsyncIterator
 from collections import OrderedDict
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from tourillon.core.gossip.topology import TopologyManager
@@ -96,12 +96,16 @@ class PeerPool:
         self,
         peer_id: str,
     ) -> EnvelopeClient:
-        with self._telemetry.start_span("pool.acquire", attributes={"peer_id": peer_id}) as span:
+        with self._telemetry.start_span(
+            "pool.acquire", attributes={"peer_id": peer_id}
+        ) as span:
             try:
                 async with self._pool_lock:
                     return await self._acquire_locked(peer_id)
             except TimeoutError as exc:
-                self._telemetry.pool_acquire_errors_total.add(1, attributes={"peer_id": peer_id})
+                self._telemetry.pool_acquire_errors_total.add(
+                    1, attributes={"peer_id": peer_id}
+                )
                 span.record_exception(exc)
                 span.set_status_error("connection timeout")
                 logger.warning("pool.acquire timeout peer_id=%s", peer_id)
@@ -136,7 +140,9 @@ class PeerPool:
             peer.refcount += 1
             self._permanents[peer_id] = peer
             self._lru[peer_id] = peer
-            self._telemetry.pool_connections_total.add(1, attributes={"peer_id": peer_id, "type": "permanent"})
+            self._telemetry.pool_connections_total.add(
+                1, attributes={"peer_id": peer_id, "type": "permanent"}
+            )
             self._update_size_gauges()
             logger.info("pool.acquire new permanent peer_id=%s bind=%s", peer_id, bind)
             return peer.client
@@ -146,7 +152,9 @@ class PeerPool:
             peer.ephemeral = True
             peer.refcount += 1
             self._overflows[peer_id] = peer
-            self._telemetry.pool_connections_total.add(1, attributes={"peer_id": peer_id, "type": "overflow"})
+            self._telemetry.pool_connections_total.add(
+                1, attributes={"peer_id": peer_id, "type": "overflow"}
+            )
             self._update_size_gauges()
             logger.info("pool.acquire new overflow peer_id=%s bind=%s", peer_id, bind)
             return peer.client
@@ -156,14 +164,20 @@ class PeerPool:
         await victim_peer.client.close()
         await victim_peer.fd.stop()
         del self._permanents[victim_id]
-        self._telemetry.pool_evictions_total.add(1, attributes={"peer_id": victim_id, "reason": "lru_evict"})
-        logger.info("pool.acquire lru_evict victim_id=%s new_peer_id=%s", victim_id, peer_id)
+        self._telemetry.pool_evictions_total.add(
+            1, attributes={"peer_id": victim_id, "reason": "lru_evict"}
+        )
+        logger.info(
+            "pool.acquire lru_evict victim_id=%s new_peer_id=%s", victim_id, peer_id
+        )
 
         peer = await self._create_connected_peer(peer_id, bind)
         peer.refcount += 1
         self._permanents[peer_id] = peer
         self._lru[peer_id] = peer
-        self._telemetry.pool_connections_total.add(1, attributes={"peer_id": peer_id, "type": "permanent"})
+        self._telemetry.pool_connections_total.add(
+            1, attributes={"peer_id": peer_id, "type": "permanent"}
+        )
         self._update_size_gauges()
         return peer.client
 
@@ -176,7 +190,9 @@ class PeerPool:
             peer.refcount -= 1
             logger.debug(
                 "pool.release peer_id=%s refcount=%d ephemeral=%s",
-                peer_id, peer.refcount, peer.ephemeral,
+                peer_id,
+                peer.refcount,
+                peer.ephemeral,
             )
 
             # auto-delete overflow
@@ -242,7 +258,9 @@ class PeerPool:
         conn_type = "overflow" if peer.ephemeral else "permanent"
         logger.info(
             "pool.refresh peer_id=%s old_bind=%s new_bind=%s",
-            peer.peer_id, client.bind, bind,
+            peer.peer_id,
+            client.bind,
+            bind,
         )
         await client.close()
         new = PeerClient(bind, self._tls_ctx, peer.fd, logger=logger)
@@ -270,7 +288,8 @@ class PeerPool:
             expired_permanents = [
                 peer_id
                 for peer_id, peer in self._permanents.items()
-                if peer.refcount == 0 and peer.client.inactivity_duration >= self._idle_ttl
+                if peer.refcount == 0
+                and peer.client.inactivity_duration >= self._idle_ttl
             ]
 
         expired_overflows = [
@@ -306,13 +325,15 @@ class PeerPool:
         while len(self._permanents) < self._max_size and len(self._overflows) > 0:
             promote_id = min(
                 self._overflows,
-                key=lambda pid: self._overflows[pid].client.inactivity_duration
+                key=lambda pid: self._overflows[pid].client.inactivity_duration,
             )
             peer = self._overflows.pop(promote_id)
             peer.ephemeral = False
             self._permanents[promote_id] = peer
             self._lru[promote_id] = peer
-            self._telemetry.pool_promotions_total.add(1, attributes={"peer_id": promote_id})
+            self._telemetry.pool_promotions_total.add(
+                1, attributes={"peer_id": promote_id}
+            )
             logger.debug("pool.reaper promote peer_id=%s", promote_id)
             promoted = True
         if promoted:
@@ -321,4 +342,3 @@ class PeerPool:
     def _update_size_gauges(self) -> None:
         self._telemetry.pool_size_permanent.set(len(self._permanents))
         self._telemetry.pool_size_overflow.set(len(self._overflows))
-

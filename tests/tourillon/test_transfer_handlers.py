@@ -34,7 +34,11 @@ from tourlib.adapter import MsgPackSerializer
 SERIALIZER = MsgPackSerializer()
 RANGE = RangeTransfer(segment=(0, 3), src="src", dst="dst")
 REQUESTS = [
-    (transfer_handlers.init, "transfer.init", TransferInit(serial="s", range=RANGE).to_dict()),
+    (
+        transfer_handlers.init,
+        "transfer.init",
+        TransferInit(serial="s", range=RANGE).to_dict(),
+    ),
     (
         transfer_handlers.claim,
         "transfer.claim",
@@ -45,7 +49,11 @@ REQUESTS = [
         "transfer.chunk",
         TransferChunk(range=RANGE, raw=b"x", seq=4, session="s-1").to_dict(),
     ),
-    (transfer_handlers.commit, "transfer.commit", TransferCommit(range=RANGE, session="s-1").to_dict()),
+    (
+        transfer_handlers.commit,
+        "transfer.commit",
+        TransferCommit(range=RANGE, session="s-1").to_dict(),
+    ),
 ]
 
 
@@ -87,13 +95,19 @@ def _install(monkeypatch: pytest.MonkeyPatch, spy: _TransferSpy) -> None:
 async def _call(handler, kind: str, payload: dict[str, Any]) -> list[tuple[str, Any]]:
     request = make_envelope(kind=kind, payload=SERIALIZER.encode(payload))
     responses = [response async for response in handler(request)]
-    assert all(response.correlation_id == request.correlation_id for response in responses)
-    return [(response.kind, SERIALIZER.decode(response.payload)) for response in responses]
+    assert all(
+        response.correlation_id == request.correlation_id for response in responses
+    )
+    return [
+        (response.kind, SERIALIZER.decode(response.payload)) for response in responses
+    ]
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_transfer_handlers_answer_with_accepts(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_transfer_handlers_answer_with_accepts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     spy = _TransferSpy()
     _install(monkeypatch, spy)
 
@@ -129,7 +143,9 @@ async def test_transfer_handlers_turn_transfer_errors_into_typed_rejects(
         responses = await _call(handler, kind, payload)
         reject_kind, data = responses[-1]
         assert reject_kind == f"{kind}.reject"
-        assert TransferReject.from_dict(data) == TransferReject(reason=str(error), fatal=fatal)
+        assert TransferReject.from_dict(data) == TransferReject(
+            reason=str(error), fatal=fatal
+        )
 
 
 @pytest.mark.tourillon
@@ -148,4 +164,3 @@ async def test_transfer_handlers_reject_malformed_payloads_as_fatal(
         assert f"malformed {kind} payload" in reject.reason
 
     assert spy.requests == []
-

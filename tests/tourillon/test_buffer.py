@@ -42,4 +42,3 @@ def test_read_after_read_remaining_raises_short_buffer_error() -> None:
 
     with pytest.raises(ValueError, match="Buffer too short"):
         walker.read(1, "tail")
-

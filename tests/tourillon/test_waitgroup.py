@@ -19,7 +19,9 @@ from tourillon.core.utils.waitgroup import WaitGroup
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_waitgroup_wait_returns_immediately_when_no_tasks_are_registered() -> None:
+async def test_waitgroup_wait_returns_immediately_when_no_tasks_are_registered() -> (
+    None
+):
     group = WaitGroup[str]()
 
     assert group.is_done() is False
@@ -73,4 +75,3 @@ async def test_waitgroup_rejects_extra_done_calls() -> None:
 
     with pytest.raises(RuntimeError, match="Too many calls to done"):
         await group.done("beta", False)
-

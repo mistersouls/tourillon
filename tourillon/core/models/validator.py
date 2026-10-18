@@ -20,7 +20,9 @@ from tourlib.validation import (
     validate_node_id_size,
 )
 
-_ALLOWED_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"})
+_ALLOWED_LOG_LEVELS = frozenset(
+    {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
+)
 _BINARY_SIZE_UNITS: tuple[tuple[str, int], ...] = (
     ("Yi", 1 << 80),
     ("Zi", 1 << 70),
@@ -31,7 +33,9 @@ _BINARY_SIZE_UNITS: tuple[tuple[str, int], ...] = (
     ("Mi", 1 << 20),
     ("Ki", 1 << 10),
 )
-_GROUP_SIZE_PATTERN = re.compile(r"^(?P<bytes>\d+)(?P<unit>B|Ki|Mi|Gi|Ti|Pi|Ei|Zi|Yi)?$")
+_GROUP_SIZE_PATTERN = re.compile(
+    r"^(?P<bytes>\d+)(?P<unit>B|Ki|Mi|Gi|Ti|Pi|Ei|Zi|Yi)?$"
+)
 
 
 def validate_log_level(value: str, field_name: str) -> str:
@@ -50,7 +54,9 @@ def validate_group_size(value: str, field_name: str) -> str:
         raise ValidationError(f"{field_name} must be a non-empty size string")
     if _GROUP_SIZE_PATTERN.fullmatch(normalized) is None:
         allowed = ", ".join(["B", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi", "Yi"])
-        raise ValidationError(f"{field_name} must be a positive size string using one of: {allowed}")
+        raise ValidationError(
+            f"{field_name} must be a positive size string using one of: {allowed}"
+        )
     quantity_bytes(normalized, field_name)
     return normalized
 
@@ -73,7 +79,7 @@ def validate_node_id(value: str, field_name: str) -> str:
     try:
         validate_node_id_size(value)
     except ValueError as exc:
-        raise ValidationError(f"{field_name} must be <= {MAX_NODE_ID_LEN_BYTES} bytes (utf-8)") from exc
+        raise ValidationError(
+            f"{field_name} must be <= {MAX_NODE_ID_LEN_BYTES} bytes (utf-8)"
+        ) from exc
     return value
-
-

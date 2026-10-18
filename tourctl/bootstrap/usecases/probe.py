@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
 from typing import Literal
 
 from cyclopts import App
@@ -25,8 +24,7 @@ probe_app = App(name="probe", help="Probe and health commands.")
 
 @probe_app.command(name="ping")
 async def probe_ping(
-    endpoint: Literal["client", "peer"],
-    opts: GlobalOptions | None = None
+    endpoint: Literal["client", "peer"], opts: GlobalOptions | None = None
 ) -> str:
     """
     Ping a Tourillon node and render the response as JSON.
@@ -37,5 +35,3 @@ async def probe_ping(
         tourconf=opts.tourconf,
         context_name=opts.context,
     )
-
-

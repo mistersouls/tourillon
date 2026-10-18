@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 from tourillon.core.models.member import MemberPhase
 from tourlib import ValidationError, require_mapping, require_str
@@ -90,14 +90,20 @@ class NodeState:
         try:
             return MemberPhase(prev_phase_raw.lower())
         except ValueError as exc:
-            raise ValidationError("node.prev_phase must be a valid member phase") from exc
+            raise ValidationError(
+                "node.prev_phase must be a valid member phase"
+            ) from exc
 
     @staticmethod
     def epoch_property(node_document: Mapping[str, Any]) -> int:
         epoch_raw = node_document.get("epoch")
         if epoch_raw is None:
             return 0
-        if not isinstance(epoch_raw, int) or isinstance(epoch_raw, bool) or epoch_raw < 0:
+        if (
+            not isinstance(epoch_raw, int)
+            or isinstance(epoch_raw, bool)
+            or epoch_raw < 0
+        ):
             raise ValidationError("node.epoch must be a non-negative integer")
         return epoch_raw
 

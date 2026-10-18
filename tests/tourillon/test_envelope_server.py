@@ -197,7 +197,9 @@ async def test_envelope_server_allows_out_of_order_responses(
             payload=envelope.payload,
         )
 
-    server = await start_envelope_server({"kv.list": list_handler}, server_ssl, max_in_flight=4)
+    server = await start_envelope_server(
+        {"kv.list": list_handler}, server_ssl, max_in_flight=4
+    )
     reader, writer = await asyncio.open_connection(
         *server.endpoint,
         ssl=client_ssl,
@@ -260,15 +262,18 @@ async def test_envelope_server_closes_on_invalid_payload_header(
     )
 
     kind = b"kv.get"
-    frame = Envelope.HEADER_STRUCT.pack(
-        1,
-        1,
-        Envelope.MODE_RPC,
-        uuid4().bytes,
-        Envelope.MAX_PAYLOAD + 1,
-        len(kind),
-        b"\x00" * 7,
-    ) + kind
+    frame = (
+        Envelope.HEADER_STRUCT.pack(
+            1,
+            1,
+            Envelope.MODE_RPC,
+            uuid4().bytes,
+            Envelope.MAX_PAYLOAD + 1,
+            len(kind),
+            b"\x00" * 7,
+        )
+        + kind
+    )
 
     writer.write(frame)
     await writer.drain()
@@ -299,7 +304,9 @@ def test_envelope_server_requires_mtls_verify_mode() -> None:
 async def test_envelope_server_stop_closes_active_clients_before_waiting() -> None:
     server_ssl = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     server_ssl.verify_mode = ssl.CERT_REQUIRED
-    server = EnvelopeServer(Dispatcher({}), server_ssl, telemetry=build_noop_telemetry())
+    server = EnvelopeServer(
+        Dispatcher({}), server_ssl, telemetry=build_noop_telemetry()
+    )
     inner = _ServerStopStub()
     server._server = inner  # type: ignore[assignment]  # noqa: SLF001
 
@@ -315,7 +322,9 @@ async def test_envelope_server_stop_closes_active_clients_before_waiting() -> No
 async def test_envelope_server_stop_aborts_clients_after_grace_timeout() -> None:
     server_ssl = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     server_ssl.verify_mode = ssl.CERT_REQUIRED
-    server = EnvelopeServer(Dispatcher({}), server_ssl, telemetry=build_noop_telemetry())
+    server = EnvelopeServer(
+        Dispatcher({}), server_ssl, telemetry=build_noop_telemetry()
+    )
     inner = _ServerStopStub(first_wait_error=TimeoutError())
     server._server = inner  # type: ignore[assignment]  # noqa: SLF001
 
@@ -325,5 +334,3 @@ async def test_envelope_server_stop_aborts_clients_after_grace_timeout() -> None
     assert inner.close_clients_calls == 1
     assert inner.abort_clients_calls == 1
     assert inner.wait_closed_calls == 2
-
-

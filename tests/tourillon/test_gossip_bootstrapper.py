@@ -47,6 +47,7 @@ def _build_bootstrapper() -> GossipBootstrapper:
         tls_client=ssl.create_default_context(),
     )
 
+
 def _member(node_id: str, *, epoch: int) -> dict[str, object]:
     return {
         "node_id": node_id,
@@ -65,18 +66,24 @@ async def test_bootstrapper_exchange_digest_reads_gossip_delta_pages() -> None:
     responses = [
         build_envelope(
             kind="gossip.delta",
-            payload=serializer.encode({"members": [_member("node-b", epoch=2)], "has_more": True}),
+            payload=serializer.encode(
+                {"members": [_member("node-b", epoch=2)], "has_more": True}
+            ),
             schema_id=serializer.schema_id,
         ),
         build_envelope(
             kind="gossip.delta",
-            payload=serializer.encode({"members": [_member("node-c", epoch=3)], "has_more": False}),
+            payload=serializer.encode(
+                {"members": [_member("node-c", epoch=3)], "has_more": False}
+            ),
             schema_id=serializer.schema_id,
         ),
     ]
     client = _StreamClientStub(responses)
 
-    members = await bootstrapper._exchange_digest(cast(EnvelopeClient, cast(object, client)), "127.0.0.1:4000")
+    members = await bootstrapper._exchange_digest(
+        cast(EnvelopeClient, cast(object, client)), "127.0.0.1:4000"
+    )
 
     assert [member.node_id for member in members] == ["node-b", "node-c"]
     assert client.requests[0].kind == "gossip.digest"
@@ -93,4 +100,3 @@ def test_bootstrapper_decode_delta_skips_invalid_members() -> None:
 
     assert [member.node_id for member in members] == ["node-b"]
     assert all(isinstance(member, Member) for member in members)
-

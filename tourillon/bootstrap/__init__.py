@@ -15,4 +15,3 @@
 from tourillon.bootstrap.main import app
 
 __all__ = ["app"]
-

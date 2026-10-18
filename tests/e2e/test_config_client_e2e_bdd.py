@@ -81,7 +81,9 @@ def given_generated_client_ca(client_command_context: dict[str, object]) -> None
 
 
 @given("valid client command options")
-def given_valid_client_command_options(client_command_context: dict[str, object]) -> None:
+def given_valid_client_command_options(
+    client_command_context: dict[str, object],
+) -> None:
     output_dir = client_command_context["output_dir"]
     assert isinstance(output_dir, Path)
     client_command_context["argv"] = [
@@ -156,7 +158,9 @@ def then_generated_client_config_exists(
 
 
 @then("the command fails with a file exists error")
-def then_command_fails_with_file_exists(client_command_context: dict[str, object]) -> None:
+def then_command_fails_with_file_exists(
+    client_command_context: dict[str, object],
+) -> None:
     result = client_command_context["result"]
     assert isinstance(result, subprocess.CompletedProcess)
     assert result.returncode != 0
@@ -164,9 +168,9 @@ def then_command_fails_with_file_exists(client_command_context: dict[str, object
 
 
 @then("the error message mentions overwrite refusal")
-def then_error_mentions_overwrite_refusal(client_command_context: dict[str, object]) -> None:
+def then_error_mentions_overwrite_refusal(
+    client_command_context: dict[str, object],
+) -> None:
     result = client_command_context["result"]
     assert isinstance(result, subprocess.CompletedProcess)
     assert "refusing to overwrite" in result.stderr
-
-

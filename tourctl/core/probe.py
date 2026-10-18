@@ -66,5 +66,3 @@ async def ping_probe(
         _raise_user_error(_probe_error_message(exc, context_name))
 
     return json.dumps(asdict(probe_pong), ensure_ascii=False, indent=2, sort_keys=True)
-
-

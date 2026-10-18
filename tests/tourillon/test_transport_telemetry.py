@@ -37,7 +37,9 @@ from tourlib.constant import TRANSPORT_ERROR_KIND
 from tourlib.envelope import Envelope, read_envelope
 
 
-def _label_key(attributes: Mapping[str, AttributeValue] | None = None) -> tuple[tuple[str, AttributeValue], ...]:
+def _label_key(
+    attributes: Mapping[str, AttributeValue] | None = None,
+) -> tuple[tuple[str, AttributeValue], ...]:
     if not attributes:
         return ()
     return tuple(sorted(attributes.items()))
@@ -63,7 +65,9 @@ class _GaugeBound(BoundGauge):
 
 class _CounterMetricRecorder(CounterMetric):
     def __init__(self) -> None:
-        self.values: dict[tuple[tuple[str, AttributeValue], ...], float] = defaultdict(float)
+        self.values: dict[tuple[tuple[str, AttributeValue], ...], float] = defaultdict(
+            float
+        )
 
     def add(
         self,
@@ -340,7 +344,9 @@ async def test_transport_telemetry_records_handler_error_metric(
 
     response = await read_envelope(reader)
     assert response.kind == TRANSPORT_ERROR_KIND
-    assert response.payload.decode("utf-8", errors="replace").startswith("internal error")
+    assert response.payload.decode("utf-8", errors="replace").startswith(
+        "internal error"
+    )
 
     writer.close()
     await writer.wait_closed()
@@ -350,4 +356,3 @@ async def test_transport_telemetry_records_handler_error_metric(
     assert telemetry._protocol_errors_total.values[endpoint_key] == 1
     span_names = [name for name, _ in telemetry.spans]
     assert "transport.envelope.error" in span_names
-

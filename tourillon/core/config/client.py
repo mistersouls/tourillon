@@ -106,4 +106,3 @@ class ClientConfigGenerator:
     def _assert_absent(path: Path) -> None:
         if path.exists():
             raise FileExistsError(f"refusing to overwrite existing file: {path}")
-

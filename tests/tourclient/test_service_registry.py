@@ -148,5 +148,3 @@ def test_service_registry_probe_factory_is_callable() -> None:
     """Probe factory must be a callable."""
     registration = SERVICE_REGISTRY["probe"]
     assert callable(registration.factory)
-
-
