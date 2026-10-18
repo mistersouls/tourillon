@@ -296,7 +296,7 @@ async def _run_put(
     key: Any,
     value: Any,
     namespace: Any,
-    quorum_write: int | None,
+    quorum_write: int,
     tourconf: str | Path | None,
     context_name: str | None,
 ) -> dict[str, Any] | None:
@@ -315,7 +315,7 @@ async def _run_get(
     *,
     key: Any,
     namespace: Any,
-    quorum_read: int | None,
+    quorum_read: int,
     tourconf: str | Path | None,
     context_name: str | None,
 ) -> dict[str, Any] | None:
@@ -334,7 +334,7 @@ async def _run_delete(
     *,
     key: Any,
     namespace: Any,
-    quorum_write: int | None,
+    quorum_write: int,
     tourconf: str | Path | None,
     context_name: str | None,
 ) -> dict[str, Any] | None:
@@ -352,7 +352,7 @@ async def _run_delete(
 async def _run_repair(
     *,
     token: str,
-    quorum_write: int | None,
+    quorum_write: int,
     tourconf: str | Path | None,
     context_name: str | None,
 ) -> dict[str, Any]:
@@ -373,7 +373,7 @@ async def kv_put(
     key_type: TypeName = "str",
     value_type: TypeName | None = None,
     namespace_type: TypeName = "auto",
-    quorum_write: int | None = None,
+    quorum_write: int = 1,
     as_json: bool = False,
     tourconf: str | Path | None = None,
     context_name: str | None = None,
@@ -411,7 +411,7 @@ async def kv_get(
     namespace: str,
     key_type: TypeName = "str",
     namespace_type: TypeName = "auto",
-    quorum_read: int | None = None,
+    quorum_read: int = 1,
     as_json: bool = False,
     tourconf: str | Path | None = None,
     context_name: str | None = None,
@@ -442,7 +442,7 @@ async def kv_delete(
     namespace: str,
     key_type: TypeName = "str",
     namespace_type: TypeName = "auto",
-    quorum_write: int | None = None,
+    quorum_write: int = 1,
     as_json: bool = False,
     tourconf: str | Path | None = None,
     context_name: str | None = None,
@@ -470,7 +470,7 @@ async def kv_delete(
 async def kv_repair(
     *,
     token: str,
-    quorum_write: int | None = None,
+    quorum_write: int = 1,
     as_json: bool = False,
     tourconf: str | Path | None = None,
     context_name: str | None = None,

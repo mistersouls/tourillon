@@ -11,16 +11,16 @@ Use [`.github/prompts/fix-bug.prompt.md`](../.github/prompts/fix-bug.prompt.md) 
 
 ---
 
-## A. Missing features promised by the README
+## A. Unimplemented capabilities listed as product objectives
 
 | # | Item | Evidence | Notes |
 | --- | --- | --- | --- |
-| A1 | **Namespaces are addressing-only.** `namespace` is carried in `Address`, requests and keyspaces, but there is no namespace registry, no isolation policy, no per-namespace replication settings. | `tourlib/models/version.py` (`Address`), `tourlib/models/kv.py` | README advertises multi-tenant isolation and namespace-level replication. |
-| A2 | **No ACLs.** Authorization is limited to mTLS peer authentication; any trusted certificate may read or write any namespace. | `tourillon/core/models/config.py` (TLS contexts), `tourillon/bootstrap/handlers/kv.py` | README advertises namespace ACLs. |
-| A3 | **No quotas.** Nothing bounds per-namespace key count or stored bytes. | no implementation found | README advertises quota management. |
-| A4 | **No named consistency levels.** Consistency is expressed as raw per-request `quorum_read` / `quorum_write` integers with no default policy. | `tourlib/models/kv.py`, `tourillon/bootstrap/handlers/kv.py:26-96` | README advertises "eventual, strong, tunable". Needs a design decision before implementation. |
-| A5 | **No failure-domain aware placement.** Placement walks the ring and takes distinct members; there is no label model (rack / zone / region / provider) and no anti-affinity constraint. | `tourillon/core/partition/placement.py`, `tourillon/core/models/member.py` | README advertises label-based anti-affinity. Requires member labels on the gossip wire first. |
-| A6 | **No steady-state rebalancing.** Transfers are planned during join and replanned on ring change while joining; there is no periodic or operator-triggered rebalance controller. | `tourillon/core/services/lifecycle.py` (`_run_transfers`) | README advertises automatic rebalance on topology change. |
+| A1 | **Namespaces are addressing-only.** `namespace` is carried in `Address`, requests and keyspaces, but there is no namespace registry, no isolation policy, no per-namespace replication settings. | `tourlib/models/version.py` (`Address`), `tourlib/models/kv.py` | `principles.md` lists namespace isolation and per-namespace management as objectives, not implemented guarantees. |
+| A2 | **No ACLs.** Authorization is limited to mTLS peer authentication; any trusted certificate may read or write any namespace. | `tourillon/core/models/config.py` (TLS contexts), `tourillon/bootstrap/handlers/kv.py` | `principles.md` includes access-control lists among namespace-management objectives, not as an implemented feature. |
+| A3 | **No quotas.** Nothing bounds per-namespace key count or stored bytes. | no implementation found | `principles.md` lists quota management as an objective, not an implemented feature. |
+| A4 | **No named consistency levels.** Consistency is expressed as raw per-request `quorum_read` / `quorum_write` integers; request models default both to 1. | `tourlib/models/kv.py`, `tourillon/bootstrap/handlers/kv.py` | `principles.md` lists configurable consistency levels as an objective. |
+| A5 | **No failure-domain aware placement.** Placement walks the ring and takes distinct members; there is no label model (rack / zone / region / provider) and no anti-affinity constraint. | `tourillon/core/partition/placement.py`, `tourillon/core/models/member.py` | `principles.md` lists label-based anti-affinity as an objective. Requires member labels on the gossip wire first. |
+| A6 | **No steady-state rebalancing.** Transfers are planned during join and replanned on ring change while joining; there is no periodic or operator-triggered rebalance controller. | `tourillon/core/services/lifecycle.py` (`_run_transfers`) | `principles.md` lists dynamic and automatic rebalance as objectives, not as implemented behavior. |
 | A7 | **Read repair is not observable.** Background read repair now writes the winning version back to stale or missing owners, but its counters live on `StoreService.stats` and are not exported through the telemetry port. | `tourillon/core/services/store.py` (`_schedule_read_repair`, `ReplicationStats`) | Wire `ReplicationStats` to `Telemetry` so repairs, skips and failures are visible in metrics. |
 
 ---
@@ -65,7 +65,7 @@ Use [`.github/prompts/fix-bug.prompt.md`](../.github/prompts/fix-bug.prompt.md) 
 
 These are not defects; they are decisions Tourillon has not made yet. Resolve them deliberately — do not copy another system's answer.
 
-1. **Consistency API.** Do quorums stay raw integers, or does Tourillon expose named levels mapped to a replication factor? What is the default when a request specifies nothing?
+1. **Consistency API.** Do quorums stay raw integers, or does Tourillon expose named levels mapped to a replication factor?
 2. **Conflict resolution.** Last-writer-wins by HLC is simple but loses concurrent updates. Does Tourillon need causality tracking, sibling values, or application-supplied merge?
 3. **Repair strategy.** Background read repair is implemented and enabled by default, and an under-replicated write can be resumed on demand through `kv.repair` from the handle its failure returned; anti-entropy between replicas outside the read path is still undecided.
 4. **Namespace lifecycle.** How is a namespace created, configured, and deleted, and what happens to data on deletion?
@@ -81,4 +81,4 @@ These are not defects; they are decisions Tourillon has not made yet. Resolve th
 | --- | --- | --- |
 | F1 | **No bound on accepted connections.** `max_in_flight` caps concurrent requests *per connection*, but nothing caps the number of connections, and it is not exposed in the node configuration — the default is always used. A single authorized client can therefore multiply the effective in-flight limit by opening more sockets. | `tourillon/core/transports/server.py:74-80`, `tourillon/core/transports/session.py:57` |
 | F2 | **Read repair creates one task per stale replica with no admission control.** The semaphore bounds how many repairs run at once, not how many tasks are created and queued; a scan-like read over many distinct stale keys can queue one task per key. `sample_rate` is the only valve. | `tourillon/core/services/store.py` (`_start_repair`, `_repair_slots`) |
-| F3 | **A requested read quorum narrows read repair.** Once the quorum is met the remaining reads are cancelled, so replicas that had not yet answered are absent from the answer set and are not repaired even when stale. Repair coverage is widest when no read quorum is requested. | `tourillon/core/services/store.py` (`_collect_reads`, `_repair_targets`) |
+| F3 | **A small read quorum narrows read repair.** Once the quorum is met the remaining reads are cancelled, so replicas that had not yet answered are absent from the answer set and are not repaired even when stale. Client requests always use a quorum of at least 1; repair coverage increases with larger read quorums. | `tourillon/core/services/store.py` (`_collect_reads`, `_repair_targets`) |

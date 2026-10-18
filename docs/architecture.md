@@ -124,7 +124,7 @@ Eligibility and roles:
 3. The preference list is resolved for the key.
 4. `replication.write` is fanned out to the targets in parallel; the local replica is applied directly.
 5. Targets that are not writable receive a **hinted** record, tagged with the intended owner.
-6. If the request carried `quorum_write`, the coordinator verifies that many acknowledgements before accepting.
+6. The coordinator verifies `quorum_write` acknowledgements before accepting; request models default omitted values to 1, including deletes and write repair.
 
 Deletes are **tombstones**, never physical removals, so a delete can win over a concurrent write by timestamp.
 
@@ -133,7 +133,7 @@ Deletes are **tombstones**, never physical removals, so a delete can win over a 
 1. The preference list is resolved and `replication.read` is collected from the readable targets plus the local replica.
 2. Visible versions are filtered (tombstones and hints have special handling).
 3. A winner is selected by a **total order**: replica count, then HLC timestamp, then namespace, key, data, and quorum marker as deterministic tie-breaks.
-4. If `quorum_read` was requested, the count is verified.
+4. The `quorum_read` response count is verified; request models default omitted values to 1. An empty replica response counts toward this quorum.
 5. A tombstone winner is returned to the caller as "absent".
 6. Replicas that answered with a missing or older version are healed in the background (**read repair**), bounded by a semaphore and deduplicated per address and node. Repair never blocks the answer.
 
@@ -258,7 +258,7 @@ Telemetry goes through the `Telemetry` / `TelemetryProvider` ports, implemented 
 
 ## 13. Where the design is deliberately open
 
-The following are design decisions that have **not** been settled yet; see [`BACKLOG.md`](BACKLOG.md) for the actionable list.
+The following are design decisions that have **not** been settled yet; see [`backlog.md`](backlog.md) for the actionable list.
 
 - Namespaces exist on the wire and in addressing but have no registry, quota, or access-control semantics.
 - Consistency is expressed as raw per-request quorum integers; there is no named consistency-level API.

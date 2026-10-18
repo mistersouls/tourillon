@@ -1,0 +1,54 @@
+# docker-compose up --build -d
+# docker-compose exec tourctl tourctl put greeting "Hello, Tourillon!" --tourconf /example/tourconf.toml
+# docker-compose exec tourctl tourctl get greeting --tourconf /example/tourconf.toml
+services:
+  init:
+    image: tourillon:${VERSION:-0.1.0.dev1}
+    build:
+      context: .
+      dockerfile: Dockerfile.tourillon
+      args:
+        VERSION: ${VERSION:-0.1.0.dev1}
+    entrypoint: ["/bin/sh", "/init.sh"]
+    volumes:
+      - example:/example
+      - ./init.sh:/init.sh:ro
+
+  tourillon:
+    image: tourillon:${VERSION:-0.1.0.dev1}
+    build:
+      context: .
+      dockerfile: Dockerfile.tourillon
+      args:
+        VERSION: ${VERSION:-0.1.0.dev1}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    working_dir: /example
+    command: ["node", "start", "./node.toml"]
+    ports:
+      - "127.0.0.1:7000:7000"
+      - "127.0.0.1:7001:7001"
+    volumes:
+      - example:/example
+
+  tourctl:
+    image: tourctl:${VERSION:-0.1.0.dev1}
+    build:
+      context: .
+      dockerfile: Dockerfile.tourctl
+      args:
+        VERSION: ${VERSION:-0.1.0.dev1}
+    entrypoint: ["cat"]
+    command: []
+    stdin_open: true
+    tty: true
+    depends_on:
+      tourillon:
+        condition: service_started
+    working_dir: /example
+    volumes:
+      - example:/example:ro
+
+volumes:
+  example:

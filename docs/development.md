@@ -1,9 +1,10 @@
 # Development
 
 This guide covers repository setup, contribution checks, and preparing
-Tourillon releases. End-user installation instructions are in the
-[project README](../README.md); native bundle and platform details are in the
-[bundle guide](../scripts/bundle/README.md).
+Tourillon releases. End-user instructions are in the
+[installation guide](installation.md) and [project README](../README.md).
+Bundle construction and release packaging are covered by the
+[bundle build guide](../scripts/bundle/README.md).
 
 ## Repository setup
 
@@ -21,13 +22,42 @@ uv run pytest
 
 Before submitting changes, run the checks on the files you changed. The
 repository has some pre-existing repository-wide lint and formatting debt
-(see [Backlog item D1](BACKLOG.md)).
+(see [Backlog item D1](backlog.md)).
 
 ```bash
 uv run pre-commit run --files path/to/changed_file.py
 uv run ruff check path/to/changed_file.py
 uv run black --check path/to/changed_file.py
 ```
+
+## Recording the README animation
+
+From the repository root, generate the GIF using the real Docker Compose
+example:
+
+```sh
+uv run scripts/record_example.py
+```
+
+The script declares its own rendering dependencies and writes
+`docs/assets/tourillon.gif`. It builds both product images, starts an isolated
+single-node stack without publishing host ports, records real `put` and `get`
+output inside a single container shell opened with `exec`, and removes its
+containers and volume afterward. Startup output is shown progressively, and
+commands are animated character by character. Existing example
+containers and volumes are not modified. The build refreshes the local product
+image tags selected by the example.
+
+On Windows it uses the Ubuntu WSL distribution by default. For Compose v1 in
+WSL, run:
+
+```sh
+uv run scripts/record_example.py --wsl Ubuntu --compose v1
+```
+
+Use `--font PATH` to select a monospace TrueType font and `--output PATH` to
+write the GIF elsewhere. The animation shortens waiting times, not command
+results.
 
 ## Preparing a release
 

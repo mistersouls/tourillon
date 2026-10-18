@@ -56,7 +56,7 @@ async def test_kv_service_put_get_delete_roundtrip(
     async def put_handler(request: Envelope) -> AsyncIterator[Envelope]:
         document = serializer.decode(request.payload)
         key = (document["namespace"], document["key"])
-        assert document["quorum_write"] is None
+        assert document["quorum_write"] == 1
         store[key] = document["value"]
         yield replay_envelope(
             kind="kv.put.accept",
@@ -67,7 +67,7 @@ async def test_kv_service_put_get_delete_roundtrip(
     async def get_handler(request: Envelope) -> AsyncIterator[Envelope]:
         document = serializer.decode(request.payload)
         key = (document["namespace"], document["key"])
-        assert document["quorum_read"] is None
+        assert document["quorum_read"] == 1
         value = store.get(key)
         payload = None if value is None else _version_document(*key, value)
         yield replay_envelope(
@@ -79,7 +79,7 @@ async def test_kv_service_put_get_delete_roundtrip(
     async def delete_handler(request: Envelope) -> AsyncIterator[Envelope]:
         document = serializer.decode(request.payload)
         key = (document["namespace"], document["key"])
-        assert document["quorum_write"] is None
+        assert document["quorum_write"] == 1
         store.pop(key, None)
         yield replay_envelope(
             kind="kv.delete.accept",
@@ -87,11 +87,23 @@ async def test_kv_service_put_get_delete_roundtrip(
             payload=serializer.encode(_version_document(*key, b"")),
         )
 
+    async def repair_handler(request: Envelope) -> AsyncIterator[Envelope]:
+        document = serializer.decode(request.payload)
+        assert document["quorum_write"] == 1
+        yield replay_envelope(
+            kind="kv.repair.accept",
+            request=request,
+            payload=serializer.encode(
+                {"issue": "already_durable", "replicas": 1, "token": document["token"]}
+            ),
+        )
+
     server = await start_envelope_server(
         {
             "kv.put": put_handler,
             "kv.get": get_handler,
             "kv.delete": delete_handler,
+            "kv.repair": repair_handler,
         },
         server_ssl,
     )
@@ -110,6 +122,7 @@ async def test_kv_service_put_get_delete_roundtrip(
             get_result = await service.get(namespace="ns", key="k")
             delete_result = await service.delete(namespace="ns", key="k")
             get_missing = await service.get(namespace="ns", key="k")
+            repair_result = await service.repair(token="tok")
         finally:
             await transport.close()
     finally:
@@ -122,6 +135,7 @@ async def test_kv_service_put_get_delete_roundtrip(
     assert isinstance(delete_result, Version)
     assert serializer.decode(delete_result.address.namespace) == "ns"
     assert get_missing is None
+    assert repair_result == {"issue": "already_durable", "replicas": 1, "token": "tok"}
 
 
 @pytest.mark.asyncio

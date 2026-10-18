@@ -5,7 +5,7 @@ description: Diagnose and fix a runtime bug with a regression test that fails fi
 
 # Fix a bug
 
-Fix: `${input:bug:describe the bug, or reference a docs/BACKLOG.md item}`
+Fix: `${input:bug:describe the bug, or reference a docs/backlog.md item}`
 
 Read `AGENTS.md` and the `.github/instructions/` file matching the area you are touching.
 
@@ -15,7 +15,7 @@ Read `AGENTS.md` and the `.github/instructions/` file matching the area you are 
 2. **Find the root cause.** Trace the real call path: coordinator → placement → peer RPC → storage, or handler → service → port. State the root cause explicitly before fixing it. Do not patch the symptom at the call site if the defect is deeper.
 3. **Fix minimally.** Change the smallest amount of code that addresses the cause. No drive-by refactors, no reformatting of untouched lines.
 4. **Prove it.** The regression test now passes; add a companion test for the adjacent failure path (timeout, rejection, unavailable replica, cancellation) if one is missing.
-5. **Check for siblings.** The same pattern often repeats across services — search for it and note any further occurrences in `docs/BACKLOG.md` rather than silently expanding scope.
+5. **Check for siblings.** The same pattern often repeats across services — search for it and note any further occurrences in `docs/backlog.md` rather than silently expanding scope.
 
 ## Distributed-systems review checklist
 
@@ -30,4 +30,4 @@ When the fix touches the replication, membership or transfer paths, confirm:
 
 ## Done when
 
-The regression test fails before the fix and passes after; `uv run pytest` is green with the coverage gate; `black`/`ruff` are clean on changed files; and `docs/BACKLOG.md` is updated if the item was listed there.
+The regression test fails before the fix and passes after; `uv run pytest` is green with the coverage gate; `black`/`ruff` are clean on changed files; and `docs/backlog.md` is updated if the item was listed there.

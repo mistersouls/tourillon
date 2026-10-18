@@ -141,12 +141,9 @@ class StoreService:
         if not records and errors:
             raise self._replication_error("read", errors)
         version, _ = self._select_version(self._visible_versions(records))
-        if request.quorum_read is not None:
-            # A replica answering "I hold nothing" is still an answer: absence
-            # is information. The read quorum counts responders, not holders of
-            # the winning version, so it measures how much of the replica set
-            # was reachable rather than how much of it agreed.
-            self._ensure_quorum(len(records), request.quorum_read, "read", errors)
+        # A replica answering "I hold nothing" is still an answer: absence is
+        # information. The quorum counts responders, not holders of the winner.
+        self._ensure_quorum(len(records), request.quorum_read, "read", errors)
         self._schedule_read_repair(answers, preflist.preferences, version)
         if self._is_tombstone(version, records):
             return None
@@ -171,14 +168,13 @@ class StoreService:
         version, version_count = self._select_version(
             self._versions_from_records(records)
         )
-        if request.quorum_write is not None:
-            self._ensure_quorum(
-                version_count,
-                request.quorum_write,
-                "write",
-                errors,
-                encode_token(record.key),
-            )
+        self._ensure_quorum(
+            version_count,
+            request.quorum_write,
+            "write",
+            errors,
+            encode_token(record.key),
+        )
         return version
 
     async def delete(self, request: DeleteRequest) -> Version | None:
@@ -196,14 +192,13 @@ class StoreService:
         version, version_count = self._select_version(
             self._versions_from_records(records)
         )
-        if request.quorum_write is not None:
-            self._ensure_quorum(
-                version_count,
-                request.quorum_write,
-                "write",
-                errors,
-                encode_token(record.key),
-            )
+        self._ensure_quorum(
+            version_count,
+            request.quorum_write,
+            "write",
+            errors,
+            encode_token(record.key),
+        )
         return version
 
     async def read(self, addr: PartitionAddress) -> Record | None:
@@ -296,8 +291,6 @@ class StoreService:
         token: str,
     ) -> None:
         """Let the client decide again whether the durability reached is enough."""
-        if request.quorum_write is None:
-            return
         StoreService._ensure_quorum(
             durable, request.quorum_write, "repair", errors, token
         )
@@ -746,16 +739,15 @@ class StoreService:
     @staticmethod
     def _ensure_quorum(
         success_count: int,
-        required: int | None,
+        required: int,
         op: str,
         errors: Sequence[Exception] | None = None,
         token: str | None = None,
     ) -> None:
-        threshold = 1 if required is None else required
-        if success_count < threshold:
+        if success_count < required:
             raise QuorumNotMetError(
                 op,
-                required=threshold,
+                required=required,
                 received=success_count,
                 errors=errors or (),
                 token=token,
@@ -873,16 +865,14 @@ class StoreService:
         value: bytes,
         pid: int,
         tombstone: bool,
-        quorum_write: int | None,
+        quorum_write: int,
     ) -> Record:
         """Build the record to replicate, recording the durability asked for.
 
         The requested quorum is stored with the version rather than a constant:
         it is what tells a later repair how durable the write was meant to be.
-        `0` means the client asked for none, which is not the same as asking
-        for one.
         """
-        meta = Meta(quorum_write=quorum_write or 0, ts=self._clock.tick())
+        meta = Meta(quorum_write=quorum_write, ts=self._clock.tick())
         tag = Tag(kind=TagKind.TOMBSTONE if tombstone else TagKind.LIVE)
         return Record(
             key=Key(pid=Pid(pid), address=addr, ts=meta.ts),
@@ -891,9 +881,7 @@ class StoreService:
         )
 
     @staticmethod
-    def _validate_quorum(operation: str, quorum: int | None) -> None:
-        if quorum is None:
-            return
+    def _validate_quorum(operation: str, quorum: int) -> None:
         if (
             not isinstance(quorum, int)
             or isinstance(quorum, bool)

@@ -30,7 +30,7 @@ Read `.github/instructions/tests.instructions.md` first.
 
 ## Priority areas
 
-Per `docs/BACKLOG.md`, the weakest areas are the peer pool, storage group, lifecycle, transfer planner, transport session, phi-accrual detector, gossip bootstrapper, and the whole `tourclient` package (which is not in the coverage gate at all).
+Per `docs/backlog.md`, the weakest areas are the peer pool, storage group, lifecycle, transfer planner, transport session, phi-accrual detector, gossip bootstrapper, and the whole `tourclient` package (which is not in the coverage gate at all).
 
 ## Done when
 

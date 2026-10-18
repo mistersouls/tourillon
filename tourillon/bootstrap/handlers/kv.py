@@ -23,6 +23,11 @@ from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest, RepairReque
 dispatcher = client_dispatcher()
 
 
+def _quorum(data: dict[str, Any], field: str) -> int:
+    value = data.get(field)
+    return 1 if value is None else value
+
+
 @dispatcher.on("kv.put")
 async def put(request: Envelope) -> AsyncIterator[Envelope]:
     manager = get_manager()
@@ -33,7 +38,7 @@ async def put(request: Envelope) -> AsyncIterator[Envelope]:
             key=data["key"],
             value=data["value"],
             namespace=data["namespace"],
-            quorum_write=data.get("quorum_write"),
+            quorum_write=_quorum(data, "quorum_write"),
         )
         version = await manager.store.put(put_req)
         yield replay_envelope(
@@ -58,7 +63,7 @@ async def get(request: Envelope) -> AsyncIterator[Envelope]:
         get_req = GetRequest(
             key=data["key"],
             namespace=data["namespace"],
-            quorum_read=data.get("quorum_read"),
+            quorum_read=_quorum(data, "quorum_read"),
         )
         version = await manager.store.get(get_req)
         yield replay_envelope(
@@ -83,7 +88,7 @@ async def delete(request: Envelope) -> AsyncIterator[Envelope]:
         delete_req = DeleteRequest(
             key=data["key"],
             namespace=data["namespace"],
-            quorum_write=data.get("quorum_write"),
+            quorum_write=_quorum(data, "quorum_write"),
         )
         version = await manager.store.delete(delete_req)
         yield replay_envelope(
@@ -108,7 +113,7 @@ async def repair(request: Envelope) -> AsyncIterator[Envelope]:
         data: dict[str, Any] = serializer.decode(request.payload)
         repair_req = RepairRequest(
             token=data["token"],
-            quorum_write=data.get("quorum_write"),
+            quorum_write=_quorum(data, "quorum_write"),
         )
         result = await manager.store.repair(repair_req)
         yield replay_envelope(
