@@ -1,32 +1,53 @@
-# Copilot Instructions
+# Copilot instructions — Tourillon
 
-## Repository-specific constraints
+**Read [`AGENTS.md`](../AGENTS.md) first.** It is the authoritative context for this repository: architecture, layering, wire protocol, testing and the working agreement.
+This file repeats only the rules that must never be violated, plus Copilot-specific guidance.
 
-- Never read files under `.draft/` or `.ai-chat.md`.
-- NEVER add `__all__` declarations outside `__init__.py` files.
-- End-to-end tests must exercise the real runtime; do not monkeypatch, stub, or fake the application under test.
+Path-scoped rules live in [`.github/instructions/`](instructions/). Reusable task runbooks live in [`.github/prompts/`](prompts/).
 
-## Build, test, and lint
+## Project in one paragraph
 
-- Requires Python 3.14 or newer. Install the project and development tools with `uv sync --extra dev`.
-- Build the distributions with `uv build`.
-- Run the full test suite with coverage enforcement using `uv run pytest`. Pytest defaults to `tests/`, writes `coverage.xml`, and requires at least 90% coverage for `tourillon`, `tourctl`, and `tourlib`.
-- Run one test file with `uv run pytest tests/tourillon/test_store.py`, or one test with `uv run pytest tests/tourillon/test_store.py::test_put_replicates_to_handoff_and_readable_targets`.
-- Run Ruff with `uv run ruff check .`; check formatting with `uv run black --check .`.
-- Run all configured pre-commit hooks with `uv run pre-commit run --all-files`. The hooks also apply formatting, Ruff fixes, unused-import cleanup, file hygiene, and the Apache license-header check.
+Tourillon is a leaderless, peer-to-peer distributed key-value database in Python 3.14+. Nodes are identical peers arranged on a consistent-hash ring of virtual nodes; keys map to partitions, partitions to preference lists, and requests are coordinated by whichever node receives them. Replication uses per-request quorums, hybrid logical clocks for conflict resolution, hinted handoff for unavailable replicas, gossip for membership, and streaming transfers for rebalancing. Every socket is mTLS-authenticated.
 
-## Architecture
+## Hard rules
 
-- `tourillon` is the node runtime. `tourillon.core` contains node behavior and abstractions; `tourillon.infra` provides concrete storage and telemetry adapters; `tourillon.bootstrap` assembles the application and exposes the `tourillon` CLI.
-- `Application` is constructed with ports/adapters, and `Manager` composes node services such as storage, partitioning, topology, peer pooling, lifecycle, gossip, and transfers. `NodeLifecycle` owns startup/shutdown and the separate peer and client envelope servers.
-- `tourclient` is the async client library. Its service registry maps service names to factories and declares which client/peer endpoint each service supports. `tourctl` is the operator CLI built on those client services.
-- `tourlib` holds shared wire models and envelope framing, serialization, persistence, and mTLS abstractions/adapters used across the runtime, client, and CLI.
-- Tests are grouped by package under `tests/`; `tests/e2e/` exercises command-line entry points and real node processes.
+- Never read `.draft/` or `.ai-chat.md`.
+- Never name other database products (commercial or open-source) anywhere in the repo — code, comments, docstrings, tests, docs, commit messages, PR text. Describe mechanisms from first principles using neutral vocabulary. Tourillon is its own design, not a reimplementation of anything.
+- Never add `__all__` outside `__init__.py`.
+- Every `.py` file starts with the Apache 2.0 header block (copy it from any existing file).
+- Keep every function at cyclomatic complexity `<= 8`.
+- E2E tests (`tests/e2e/`) must drive the real executables — never monkeypatch, stub or fake the app under test.
+- Never commit secrets or certificate material; never hand-edit `uv.lock`.
 
-## Codebase conventions
+## Commands
 
-- Keep node/domain behavior behind protocols in `tourillon.core.ports`; put backend implementations in `tourillon.infra`. Default implementations are wired in `tourillon.bootstrap.deps`, rather than being selected inside domain services.
-- Network calls use `tourlib.envelope.Envelope`: `kind` values are lowercase dotted names (`domain.action`), payloads are encoded through the shared `Serializer`, and `Dispatcher` handlers are registered by kind. Keep service endpoint declarations in `tourclient.core.services.registry` aligned with server handler registration.
-- Storage operations are scoped to a partition group and use async sessions; use a session's batch API when multiple operations belong together. Keyspace and key/value schema types live in `tourillon.core.models.storageschema`.
-- Configuration and node state are persisted through the `Persistence` port (TOML by default). Keep parsing/validation in the configuration or model types rather than duplicating it in CLI handlers.
-- Keep individual functions at cyclomatic complexity `<= 8`. Add tests for both success and failure behavior when changing runtime behavior.
+```bash
+uv sync --extra dev   # setup
+uv run pytest         # full suite + 90% coverage gate
+uv run black <files>  # format only what you touched
+uv run ruff check <files>
+```
+
+**Do not run `black .` or `ruff check --fix .`.** The repository has pre-existing, repo-wide formatting debt; a global run creates a huge unrelated diff. Lint and format only the files you changed, and ignore pre-existing violations elsewhere.
+
+## Layering (the most common source of mistakes)
+
+- `tourillon/core/` — domain logic, depends only on protocols in `tourillon/core/ports/` and `tourlib/port/`. No `lmdb`, no `opentelemetry`, no concrete adapters.
+- `tourillon/infra/`, `tourlib/adapter/` — concrete implementations.
+- `tourillon/bootstrap/deps.py` — the only place that chooses implementations.
+
+## Wire protocol essentials
+
+One frame type, `tourlib.envelope.Envelope`: 32-byte header + UTF-8 `kind` + serialized payload. `kind` is lowercase `domain.action`; responses are `<kind>.accept` / `<kind>.reject`.
+
+- Always build responses with `replay_envelope(kind=..., request=..., payload=...)`.
+- Always encode payloads through the injected `Serializer`.
+- Handlers are async generators registered with `@dispatcher.on("domain.action")` on either `peer_dispatcher()` or `client_dispatcher()`; a kind may be registered only once.
+- Adding or changing a kind means touching all four of: server handler, `tourlib/models/`, `tourclient/core/services/`, and `tourclient/core/services/registry.py`.
+
+## Definition of done
+
+1. Targeted tests pass, then the full `uv run pytest` passes with the coverage gate.
+2. Both a success test and a failure test exist for new runtime behaviour.
+3. `black` and `ruff` are clean on the files you changed.
+4. The change is surgical — no drive-by reformatting or unrelated refactors.

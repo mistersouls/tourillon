@@ -1,0 +1,37 @@
+# Environment preparation for the GitHub Copilot coding agent.
+# The agent runs the `copilot-setup-steps` job before starting work, so the
+# toolchain, locked dependencies and the `tourillon` / `tourctl` executables are
+# already available and it can run `uv run pytest` immediately.
+# Keep these steps in sync with the `test` job in ci.yml.
+name: Copilot setup steps
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Install CPython 3.14
+        run: uv python install 3.14
+
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev --python 3.14
+
+      - name: Verify toolchain
+        run: |
+          uv run --no-sync python --version
+          uv run --no-sync tourillon --help
+          uv run --no-sync tourctl --help

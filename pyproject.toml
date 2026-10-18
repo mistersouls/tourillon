@@ -68,7 +68,7 @@ target-version = "py313"
 select = ["E", "W", "F", "I", "N", "UP", "B", "SIM", "C90"]
 ignore = [
     "E501", # line length enforced by black
-    "B008", # typer.Option() in argument defaults is the canonical Typer pattern
+    "B008", # cyclopts option objects in argument defaults are the canonical pattern
 ]
 
 [tool.ruff.lint.mccabe]
