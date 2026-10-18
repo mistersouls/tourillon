@@ -1,75 +1,166 @@
 # Tourillon
 
-**Tourillon** is a **distributed key‑value database** designed to be **massively scalable**, **highly available**,
-and suitable for **multi‑tenant** environments through isolated **namespaces**.
-It follows a **leaderless architecture** with **no central controller**.
+**A distributed key-value store with no leader to elect and no central
+controller to operate.**
 
----
+Tourillon is an early-stage, leaderless database built for teams who want to
+explore distributed storage without first adopting a large control plane. Run
+database nodes as native applications, let them discover peers, and use the
+same small command-line client to write, read, and delete values.
 
-## Core Objectives
+> **Development preview:** Tourillon is evolving quickly. It is not yet
+> production-ready, and releases may introduce incompatible changes. Do not
+> use it for critical or irreplaceable data.
 
-- Provide a **simple, fast, and extensible** distributed KV-store.
-- Support **namespaces** to isolate data and enable multi‑tenant or shared environments.
-- Build **HA clusters** capable of scaling to **10,000 nodes** or more.
-- Offer a minimalistic, predictable API that integrates easily with existing distributed systems.
-- Allow configurable consistency levels (eventual, strong, tunable).
-- Minimize external dependencies to remain lightweight and portable.
+## Why try Tourillon?
 
----
+- **No leader, no single controller.** Nodes share responsibility instead of
+  relying on a central node to coordinate the cluster.
+- **Distribution built in.** Keys are mapped into a partitioned hash space;
+  nodes exchange membership and coordinate through peer-to-peer communication.
+- **A small operational surface.** `tourillon` runs and configures database
+  nodes; `tourctl` lets you inspect nodes and work with key-value data.
+- **Native, self-contained downloads.** Each platform ZIP includes its runtime
+  and an offline installer. You do not need to install Python or fetch runtime
+  dependencies.
+- **mTLS between clients and nodes.** The setup commands generate the
+  certificates and configuration needed to establish authenticated,
+  encrypted connections.
 
-## Architectural Principles
+Tourillon's longer-term product objectives—including multi-tenancy,
+failure-domain-aware placement, and very large clusters—are described in
+[Product objectives and principles](docs/PRINCIPLES.md). Those are design
+goals, not a claim that every capability is available today.
 
-### Namespaces
-- Logical isolation of data.
-- Native multi‑tenant support.
-- Independent management of quotas, replication, and ACLs.
+## Choose your download
 
-### Distribution
-- Automatic key partitioning.
-- Dynamic rebalancing when nodes join or leave.
-- Deterministic routing based on hashing.
-- **Leaderless operation**: coordination is decentralized, with **no single central controller**.
+Visit [GitHub Releases](https://github.com/mistersouls/tourillon/releases) and
+download the ZIP matching your **product**, **operating system**, and
+**processor architecture**. Each release contains separate downloads for:
 
-### Scalability
-- Architecture designed to reach **10K+ nodes**.
-- Network protocols optimized for very large clusters.
-- Minimal global metadata to avoid bottlenecks.
+| Product | Choose it when you want to… |
+| --- | --- |
+| `tourillon` | Run a database node. |
+| `tourctl` | Manage or inspect nodes and read/write key-value data. |
 
-### High Availability
-- **Automatic rebalance** of partitions when topology changes.
-- **Label‑based anti‑affinity** ensuring replicas of the same shard do not land on nodes sharing common failure domains (rack, zone, region, provider, etc.).
-- Namespace-level configurable replication.
-- Failure detection and automatic cluster reconfiguration.
+Choose the `x86_64` build for most Intel/AMD computers and the `arm64` build
+for ARM devices, including Apple Silicon Macs. The archive names include the
+product and platform, for example `tourctl-exe-windows-x86_64.zip`.
 
----
+## Install
 
-## Documentation
+1. Download the ZIP for each product you need. A server needs `tourillon`; a
+   machine from which you administer the database needs `tourctl`.
+2. Extract the complete ZIP to a folder.
+3. Open a terminal in the extracted product folder—the folder containing
+   `install.ps1` or `install.sh`—and run the installer:
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the node, client and CLI actually fit together: ring and partitioning, read/write paths, gossip, transfers, wire protocol, storage model.
-- [`docs/BACKLOG.md`](docs/BACKLOG.md) — verified list of missing features, open defects and unsettled design questions.
-- [`AGENTS.md`](AGENTS.md) — working agreement, conventions and commands. Read this before contributing.
+**Windows — PowerShell:**
 
----
-
-## Contributions
-
-Contributions are welcome once the foundational components are in place.
-
-This repository is set up for AI-assisted development. [`AGENTS.md`](AGENTS.md) is the shared context for coding agents,
-with path-scoped rules in [`.github/instructions/`](.github/instructions/) and reusable task runbooks in
-[`.github/prompts/`](.github/prompts/). Human contributors should follow the same conventions.
-
-### Quick start
-
-```bash
-uv sync --extra dev   # requires Python 3.14+
-uv run pytest         # full suite with the 90% coverage gate
+```powershell
+.\install.ps1
 ```
 
-> Note: the repository carries pre-existing, repo-wide lint and formatting debt (see `docs/BACKLOG.md`, item D1).
-> Run `black` and `ruff` on the files you changed — not across the whole tree.
+**Linux and macOS:**
 
----
+```sh
+./install.sh
+```
+
+The installer sets up the product for your user and checks that the included
+runtime can start. On Windows, open a new terminal after installation so it
+loads the updated `PATH`. On Linux and macOS, make sure `~/.local/bin` is on
+your `PATH`; Linux bundles require glibc 2.35 or newer.
+
+Confirm that the command is available:
+
+```text
+tourillon --help
+tourctl --help
+```
+
+Each command is installed only if you installed its corresponding product.
+For custom install locations, updating an existing installation, and platform
+troubleshooting, see the [installation guide](scripts/bundle/README.md).
+
+## Your first node and first value
+
+The following walkthrough starts one node on the local machine, creates a
+client identity, then writes and reads a value. It is a convenient way to try
+Tourillon; it is not a production cluster configuration.
+
+Create a working directory and generate a local certificate authority:
+
+```sh
+mkdir -p tourillon-demo
+cd tourillon-demo
+tourillon config ca ./certs
+```
+
+Generate the node configuration. `1Gi` is the storage allocation for a group;
+adjust it to suit your machine:
+
+```sh
+tourillon config node node-1 ./data 1Gi \
+  ./certs/ca-cert.pem ./certs/ca-key.pem \
+  --output-file ./node.toml
+```
+
+Generate a client configuration for the node's local client and peer
+endpoints, then start the node:
+
+```sh
+tourillon config client local-user \
+  --ca-cert ./certs/ca-cert.pem \
+  --ca-key ./certs/ca-key.pem \
+  --output-file ./tourconf.toml \
+  --client-address 127.0.0.1:7000 \
+  --peer-address 127.0.0.1:7001
+
+tourillon node start ./node.toml
+```
+
+Leave the node running. In a **second terminal** opened in the same
+`tourillon-demo` directory, write and read a value:
+
+```sh
+tourctl put greeting "Hello, Tourillon!" --tourconf ./tourconf.toml
+tourctl get greeting --tourconf ./tourconf.toml
+```
+
+Use `tourctl delete greeting --tourconf ./tourconf.toml` to delete it. The
+default namespace is `default`; use `--namespace` to select another namespace.
+For a remote or multi-node setup, use the command help and the
+[architecture guide](docs/ARCHITECTURE.md) before exposing node endpoints.
+
+**Protect the generated files.** The CA private key can issue trusted
+certificates. Node and client configuration files contain private key material
+as well. Do not publish them or share them as ordinary logs or support files.
+
+## What is implemented—and what is not
+
+The current preview includes peer membership, hash-based partitioning,
+replicated key-value operations, configurable per-request read/write quorum
+counts, node inspection, and certificate-based client/peer connections.
+Quorums are numeric request options, not named consistency guarantees.
+
+Some advertised distributed-database capabilities are still planned or
+incomplete. In particular, namespaces currently label data but **do not
+provide tenant isolation**; there are no namespace ACLs or quotas, and
+placement does not yet enforce rack/zone/region anti-affinity. The 10,000-node
+scale is an objective, not a benchmarked or supported deployment size.
+Review the [architecture guide](docs/ARCHITECTURE.md) for implementation
+details and the [backlog](docs/BACKLOG.md) for known gaps before evaluating
+Tourillon for a real workload.
+
+## Learn more
+
+- [Product objectives and principles](docs/PRINCIPLES.md) — product vision and
+  architectural direction.
+- [Architecture](docs/ARCHITECTURE.md) — how nodes, clients, and storage work.
+- [Installation guide](scripts/bundle/README.md) — platform options and
+  troubleshooting.
+- [Development guide](docs/DEVELOPMENT.md) — contributing, tests, and releases.
 
 ## License
 
