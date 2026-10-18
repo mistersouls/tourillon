@@ -1,0 +1,37 @@
+FROM ubuntu:22.04 AS bundle
+
+ARG VERSION=0.1.0.dev1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+        arm64) archive_arch=arm64 ;; \
+        amd64) archive_arch=x86_64 ;; \
+        *) echo "Unsupported architecture" >&2; exit 1 ;; \
+    esac; \
+    curl --fail --location --retry 3 \
+        "https://github.com/mistersouls/tourillon/releases/download/tourillon-v${VERSION}/tourillon-${VERSION}-linux-${archive_arch}.zip" \
+        --output /tmp/bundle.zip; \
+    unzip -q /tmp/bundle.zip -d /tmp/bundle; \
+    rm /tmp/bundle.zip
+
+FROM ubuntu:22.04
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=bundle /tmp/bundle/tourillon /tmp/bundle/tourillon
+
+RUN sh /tmp/bundle/tourillon/install.sh \
+        --install-dir /opt/tourillon \
+        --bin-dir /usr/local/bin \
+    && rm -rf /tmp/bundle/tourillon \
+    && tourillon --help
+
+WORKDIR /data
+ENTRYPOINT ["/usr/local/bin/tourillon"]
+CMD ["--help"]

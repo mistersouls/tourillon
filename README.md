@@ -12,17 +12,24 @@ same small command-line client to write, read, and delete values.
 > production-ready, and releases may introduce incompatible changes. Do not
 > use it for critical or irreplaceable data.
 
+[![Single-node Docker Compose example: start Tourillon, write a value, and read it back.](docs/assets/tourillon.gif)](examples/docker/README.md)
+
+**Want to see it in action?** Try the
+[Docker Compose example](examples/docker/README.md): start one node and use
+the client to write, read, and delete a value. Docker handles the setup,
+including certificates and configuration. This is a local example, not a
+production deployment.
+
 ## Why try Tourillon?
 
 - **No leader, no single controller.** Nodes share responsibility instead of
   relying on a central node to coordinate the cluster.
-- **Distribution built in.** Keys are mapped into a partitioned hash space;
-  nodes exchange membership and coordinate through peer-to-peer communication.
+- **Data shared across nodes.** Nodes distribute and replicate key-value data
+  across the cluster, coordinating directly with their peers.
 - **A small operational surface.** `tourillon` runs and configures database
   nodes; `tourctl` lets you inspect nodes and work with key-value data.
-- **Native, self-contained downloads.** Each platform ZIP includes its runtime
-  and an offline installer. You do not need to install Python or fetch runtime
-  dependencies.
+- **Native, self-contained downloads.** Download the ZIP for your platform,
+  extract it, and run the included offline installer.
 - **mTLS between clients and nodes.** The setup commands generate the
   certificates and configuration needed to establish authenticated,
   encrypted connections.
@@ -32,7 +39,16 @@ failure-domain-aware placement, and very large clusters—are described in
 [Product objectives and principles](docs/PRINCIPLES.md). Those are design
 goals, not a claim that every capability is available today.
 
-## Choose your download
+## Choose how to try Tourillon
+
+| Path | Choose it when you want to... |
+| --- | --- |
+| [Try with Docker](examples/docker/README.md) | Start a local node and client with certificates and configuration generated for you. |
+| [Install natively](#install-natively) | Run the applications directly on Windows, Linux, or macOS, with no additional runtime to install. |
+
+## Install natively
+
+### Choose your download
 
 Visit [GitHub Releases](https://github.com/mistersouls/tourillon/releases) and
 download the ZIP matching your **product**, **operating system**, and
@@ -45,9 +61,10 @@ download the ZIP matching your **product**, **operating system**, and
 
 Choose the `x86_64` build for most Intel/AMD computers and the `arm64` build
 for ARM devices, including Apple Silicon Macs. The archive names include the
-product and platform, for example `tourctl-exe-windows-x86_64.zip`.
+product, version, and platform, for example
+`tourctl-0.1.0.dev1-windows-x86_64.zip`.
 
-## Install
+### Run the installer
 
 1. Download the ZIP for each product you need. A server needs `tourillon`; a
    machine from which you administer the database needs `tourctl`.
@@ -67,8 +84,8 @@ product and platform, for example `tourctl-exe-windows-x86_64.zip`.
 ./install.sh
 ```
 
-The installer sets up the product for your user and checks that the included
-runtime can start. On Windows, open a new terminal after installation so it
+The installer sets up the product for your user and checks that the application
+can start. On Windows, open a new terminal after installation so it
 loads the updated `PATH`. On Linux and macOS, make sure `~/.local/bin` is on
 your `PATH`; Linux bundles require glibc 2.35 or newer.
 

@@ -29,6 +29,34 @@ uv run ruff check path/to/changed_file.py
 uv run black --check path/to/changed_file.py
 ```
 
+## Recording the README animation
+
+From the repository root, generate the GIF using the real Docker Compose
+example:
+
+```sh
+uv run scripts/record_example.py
+```
+
+The script declares its own rendering dependencies and writes
+`docs/assets/tourillon.gif`. It builds both product images, starts an isolated
+single-node stack without publishing host ports, records real `put` and `get`
+output inside a single container shell opened with `exec`, and removes its
+containers and volume afterward. Startup output is shown progressively, and
+commands are animated character by character. Existing example
+stacks and volumes are not modified.
+
+On Windows it uses the Ubuntu WSL distribution by default. For Compose v1 in
+WSL, run:
+
+```sh
+uv run scripts/record_example.py --wsl Ubuntu --compose v1
+```
+
+Use `--font PATH` to select a monospace TrueType font and `--output PATH` to
+write the GIF elsewhere. The animation shortens waiting times, not command
+results.
+
 ## Preparing a release
 
 Merge release documentation and code changes to `main`, update local `main`,
