@@ -62,7 +62,7 @@ download the ZIP matching your **product**, **operating system**, and
 Choose the `x86_64` build for most Intel/AMD computers and the `arm64` build
 for ARM devices, including Apple Silicon Macs. The archive names include the
 product, version, and platform, for example
-`tourctl-0.1.0.dev1-windows-x86_64.zip`.
+`tourctl-0.1.0.dev2-windows-x86_64.zip`.
 
 ### Run the installer
 

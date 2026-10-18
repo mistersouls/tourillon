@@ -43,10 +43,11 @@ The script declares its own rendering dependencies and writes
 `docs/assets/tourillon.gif`. It builds both product images, starts an isolated
 single-node stack without publishing host ports, records real `put` and `get`
 output inside a single container shell opened with `exec`, and removes its
-containers and volume afterward. Startup output is shown progressively, and
-commands are animated character by character. Existing example
-containers and volumes are not modified. The build refreshes the local product
-image tags selected by the example.
+containers and volume afterward. Before recording, it runs Compose `down
+--volumes` for the example's normal project, removing any existing example
+containers and data volume. Startup output is shown progressively, and
+commands are animated character by character. The build refreshes the local
+product image tags selected by the example.
 
 On Windows it uses the Ubuntu WSL distribution by default. For Compose v1 in
 WSL, run:

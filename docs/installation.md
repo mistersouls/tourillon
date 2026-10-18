@@ -15,7 +15,7 @@ Download a ZIP from [GitHub Releases](https://github.com/mistersouls/tourillon/r
 
 Products have separate releases. Choose the product, operating system, and
 architecture you need; for example,
-`tourctl-0.1.0.dev1-windows-x86_64.zip`.
+`tourctl-0.1.0.dev2-windows-x86_64.zip`.
 
 Use `arm64` for ARM systems and `x86_64` for Intel/AMD systems. Inside WSL,
 choose a **Linux** bundle, not a Windows bundle. Run `uname -m` in Linux:
