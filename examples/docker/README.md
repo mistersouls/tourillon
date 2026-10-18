@@ -15,11 +15,11 @@ From this directory:
 docker-compose up --build -d
 ```
 
-The default version is `0.1.0.dev1`. To select another version published for
+The default version is `0.1.0.dev2`. To select another version published for
 both products:
 
 ```sh
-VERSION=0.1.0.dev1 docker-compose up --build -d
+VERSION=0.1.0.dev2 docker-compose up --build -d
 ```
 
 The `init` service generates certificates and configuration files on the first

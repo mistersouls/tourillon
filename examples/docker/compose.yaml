@@ -3,24 +3,24 @@
 # docker-compose exec tourctl tourctl get greeting --tourconf /example/tourconf.toml
 services:
   init:
-    image: tourillon:${VERSION:-0.1.0.dev1}
+    image: tourillon:${VERSION:-0.1.0.dev2}
     build:
       context: .
       dockerfile: Dockerfile.tourillon
       args:
-        VERSION: ${VERSION:-0.1.0.dev1}
+        VERSION: ${VERSION:-0.1.0.dev2}
     entrypoint: ["/bin/sh", "/init.sh"]
     volumes:
       - example:/example
       - ./init.sh:/init.sh:ro
 
   tourillon:
-    image: tourillon:${VERSION:-0.1.0.dev1}
+    image: tourillon:${VERSION:-0.1.0.dev2}
     build:
       context: .
       dockerfile: Dockerfile.tourillon
       args:
-        VERSION: ${VERSION:-0.1.0.dev1}
+        VERSION: ${VERSION:-0.1.0.dev2}
     depends_on:
       init:
         condition: service_completed_successfully
@@ -33,12 +33,12 @@ services:
       - example:/example
 
   tourctl:
-    image: tourctl:${VERSION:-0.1.0.dev1}
+    image: tourctl:${VERSION:-0.1.0.dev2}
     build:
       context: .
       dockerfile: Dockerfile.tourctl
       args:
-        VERSION: ${VERSION:-0.1.0.dev1}
+        VERSION: ${VERSION:-0.1.0.dev2}
     entrypoint: ["cat"]
     command: []
     stdin_open: true

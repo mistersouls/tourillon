@@ -272,8 +272,10 @@ def main() -> None:
     args = arguments()
     recording = Recording(load_font(args.font))
     docker = Docker(args)
+    project_name = EXAMPLE.name
+    docker.run("-p", project_name, "down", "--volumes")
     docker.run("build", "--quiet")
-    config = yaml.safe_load(docker.run("config"))
+    config = yaml.safe_load(docker.run("-p", project_name, "config"))
     for service in config["services"].values():
         service.pop("ports", None)
         service.pop("build", None)
@@ -284,7 +286,7 @@ def main() -> None:
             "-f",
             docker.config_path(config_file),
             "-p",
-            f"tourillon-gif-{uuid.uuid4().hex[:8]}",
+            project_name,
         ]
         try:
             capture(docker, options, recording)
