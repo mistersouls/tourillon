@@ -195,8 +195,13 @@ class StoreService:
             raise self._replication_error("read", errors)
         version, _ = self._select_version(self._visible_versions(records))
         # A replica answering "I hold nothing" is still an answer: absence is
-        # information. The quorum counts responders, not holders of the winner.
-        self._ensure_quorum(len(records), request.quorum_read, "read", errors)
+        # information. A handoff and its owner count as one logical replica.
+        self._ensure_quorum(
+            self._read_response_count(targets, answers),
+            request.quorum_read,
+            "read",
+            errors,
+        )
         self._schedule_read_repair(answers, preflist.preferences, version)
         if self._is_tombstone(version, records):
             return None
@@ -543,7 +548,7 @@ class StoreService:
 
     async def _collect_reads(
         self,
-        targets: Sequence[str],
+        targets: Mapping[str, frozenset[str]],
         addr: PartitionAddress,
         quorum: int | None,
     ) -> tuple[dict[str, Record | None], list[Exception]]:
@@ -555,13 +560,15 @@ class StoreService:
         records: dict[str, Record | None] = {}
         errors: list[Exception] = []
 
+        pending: set[str] = set().union(*targets.values())
         tasks = {
             asyncio.create_task(self._read_from_target(target, addr), name=target)
-            for target in targets
+            for target in sorted(pending)
         }
 
         def collect(done: set[asyncio.Task[Record | None]]) -> None:
             for task in done:
+                pending.discard(task.get_name())
                 try:
                     records[task.get_name()] = task.result()
                 except Exception as exc:
@@ -571,13 +578,25 @@ class StoreService:
         def quorum_met() -> bool:
             if quorum is None:
                 return False
-            return len(records) >= quorum
+            return self._read_response_count(targets, records, pending) >= quorum
 
         unanswered = await self._drain_parallel_tasks(
             tasks, collect, quorum_met if quorum is not None else None
         )
         errors.extend(self._unanswered(unanswered))
         return records, errors
+
+    @staticmethod
+    def _read_response_count(
+        targets: Mapping[str, frozenset[str]],
+        answers: Mapping[str, Record | None],
+        pending: set[str] | frozenset[str] = frozenset(),
+    ) -> int:
+        """Count owners once, settling both read sources before an early return."""
+        return sum(
+            bool(sources.intersection(answers)) and not sources.intersection(pending)
+            for sources in targets.values()
+        )
 
     async def _read_from_target(
         self, target_node_id: str, addr: PartitionAddress
@@ -786,13 +805,18 @@ class StoreService:
         return self._serializer.decode(response.payload)
 
     @staticmethod
-    def _replication_targets(preferences: Sequence[Preference]) -> list[str]:
-        targets: list[str] = []
+    def _replication_targets(
+        preferences: Sequence[Preference],
+    ) -> dict[str, frozenset[str]]:
+        targets: dict[str, frozenset[str]] = {}
         for entry in preferences:
+            sources: set[str] = set()
+            if entry.readable:
+                sources.add(entry.node_id)
             if entry.handoff is not None:
-                targets.append(entry.handoff)
-            elif entry.readable:
-                targets.append(entry.node_id)
+                sources.add(entry.handoff)
+            if sources:
+                targets[entry.node_id] = frozenset(sources)
         if not targets:
             raise NoReplicaAvailableError("read")
         return targets

@@ -67,6 +67,13 @@ hints to be satisfied.
 The node remains `DRAINING` until the transfer runner succeeds.
 Ring changes trigger transfer replanning.
 
+Read routing treats `readable` and `handoff` independently: a readable owner
+and its handoff are both queried, with duplicate destinations queried only once.
+They represent one logical replica for the read quorum. Before that preference
+can satisfy an early quorum, both requests must settle; at the response deadline,
+one successful response is sufficient. Version selection includes both sources,
+including hinted tombstones. Write routing continues to prefer the handoff.
+
 A failed drain stays `DRAINING` and can be retried with `node leave`; a restart
 resumes a persisted drain. After successful transfers the client listener closes,
 then completion publishes `IDLE`, removing the node from the ring without

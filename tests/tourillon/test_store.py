@@ -713,6 +713,148 @@ async def test_get_raises_when_no_replication_targets_available() -> None:
 
 
 @pytest.mark.tourillon
+@pytest.mark.parametrize("local_is_owner", [True, False])
+@pytest.mark.parametrize("remote_kind", ["missing", "newer", "tombstone"])
+async def test_get_reads_both_owner_and_handoff_before_counting_preference(
+    local_is_owner: bool, remote_kind: str
+) -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    local = _record(addr, data=b"historical", wall_ms=10)
+    remote = (
+        None
+        if remote_kind == "missing"
+        else _record(
+            addr,
+            data=b"newer",
+            wall_ms=20,
+            tombstone=remote_kind == "tombstone",
+        )
+    )
+    owner, handoff = ("node-a", "node-b") if local_is_owner else ("node-b", "node-a")
+    if not local_is_owner:
+        local = Record(key=local.key, value=local.value, tag=Tag.hint(local.tag, owner))
+    if remote is not None and local_is_owner:
+        remote = Record(
+            key=remote.key, value=remote.value, tag=Tag.hint(remote.tag, owner)
+        )
+    store, _, pool, _, _ = _build_store(
+        node_id="node-a",
+        preferences=(Preference(owner, True, handoff),),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(local),
+        remote_responses={
+            "replication.read": None if remote is None else remote.to_dict()
+        },
+        remote_delays={"replication.read": 0.02},
+        response_delay=0,
+        read_repair=ReadRepairConfig(enabled=False),
+    )
+    store.pause()
+    version = await store.get(GetRequest(namespace=b"ns", key=b"key"))
+
+    if remote_kind == "tombstone":
+        assert version is None
+    else:
+        expected = b"historical" if remote is None else b"newer"
+        assert version is not None and version.data == expected
+    assert pool.acquire_calls == ["node-b"]
+
+
+@pytest.mark.tourillon
+async def test_get_owner_and_handoff_cannot_satisfy_two_replica_quorum() -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    record = _record(addr)
+    store, _, _, _, _ = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference("node-a", True, "node-b"),
+            Preference("node-c", True, None),
+        ),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(record),
+        remote_responses={"replication.read": record.to_dict()},
+    )
+    with pytest.raises(QuorumNotMetError) as exc_info:
+        await store.get(GetRequest(namespace=b"ns", key=b"key", quorum_read=2))
+    assert exc_info.value.to_dict()["received"] == 1
+
+
+@pytest.mark.tourillon
+async def test_get_owner_and_handoff_plus_another_owner_meet_two_replica_quorum() -> (
+    None
+):
+    addr = Address(namespace=b"ns", key=b"key")
+    record = _record(addr)
+    store, _, pool, _, _ = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference("node-a", True, "node-b"),
+            Preference("node-c", True, None),
+        ),
+        members={
+            "node-b": _member("node-b", "127.0.0.1:9001"),
+            "node-c": _member("node-c", "127.0.0.1:9002"),
+        },
+        local_store=_StoreStub(record),
+        remote_responses={"replication.read": record.to_dict()},
+    )
+    version = await store.get(GetRequest(namespace=b"ns", key=b"key", quorum_read=2))
+    assert version is not None and version.data == record.value.data
+    assert pool.acquire_calls == ["node-b", "node-c"]
+
+
+@pytest.mark.tourillon
+async def test_get_reports_failure_when_neither_owner_nor_handoff_responds() -> None:
+    store, _, _, _, _ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-b", True, "node-c"),),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    with pytest.raises(StoreOperationError) as exc_info:
+        await store.get(GetRequest(namespace=b"ns", key=b"key"))
+    assert len(exc_info.value.to_dict()["errors"]) == 2
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("local_is_owner", [True, False])
+async def test_get_uses_available_read_source_when_other_source_times_out(
+    local_is_owner: bool,
+) -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    record = _record(addr)
+    owner, handoff = ("node-a", "node-b") if local_is_owner else ("node-b", "node-a")
+    store, _, _, _, _ = _build_store(
+        node_id="node-a",
+        preferences=(Preference(owner, True, handoff),),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(record),
+        remote_responses={"replication.read": None},
+        remote_delays={"replication.read": 60},
+        response_delay=0,
+    )
+    store._response_timeout = 0.01
+    version = await store.get(GetRequest(namespace=b"ns", key=b"key"))
+    assert version is not None and version.data == record.value.data
+
+
+@pytest.mark.tourillon
+async def test_get_deduplicates_owner_and_handoff_destination() -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    store, storage, _, _, _ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, "node-a"),),
+        members={},
+        local_store=_StoreStub(_record(addr)),
+        remote_responses={},
+    )
+    version = await store.get(GetRequest(namespace=b"ns", key=b"key"))
+    assert version is not None
+    assert storage.open_calls == [7]
+
+
+@pytest.mark.tourillon
 @pytest.mark.asyncio
 async def test_put_skips_unreadable_preference_without_handoff() -> None:
     addr = Address(namespace=b"ns", key=b"key")
