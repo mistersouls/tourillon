@@ -238,6 +238,22 @@ def _stored_tag(store: _FakeStore, record: Record) -> Tag:
 
 
 @pytest.mark.tourillon
+async def test_failed_hint_delivery_preserves_hint_tag() -> None:
+    store = _FakeStore()
+    record = _record()
+    _seed(store, record)
+    serializer = _PickleSerializer()
+    replayer = HintReplayer(
+        storage=_FakeStorage(_FakeSessionProvider(store)),  # type: ignore[arg-type]
+        peer_pool=_FakePeerPool(_FakeClient(serializer, "unexpected.kind")),  # type: ignore[arg-type]
+        serializer=serializer,  # type: ignore[arg-type]
+        total_groups=1,
+    )
+    await replayer._replay_once()
+    assert _stored_tag(store, record).kind == TagKind.HINT
+
+
+@pytest.mark.tourillon
 @pytest.mark.asyncio
 async def test_replay_once_restores_original_tag_after_successful_write() -> None:
     store = _FakeStore()

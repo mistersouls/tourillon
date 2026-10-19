@@ -69,6 +69,14 @@ NODE_JOIN_ERROR_PROFILE = ErrorProfile(
     invalid_response="Tourillon node returned an invalid join response",
 )
 
+NODE_LEAVE_ERROR_PROFILE = ErrorProfile(
+    action_failed="Node leave failed",
+    tls_failed="TLS setup or handshake failed during node leave",
+    refused="Tourillon node refused the leave connection",
+    unreachable="Unable to reach the Tourillon node for leave",
+    invalid_response="Tourillon node returned an invalid leave response",
+)
+
 
 def _config_error_message(exc: Exception, context_name: str | None) -> str | None:
     if isinstance(exc, FileNotFoundError):

@@ -23,6 +23,7 @@ import pytest
 from tourillon.core.exceptions import (
     InvalidQuorumError,
     InvalidRepairTokenError,
+    NodeDrainingError,
     NoReplicaAvailableError,
     QuorumNotMetError,
     StoreOperationError,
@@ -1550,7 +1551,8 @@ async def test_read_repair_sampling_counts_what_it_declines_to_repair() -> None:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_read_repair_failure_is_counted_not_raised() -> None:
+@pytest.mark.parametrize("draining", [False, True])
+async def test_read_repair_failure_is_counted_not_raised(draining: bool) -> None:
     """The read already succeeded; a failed repair must not reach the client."""
     addr = Address(namespace=b"ns", key=b"key")
     fresh = _record(addr, data=b"v2", wall_ms=9)
@@ -1561,6 +1563,8 @@ async def test_read_repair_failure_is_counted_not_raised() -> None:
         local_store=_StoreStub(fresh),
         remote_responses={"replication.read": None},
     )
+    if draining:
+        store.pause()
 
     version = await store.get(GetRequest(namespace=b"ns", key=b"key"))
     await store.close()
@@ -1597,6 +1601,183 @@ async def test_concurrent_reads_do_not_stack_repairs_for_the_same_key() -> None:
 
 def _repair_token(record: Record) -> str:
     return encode_token(record.key)
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("operation", ["put", "delete", "repair", "write"])
+async def test_draining_rejects_new_work(operation: str) -> None:
+    store, _, _, _, client = _build_store(
+        node_id="node-a",
+        preferences=_two_owners(),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    record = _record(Address(namespace=b"ns", key=b"key"))
+    requests = {
+        "get": GetRequest(namespace=b"ns", key=b"key"),
+        "put": PutRequest(namespace=b"ns", key=b"key", value=b"value"),
+        "delete": DeleteRequest(namespace=b"ns", key=b"key"),
+        "repair": RepairRequest(token=_repair_token(record)),
+        "write": record,
+    }
+    store.pause()
+    with pytest.raises(NodeDrainingError, match="node is draining"):
+        await getattr(store, operation)(requests[operation])
+    assert not client.requests
+
+
+class _BlockedRepairClient(_PeerClientStub):
+    def __init__(self, serializer: MsgPackSerializer, fresh: Record) -> None:
+        super().__init__(
+            serializer,
+            {
+                "replication.read": None,
+                "replication.write": fresh.to_dict(),
+            },
+        )
+        self.read_started = asyncio.Event()
+        self.read_allowed = asyncio.Event()
+        self.repair_started = asyncio.Event()
+        self.repair_allowed = asyncio.Event()
+
+    async def request(self, envelope: Envelope) -> Envelope:
+        if envelope.kind == "replication.read":
+            self.read_started.set()
+            await self.read_allowed.wait()
+        else:
+            self.repair_started.set()
+            await self.repair_allowed.wait()
+        return await super().request(envelope)
+
+
+class _BlockedWriteClient(_BlockedRepairClient):
+    def __init__(
+        self, serializer: MsgPackSerializer, record: Record, fail: bool
+    ) -> None:
+        super().__init__(serializer, record)
+        self.fail = fail
+
+    async def request(self, envelope: Envelope) -> Envelope:
+        self.repair_started.set()
+        await self.repair_allowed.wait()
+        if self.fail:
+            raise ConnectionError("write unavailable")
+        self._responses[envelope.kind] = self._serializer.decode(envelope.payload)[
+            "record"
+        ]
+        return await super().request(envelope)
+
+
+@pytest.mark.tourillon
+async def test_drain_keeps_reads_and_read_repairs_without_waiting_for_reads() -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    fresh = _record(addr, data=b"v2", wall_ms=9)
+    store, _, pool, serializer, _ = _build_store(
+        node_id="node-a",
+        preferences=_two_owners(),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(fresh),
+        remote_responses={},
+    )
+    client = _BlockedRepairClient(serializer, fresh)
+    pool._client = client
+    store._start_repair("node-b", fresh)
+    await asyncio.wait_for(client.repair_started.wait(), 1)
+    read = asyncio.create_task(
+        store.get(GetRequest(namespace=b"ns", key=b"key", quorum_read=2))
+    )
+    await asyncio.wait_for(client.read_started.wait(), 1)
+    draining = asyncio.create_task(store.drain())
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(draining), 0.01)
+        assert not draining.done()
+        client.repair_allowed.set()
+        await asyncio.wait_for(draining, 1)
+        assert not read.done()
+        client.read_allowed.set()
+        await asyncio.wait_for(read, 1)
+        await store.close()
+        assert store.stats.read_repairs_repaired == 2
+        assert await store.get(GetRequest(namespace=b"ns", key=b"key")) is not None
+        await store.close()
+        assert store.stats.read_repairs_repaired == 3
+        assert store.stats.read_repairs_skipped == 0
+        await store.stop_read_repairs()
+        assert await store.get(GetRequest(namespace=b"ns", key=b"key")) is not None
+        assert store.stats.read_repairs_repaired == 3
+        assert store.stats.read_repairs_skipped == 1
+        store.pause(readable=False)
+        with pytest.raises(NodeDrainingError):
+            await store.get(GetRequest(namespace=b"ns", key=b"key"))
+        store.resume()
+        assert await store.get(GetRequest(namespace=b"ns", key=b"key")) is not None
+        await store.close()
+        assert store.stats.read_repairs_repaired == 4
+    finally:
+        client.read_allowed.set()
+        client.repair_allowed.set()
+        await asyncio.gather(read, draining)
+        await store.close()
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("fail", [False, True])
+async def test_drain_waits_for_admitted_write_without_cancelling_it(fail: bool) -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    record = _record(addr)
+    store, _, pool, serializer, _ = _build_store(
+        node_id="node-a",
+        preferences=_two_owners(),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    client = _BlockedWriteClient(serializer, record, fail)
+    pool._client = client
+    write = asyncio.create_task(
+        store.put(
+            PutRequest(namespace=b"ns", key=b"key", value=b"value", quorum_write=2)
+        )
+    )
+    await asyncio.wait_for(client.repair_started.wait(), 1)
+    draining = asyncio.create_task(store.drain())
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(draining), 0.01)
+        draining.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await draining
+        assert not write.done()
+        client.repair_allowed.set()
+        if fail:
+            with pytest.raises(StoreOperationError):
+                await write
+        else:
+            assert await write is not None
+        await asyncio.wait_for(store.drain(), 1)
+        assert not store._mutations
+    finally:
+        client.repair_allowed.set()
+        await asyncio.gather(write, draining, return_exceptions=True)
+        await store.close()
+
+
+@pytest.mark.tourillon
+async def test_draining_accepts_replica_reads() -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    record = _record(addr)
+    store, _, _, _, _ = _build_store(
+        node_id="node-a",
+        preferences=_two_owners(),
+        members={},
+        local_store=_StoreStub(record),
+        remote_responses={},
+    )
+    store.pause()
+    assert await store.read(PartitionAddress(pid=Pid(7), address=addr)) == record
+    assert await store.read_at(record.key) == record
 
 
 @pytest.mark.tourillon

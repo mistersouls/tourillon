@@ -26,7 +26,6 @@ class NodeState:
 
     node_id: str
     phase: MemberPhase = MemberPhase.IDLE
-    prev_phase: MemberPhase | None = None
     tokens: tuple[str, ...] = ()
     seeds: tuple[str, ...] = ()
     epoch: int = 0
@@ -35,7 +34,6 @@ class NodeState:
         return NodeState(
             node_id=self.node_id,
             phase=self.phase,
-            prev_phase=self.prev_phase,
             tokens=self.tokens,
             seeds=tuple(seeds),
             epoch=self.epoch,
@@ -47,8 +45,6 @@ class NodeState:
             "phase": self.phase.value,
             "epoch": self.epoch,
         }
-        if self.prev_phase is not None:
-            node_document["prev_phase"] = self.prev_phase.value
         if self.tokens:
             node_document["tokens"] = list(self.tokens)
         if self.seeds:
@@ -62,7 +58,6 @@ class NodeState:
         return cls(
             node_id=require_str(node_document, "node_id"),
             phase=cls.phase_property(node_document),
-            prev_phase=cls.prev_phase_property(node_document),
             epoch=cls.epoch_property(node_document),
             tokens=cls.tokens_property(node_document),
             seeds=cls.seeds_property(node_document),
@@ -79,20 +74,6 @@ class NodeState:
             return MemberPhase(phase_raw.lower())
         except ValueError as exc:
             raise ValidationError("node.phase must be a valid member phase") from exc
-
-    @staticmethod
-    def prev_phase_property(node_document: Mapping[str, Any]) -> MemberPhase | None:
-        prev_phase_raw = node_document.get("prev_phase")
-        if prev_phase_raw is None:
-            return None
-        if not isinstance(prev_phase_raw, str) or not prev_phase_raw:
-            raise ValidationError("node.prev_phase must be a non-empty string")
-        try:
-            return MemberPhase(prev_phase_raw.lower())
-        except ValueError as exc:
-            raise ValidationError(
-                "node.prev_phase must be a valid member phase"
-            ) from exc
 
     @staticmethod
     def epoch_property(node_document: Mapping[str, Any]) -> int:

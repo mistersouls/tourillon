@@ -34,7 +34,6 @@ def test_node_state_round_trip_ready_phase() -> None:
     assert state.node_id == "node-a"
     assert state.phase == MemberPhase.READY
     assert state.epoch == 3
-    assert state.prev_phase is None
     assert state.to_document() == {
         "node": {
             "node_id": "node-a",
@@ -108,30 +107,15 @@ def test_node_state_requires_non_negative_integer_epoch() -> None:
 
 
 @pytest.mark.tourillon
-def test_node_state_rejects_unknown_prev_phase_when_present() -> None:
-    with pytest.raises(
-        ValidationError, match="node.prev_phase must be a valid member phase"
-    ):
-        NodeState.from_document(
-            {
-                "node": {
-                    "node_id": "node-a",
-                    "phase": "READY",
-                    "prev_phase": "UNKNOWN",
-                }
-            }
-        )
-
-
-@pytest.mark.tourillon
-def test_node_state_accepts_prev_phase_when_present() -> None:
+@pytest.mark.parametrize("legacy_phase", ["READY", "UNKNOWN", "", None, 42])
+def test_node_state_discards_deprecated_prev_phase(legacy_phase: object) -> None:
     state = NodeState.from_document(
         {
             "node": {
                 "node_id": "node-a",
                 "phase": "PAUSED",
                 "epoch": 8,
-                "prev_phase": "READY",
+                "prev_phase": legacy_phase,
             }
         }
     )
@@ -141,7 +125,6 @@ def test_node_state_accepts_prev_phase_when_present() -> None:
             "node_id": "node-a",
             "phase": "paused",
             "epoch": 8,
-            "prev_phase": "ready",
         }
     }
 
@@ -228,22 +211,6 @@ def test_node_state_to_document_includes_seeds() -> None:
     doc = state.to_document()
 
     assert doc["node"]["seeds"] == ["s1:7001"]  # type: ignore[index]
-
-
-@pytest.mark.tourillon
-def test_node_state_rejects_empty_prev_phase_string() -> None:
-    with pytest.raises(
-        ValidationError, match="node.prev_phase must be a non-empty string"
-    ):
-        NodeState.from_document(
-            {
-                "node": {
-                    "node_id": "node-a",
-                    "phase": "ready",
-                    "prev_phase": "",
-                }
-            }
-        )
 
 
 @pytest.mark.tourillon

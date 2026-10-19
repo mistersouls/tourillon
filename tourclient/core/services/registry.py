@@ -48,6 +48,7 @@ SERVICE_REGISTRY: dict[str, ServiceRegistration] = {
         factory=InspectService,
     ),
     "node": ServiceRegistration(
+        # Join and asynchronous leave share the peer-only operator surface.
         name="node",
         supported_endpoints=frozenset(["peer"]),  # type: ignore[arg-type]
         factory=NodeService,

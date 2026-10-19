@@ -110,6 +110,7 @@ class Manager:
             topologymgr=self._topologymgr,
             storage=self._storage,
             telemetry=self._telemetry,
+            store=self._store,
         )
         self._inspector = NodeInspector(
             node_id=self._config.node.id,
@@ -242,3 +243,6 @@ class Manager:
 
     async def join(self, seeds: list[str] | None = None) -> None:
         await self._lifecycle.join(seeds=seeds)
+
+    async def leave(self) -> None:
+        await self._lifecycle.leave()

@@ -48,7 +48,37 @@ infra/       LMDB storage, OpenTelemetry telemetry
 4. `Manager` builds the node services (section 3).
 5. `Manager.serve_forever()` installs `SIGINT`/`SIGTERM` handlers, starts the node, and waits.
 
-Shutdown is ordered: `NodeLifecycle.stop()` (client server → hint replayer → join task → gossip → peer server), then peer pool, storage, telemetry. A failing step is logged and the remaining steps still run.
+Shutdown is ordered: `NodeLifecycle.stop()` (client server → leave task → hint replayer → join task → gossip → peer server), then peer pool, storage, telemetry. A failing step is logged and the remaining steps still run.
+
+Shutdown signals do not initiate a departure. Only an explicit `tourctl node leave`
+request transitions a `READY` or `PAUSED` node to `DRAINING`. The command acknowledges
+initiation, not completion: use `tourctl node inspect` on the peer endpoint to
+observe the final `IDLE` phase. New writes (including replicated writes) are refused,
+but reads and their background read repairs remain available throughout
+`DRAINING`. Admitted mutations and a snapshot of detached writes and read repairs
+settle before owned ranges are pushed to their replacement replicas.
+The barrier does not include reads or keep expanding for newly scheduled repairs,
+so continuous reads cannot prevent transfers from starting.
+Hint replay and read repair continue during transfers. After transfer success,
+hint replay stops, new read repairs are disabled and existing repairs settle.
+Pending hints retain their `HINT` tags in transferred records; the destination
+replays them to their intended owners. Departure does not wait for the source's
+hints to be satisfied.
+The node remains `DRAINING` until the transfer runner succeeds.
+Ring changes trigger transfer replanning.
+
+A failed drain stays `DRAINING` and can be retried with `node leave`; a restart
+resumes a persisted drain. After successful transfers the client listener closes,
+then completion publishes `IDLE`, removing the node from the ring without
+terminating the process or deleting
+its local data. The peer
+listener and gossip remain available. On startup, any `IDLE` node with persisted
+or configured seeds waits for an explicit join; without seeds it bootstraps.
+No previous-phase field is used to distinguish a drained node.
+Leaving the last node on the ring is rejected
+because there is no destination for its ranges.
+At departure, at most five eligible peer addresses are persisted as restart
+seeds; selection stops as soon as this bound is reached.
 
 ### Two servers, two dispatchers
 
@@ -224,12 +254,12 @@ Handlers are async generators registered once per kind on the peer or client dis
 | --- | --- | --- |
 | `probe` | client, peer | `probe.ping` → `probe.pong` |
 | `kv` | client, peer | `kv.put` / `kv.get` / `kv.delete` / `kv.repair` |
-| `node` | peer | `node.join` |
+| `node` | peer | `node.join` / `node.leave` |
 | `inspect` | peer | `node.inspect` → paginated `node.info` |
 
 `gossip.*`, `replication.*` and `transfer.*` are internal to the cluster and deliberately have no client service.
 
-`tourctl` builds on those services with cyclopts commands (`probe ping`, `node inspect`, `node join`, `put`, `get`, `delete`, `repair`). Commands stay thin; rendering and error mapping live in `tourctl/core/`, which translates configuration, TLS/connectivity and protocol failures into actionable `SystemExit` messages instead of tracebacks.
+`tourctl` builds on those services with cyclopts commands (`probe ping`, `node inspect`, `node join`, `node leave`, `put`, `get`, `delete`, `repair`). Commands stay thin; rendering and error mapping live in `tourctl/core/`, which translates configuration, TLS/connectivity and protocol failures into actionable `SystemExit` messages instead of tracebacks.
 
 `tourillon config ca | client | node` generates the mTLS material and the TOML configuration files that both sides consume.
 
@@ -264,4 +294,4 @@ The following are design decisions that have **not** been settled yet; see [`bac
 - Consistency is expressed as raw per-request quorum integers; there is no named consistency-level API.
 - There is no anti-entropy between replicas outside the read path: divergence is healed opportunistically by read repair, or on demand through `kv.repair`, and never proactively.
 - Placement has no failure-domain (anti-affinity) awareness.
-- Graceful leave and steady-state rebalancing are not implemented; transfers are currently join-driven.
+- Steady-state rebalancing is not implemented; transfers are driven by joins and explicit departures.

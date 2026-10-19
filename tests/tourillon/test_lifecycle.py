@@ -33,15 +33,18 @@ from tourillon.core.config import (
     TransportConfig,
     TransportPoolConfig,
 )
-from tourillon.core.exceptions import BootstrapError
+from tourillon.core.exceptions import BootstrapError, JoinError, LeaveError
 from tourillon.core.gossip.gossiper import GossipStats
 from tourillon.core.gossip.topology import TopologyManager
+from tourillon.core.models.clock import HLCClock
 from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.models.state import NodeState
 from tourillon.core.partition.partitioner import Partitioner
+from tourillon.core.partition.placement import SimplePlacementStrategy
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.probe.detector import FailureDetectorProvider
 from tourillon.core.services.lifecycle import NodeLifecycle
+from tourillon.core.services.store import StoreService
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.spaces.ring import Ring
 from tourillon.core.spaces.vnode import VNode
@@ -160,6 +163,22 @@ def _build_lifecycle(
         max_overflow=pool_opts.max_overflow,
         idle_ttl=pool_opts.idle_ttl,
     )
+    partitioner = Partitioner(hashspace=HashSpace(bits=128), pshift=17, gshift=5)
+    storage = _StorageStub()
+    store = StoreService(
+        node_id=config.node.id,
+        storage=storage,  # type: ignore[arg-type]
+        partitioner=partitioner,
+        placement_strategy=SimplePlacementStrategy(
+            replication_factor=config.placement.replication_factor,
+            topologymgr=topologymgr,
+            partitioner=partitioner,
+            peer_pool=peer_pool,
+        ),
+        clock=HLCClock(node_id=config.node.id),
+        serializer=serializer,
+        peer_pool=peer_pool,
+    )
     return NodeLifecycle(
         config=config,
         peer_dispatcher=Dispatcher(),
@@ -174,6 +193,7 @@ def _build_lifecycle(
         storage=_StorageStub(),  # type: ignore[arg-type]
         gossip_stats=GossipStats(),
         telemetry=build_noop_telemetry(),
+        store=store,
     )
 
 
@@ -192,7 +212,6 @@ async def test_load_state_defaults_to_config_node_id_when_missing(
 
     assert state.node_id == "node-a"
     assert state.phase == MemberPhase.IDLE
-    assert state.prev_phase is None
     assert state.epoch == 0
     assert persistence.writes == [
         (
@@ -230,7 +249,7 @@ async def test_load_state_uses_persisted_document(tmp_path: Path) -> None:
 
     assert state.node_id == "node-b"
     assert state.phase == MemberPhase.READY
-    assert state.prev_phase == MemberPhase.JOINING
+    assert "prev_phase" not in state.to_document()["node"]
     assert state.epoch == 4
 
 
@@ -418,7 +437,13 @@ async def test_sync_full_returns_false_when_bootstrapper_fails(
 @pytest.mark.asyncio
 async def test_transition_to_persists_phase_tokens_and_seeds(tmp_path: Path) -> None:
     persistence = _DocumentStatePersistence(
-        {"node": {"node_id": "node-a", "phase": "idle", "epoch": 0}}
+        {
+            "node": {
+                "node_id": "node-a",
+                "phase": "idle",
+                "epoch": 0,
+            }
+        }
     )
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path, node_id="node-a"),
@@ -434,7 +459,7 @@ async def test_transition_to_persists_phase_tokens_and_seeds(tmp_path: Path) -> 
     )
 
     assert transitioned.phase == MemberPhase.JOINING
-    assert transitioned.prev_phase == MemberPhase.IDLE
+    assert "prev_phase" not in transitioned.to_document()["node"]
     assert transitioned.epoch == 1
     assert transitioned.tokens
     assert transitioned.seeds == ("seed:9000",)
@@ -570,6 +595,10 @@ async def test_startup_idle_branches_on_seed_configuration(
     lifecycle._transition_to = transition_to  # type: ignore[method-assign]  # noqa: SLF001
 
     await lifecycle._startup_idle(state, seeds=["seed:9000"])
+    assert events == ["peer"]
+
+    events.clear()
+    await lifecycle._startup_idle(state.with_seeds(["persisted:9000"]))
     assert events == ["peer"]
 
     events.clear()
@@ -792,6 +821,7 @@ async def test_publish_state_and_sync_full_success_increment_counters(
 
 class _TransferRunnerStub:
     def __init__(self) -> None:
+        self.started = asyncio.Event()
         loop = asyncio.get_running_loop()
         self.run_result: asyncio.Future[tuple[list[str], list[str]]] = (
             loop.create_future()
@@ -804,6 +834,7 @@ class _TransferRunnerStub:
 
     async def run(self, current: Ring, target: Ring) -> tuple[list[str], list[str]]:
         self.calls.append(("run", current.serial(), target.serial()))
+        self.started.set()
         return await self.run_result
 
     async def apply(self, current: Ring, target: Ring) -> None:
@@ -991,3 +1022,351 @@ async def test_perform_join_moves_to_ready_or_failed_from_the_transfer_results(
     )  # membership sync failed: no transfer at all  # noqa: SLF001
     assert events == ["publish:joining", "publish:failed", "gossiper-stopped"]
     assert outcomes == []
+
+
+class _DrainStore:
+    def __init__(self) -> None:
+        self.paused = False
+        self.waiting = asyncio.Event()
+        self.settled = asyncio.Event()
+        self.repairs_stopped = False
+
+    def pause(self, *, readable: bool = True) -> None:
+        self.paused = True
+        self.readable = readable
+
+    async def drain(self) -> None:
+        self.waiting.set()
+        await self.settled.wait()
+
+    async def stop_read_repairs(self) -> None:
+        self.repairs_stopped = True
+
+
+class _DrainHints:
+    def __init__(self) -> None:
+        self.pending = True
+        self.started = False
+        self.stopped = False
+
+    async def start(self) -> None:
+        self.started = True
+        self.stopped = False
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+async def _leaving_lifecycle(tmp_path: Path):
+    lifecycle = _build_lifecycle(
+        config=_build_config(tmp_path, node_id="node-a"),
+        persistence=_DocumentStatePersistence(
+            {
+                "node": {
+                    "node_id": "node-a",
+                    "phase": "ready",
+                    "epoch": 2,
+                    "tokens": ["0x80"],
+                }
+            }
+        ),
+    )
+    for member in (
+        Member(
+            node_id="node-a",
+            peer_address="127.0.0.1:7001",
+            epoch=2,
+            phase=MemberPhase.READY,
+            tokens=("0x80",),
+        ),
+        Member(
+            node_id="node-b",
+            peer_address="127.0.0.1:7002",
+            epoch=1,
+            phase=MemberPhase.READY,
+            tokens=("0x0",),
+        ),
+    ):
+        await lifecycle._topologymgr.apply_member(member)
+    store, hints, runner = _DrainStore(), _DrainHints(), _TransferRunnerStub()
+    lifecycle._store = store  # type: ignore[assignment]
+    lifecycle._hint_replayer = hints  # type: ignore[assignment]
+    lifecycle._transfer_runner = runner  # type: ignore[assignment]
+    return lifecycle, store, hints, runner
+
+
+@pytest.mark.tourillon
+async def test_leave_waits_repairs_and_transfers_but_not_hint_satisfaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle, store, hints, runner = await _leaving_lifecycle(tmp_path)
+    client_stopped = asyncio.Event()
+
+    async def stop_client() -> None:
+        if not client_stopped.is_set():
+            assert (await lifecycle._load_state()).phase == MemberPhase.DRAINING
+        client_stopped.set()
+
+    monkeypatch.setattr(lifecycle, "_stop_client", stop_client)
+    await lifecycle.leave()
+    try:
+        await asyncio.wait_for(store.waiting.wait(), 1)
+        assert store.paused
+        assert store.readable
+        assert not client_stopped.is_set()
+        assert (await lifecycle._load_state()).phase == MemberPhase.DRAINING
+        assert not runner.calls
+        assert hints.started
+        assert not hints.stopped
+        assert not store.repairs_stopped
+        with pytest.raises(LeaveError, match="already in progress"):
+            await lifecycle.leave()
+        with pytest.raises(JoinError, match="Leave operation"):
+            await lifecycle.join(["seed:9000"])
+        store.settled.set()
+        await asyncio.wait_for(runner.started.wait(), 1)
+        assert not hints.stopped
+        assert not store.repairs_stopped
+        assert not client_stopped.is_set()
+        runner.run_result.set_result((["range"], []))
+        await asyncio.wait_for(lifecycle._leave_task, 1)
+        assert runner.calls[0][2] == Ring([VNode(token=0, node_id="node-b")]).serial()
+        state = await lifecycle._load_state()
+        assert state.phase == MemberPhase.IDLE
+        assert state.epoch == 4
+        assert state.seeds == ("127.0.0.1:7002",)
+        topology = await lifecycle._topologymgr.snapshot()
+        assert {vnode.node_id for vnode in topology.ring} == {"node-b"}
+        assert hints.stopped
+        assert hints.pending
+        assert hints.started
+        assert store.repairs_stopped
+        assert client_stopped.is_set()
+        assert not store.readable
+    finally:
+        await lifecycle.stop()
+
+
+@pytest.mark.tourillon
+async def test_failed_transfer_stays_draining_and_can_be_retried(
+    tmp_path: Path, caplog
+) -> None:
+    lifecycle, store, hints, runner = await _leaving_lifecycle(tmp_path)
+    store.settled.set()
+    runner.run_result.set_result(([], ["failed-range"]))
+    await lifecycle.leave()
+    await asyncio.wait_for(lifecycle._leave_task, 1)
+    assert (await lifecycle._load_state()).phase == MemberPhase.DRAINING
+    assert "Leave failed" in caplog.text
+    assert not hints.stopped
+    assert not store.repairs_stopped
+    runner.run_result = asyncio.get_running_loop().create_future()
+    runner.run_result.set_result((["range"], []))
+    await lifecycle.leave()
+    await asyncio.wait_for(lifecycle._leave_task, 1)
+    assert (await lifecycle._load_state()).phase == MemberPhase.IDLE
+    await lifecycle.stop()
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize(
+    "phase", [MemberPhase.IDLE, MemberPhase.JOINING, MemberPhase.FAILED]
+)
+async def test_leave_rejects_ineligible_phase_without_transition(
+    tmp_path: Path, phase: MemberPhase
+) -> None:
+    lifecycle = _build_lifecycle(
+        _build_config(tmp_path),
+        _DocumentStatePersistence(
+            {"node": {"node_id": "test-node", "phase": phase.value}}
+        ),
+    )
+    with pytest.raises(LeaveError, match="Cannot leave from phase"):
+        await lifecycle.leave()
+    assert (await lifecycle._load_state()).phase == phase
+
+
+@pytest.mark.tourillon
+async def test_last_node_cannot_silently_discard_its_ranges(tmp_path: Path) -> None:
+    lifecycle = _build_lifecycle(
+        _build_config(tmp_path),
+        _DocumentStatePersistence({"node": {"node_id": "test-node", "phase": "ready"}}),
+    )
+    with pytest.raises(LeaveError, match="another node"):
+        await lifecycle.leave()
+    assert (await lifecycle._load_state()).phase == MemberPhase.READY
+
+
+@pytest.mark.tourillon
+async def test_stop_during_leave_preserves_draining_for_restart(tmp_path: Path) -> None:
+    lifecycle, store, _, _ = await _leaving_lifecycle(tmp_path)
+    await lifecycle.leave()
+    await asyncio.wait_for(store.waiting.wait(), 1)
+    await lifecycle.stop()
+    assert not lifecycle.is_leaving()
+    assert (await lifecycle._load_state()).phase == MemberPhase.DRAINING
+
+
+@pytest.mark.tourillon
+async def test_drained_idle_restart_does_not_bootstrap_ready(
+    tmp_path: Path, monkeypatch
+) -> None:
+    lifecycle, _, hints, _ = await _leaving_lifecycle(tmp_path)
+    state = await lifecycle._load_state()
+    state = await lifecycle._transition_to(
+        state, MemberPhase.DRAINING, with_seeds=["127.0.0.1:7002"]
+    )
+    state = await lifecycle._transition_to(state, MemberPhase.IDLE)
+
+    async def noop() -> None:
+        pass
+
+    monkeypatch.setattr(lifecycle, "_start_peer", noop)
+    monkeypatch.setattr(lifecycle._peer_pool, "start", noop)
+    monkeypatch.setattr(lifecycle._gossiper, "start", noop)
+    await lifecycle.start()
+    assert (await lifecycle._load_state()).phase == MemberPhase.IDLE
+    assert not lifecycle.is_leaving()
+    assert not hints.started
+    assert not lifecycle._client_started
+
+
+@pytest.mark.tourillon
+async def test_idle_with_persisted_seeds_joins_only_on_explicit_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle = _build_lifecycle(
+        _build_config(tmp_path, node_id="node-a"),
+        _DocumentStatePersistence(
+            {
+                "node": {
+                    "node_id": "node-a",
+                    "phase": "idle",
+                    "epoch": 4,
+                    "seeds": ["127.0.0.1:7002"],
+                }
+            }
+        ),
+    )
+    joined: list[NodeState] = []
+
+    async def start_peer() -> None:
+        return None
+
+    async def perform_join(state: NodeState) -> None:
+        joined.append(state)
+
+    monkeypatch.setattr(lifecycle, "_start_peer", start_peer)
+    monkeypatch.setattr(lifecycle, "_perform_join", perform_join)
+    await lifecycle.start()
+    assert (await lifecycle._load_state()).phase == MemberPhase.IDLE
+    assert not joined
+    await lifecycle.join()
+    await asyncio.wait_for(lifecycle._join_task, 1)
+    assert joined[0].phase == MemberPhase.JOINING
+    assert joined[0].seeds == ("127.0.0.1:7002",)
+
+
+@pytest.mark.tourillon
+async def test_restart_resumes_previously_requested_drain(
+    tmp_path: Path, monkeypatch
+) -> None:
+    lifecycle, store, hints, runner = await _leaving_lifecycle(tmp_path)
+    state = await lifecycle._load_state()
+    await lifecycle._transition_to(state, MemberPhase.DRAINING)
+
+    async def noop() -> None:
+        pass
+
+    monkeypatch.setattr(lifecycle, "_start_peer", noop)
+    monkeypatch.setattr(lifecycle, "_start_client", noop)
+    monkeypatch.setattr(lifecycle._peer_pool, "start", noop)
+    monkeypatch.setattr(lifecycle._gossiper, "start", noop)
+    store.settled.set()
+    runner.run_result.set_result(([], []))
+    await lifecycle.start()
+    await asyncio.wait_for(lifecycle._leave_task, 1)
+    assert (await lifecycle._load_state()).phase == MemberPhase.IDLE
+    await lifecycle.stop()
+
+
+@pytest.mark.tourillon
+async def test_stop_without_leave_never_enters_draining(tmp_path: Path) -> None:
+    lifecycle, _, _, _ = await _leaving_lifecycle(tmp_path)
+    await lifecycle.stop()
+    assert (await lifecycle._load_state()).phase == MemberPhase.READY
+
+
+@pytest.mark.tourillon
+def test_leave_seeds_stops_after_five_eligible_peers_in_large_cluster() -> None:
+    visited = []
+
+    def members():
+        for index in range(10_000):
+            visited.append(index)
+            yield Member(
+                node_id=f"node-{index}",
+                peer_address=f"127.0.0.1:{10000 + index}",
+                epoch=1,
+                phase=MemberPhase.READY,
+                tokens=(),
+            )
+
+    state = NodeState(node_id="node-0")
+    assert NodeLifecycle._leave_seeds(state, members()) == [
+        f"127.0.0.1:{10000 + index}" for index in range(1, 6)
+    ]
+    assert visited == list(range(6))
+
+
+@pytest.mark.tourillon
+def test_leave_seeds_skips_ineligible_peers_and_bounds_fallback() -> None:
+    state = NodeState(
+        node_id="node-a", seeds=tuple(f"seed-{i}:9000" for i in range(10))
+    )
+    members = [
+        Member(
+            node_id=f"node-{phase.value}",
+            peer_address=f"{phase.value}:9000",
+            epoch=1,
+            phase=phase,
+            tokens=(),
+        )
+        for phase in MemberPhase
+    ]
+    assert NodeLifecycle._leave_seeds(state, members) == [
+        member.peer_address
+        for member in members
+        if member.phase in (MemberPhase.READY, MemberPhase.PAUSED)
+    ]
+    assert NodeLifecycle._leave_seeds(state, []) == list(state.seeds[:5])
+    assert NodeLifecycle._leave_seeds(NodeState(node_id="node-a"), []) == []
+
+
+@pytest.mark.tourillon
+async def test_departure_replans_with_local_tokens_removed(tmp_path: Path) -> None:
+    ring = Ring([VNode(token=0, node_id="node-b"), *_JOINING.vnodes])
+    changed = ring.add_vnodes([VNode(token=64, node_id="node-c")])
+    lifecycle, runner, topology = _joining_lifecycle(tmp_path, ring)
+    runner.run_result.set_result((["stale"], []))
+    runner.wait_result.set_result((["new-plan"], []))
+    topology.changes.put_nowait(changed)
+    assert await lifecycle._run_transfers(_JOINING, leaving=True) == (["new-plan"], [])
+    assert runner.calls == [
+        ("run", ring.serial(), ring.drop_nodes({"node-a"}).serial()),
+        ("apply", changed.serial(), changed.drop_nodes({"node-a"}).serial()),
+        ("wait",),
+    ]
+
+
+@pytest.mark.tourillon
+async def test_departure_cannot_complete_after_all_other_nodes_leave(
+    tmp_path: Path,
+) -> None:
+    ring = Ring([VNode(token=0, node_id="node-b"), *_JOINING.vnodes])
+    lifecycle, runner, topology = _joining_lifecycle(tmp_path, ring)
+    topology.changes.put_nowait(ring.drop_nodes({"node-b"}))
+    with pytest.raises(LeaveError, match="another node"):
+        await lifecycle._run_transfers(_JOINING, leaving=True)
+    assert runner.cancelled

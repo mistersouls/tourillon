@@ -16,13 +16,15 @@ import asyncio
 import random
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 from tourillon.core.exceptions import (
     InvalidQuorumError,
     InvalidRepairTokenError,
+    NodeDrainingError,
     NoReplicaAvailableError,
     QuorumNotMetError,
     StoreOperationError,
@@ -107,6 +109,54 @@ class StoreService:
         self._repair_slots = asyncio.Semaphore(self._read_repair.concurrency)
         self._repairs_inflight: set[tuple[bytes, str]] = set()
         self._repair_gate = asyncio.Semaphore((repair or RepairConfig()).concurrency)
+        self._accepting_operations = True
+        self._accepting_reads = True
+        self._accepting_read_repairs = True
+        self._mutations: set[asyncio.Future[None]] = set()
+
+    def pause(self, *, readable: bool = True) -> None:
+        """Refuse writes while draining, retaining reads until IDLE."""
+        self._accepting_operations = False
+        self._accepting_reads = readable
+
+    def resume(self) -> None:
+        self._accepting_operations = True
+        self._accepting_reads = True
+        self._accepting_read_repairs = True
+
+    async def stop_read_repairs(self) -> None:
+        """Stop scheduling repairs and let existing background writes settle."""
+        self._accepting_read_repairs = False
+        await self.close()
+
+    async def drain(self) -> None:
+        """Wait for admitted mutations and a snapshot of background writes."""
+        self.pause()
+        if self._mutations:
+            await asyncio.wait(tuple(self._mutations))
+        if self._pending_writes:
+            await asyncio.wait(tuple(self._pending_writes))
+
+    @contextmanager
+    def _operation(self, operation: str) -> Iterator[None]:
+        accepting = (
+            self._accepting_reads if operation == "read" else self._accepting_operations
+        )
+        if not accepting:
+            logger.warning(
+                "Node '%s' refuses %s while draining", self._node_id, operation
+            )
+            raise NodeDrainingError(operation)
+        if operation == "read":
+            yield
+            return
+        settled = asyncio.get_running_loop().create_future()
+        self._mutations.add(settled)
+        try:
+            yield
+        finally:
+            settled.set_result(None)
+            self._mutations.discard(settled)
 
     @property
     def stats(self) -> "ReplicationStats":
@@ -120,12 +170,15 @@ class StoreService:
         for the same reason: a half-applied repair is harmless, but tearing
         down storage mid-write is not.
         """
-        if not self._pending_writes:
-            return
-        await asyncio.gather(*tuple(self._pending_writes), return_exceptions=True)
+        while self._pending_writes:
+            await asyncio.wait(tuple(self._pending_writes))
 
     async def get(self, request: GetRequest) -> Version | None:
         """Get the versioned value for the given address."""
+        with self._operation("read"):
+            return await self._get(request)
+
+    async def _get(self, request: GetRequest) -> Version | None:
         self._validate_quorum("read", request.quorum_read)
         addr = Address(key=request.key, namespace=request.namespace)
         preflist = await self._placement_strategy.preference_list(addr)
@@ -150,6 +203,10 @@ class StoreService:
         return version
 
     async def put(self, request: PutRequest) -> Version | None:
+        with self._operation("write"):
+            return await self._put(request)
+
+    async def _put(self, request: PutRequest) -> Version | None:
         self._validate_quorum("write", request.quorum_write)
         addr = Address(key=request.key, namespace=request.namespace)
         preflist = await self._placement_strategy.preference_list(addr)
@@ -178,6 +235,10 @@ class StoreService:
         return version
 
     async def delete(self, request: DeleteRequest) -> Version | None:
+        with self._operation("delete"):
+            return await self._delete(request)
+
+    async def _delete(self, request: DeleteRequest) -> Version | None:
         self._validate_quorum("write", request.quorum_write)
         addr = Address(key=request.key, namespace=request.namespace)
         preflist = await self._placement_strategy.preference_list(addr)
@@ -209,6 +270,10 @@ class StoreService:
         return await self._local_read_at(key)
 
     async def write(self, record: Record) -> Record:
+        with self._operation("replication.write"):
+            return await self._write(record)
+
+    async def _write(self, record: Record) -> Record:
         """Apply a replicated write received from a peer.
 
         The partition id is recomputed from the address and compared with the
@@ -237,6 +302,10 @@ class StoreService:
         return await self._local_write(record)
 
     async def repair(self, request: RepairRequest) -> RepairResult:
+        with self._operation("repair"):
+            return await self._repair(request)
+
+    async def _repair(self, request: RepairRequest) -> RepairResult:
         """Spread an already-written version to the replicas that lack it.
 
         This is the resumable half of a write that did not reach its quorum.
@@ -595,6 +664,9 @@ class StoreService:
         return sorted(targets)
 
     def _start_repair(self, node_id: str, record: Record) -> None:
+        if not self._accepting_read_repairs:
+            self._stats.read_repairs_skipped += 1
+            return
         marker = (record.key.to_bytes(Keyspace.LOGS), node_id)
         if marker in self._repairs_inflight:
             # A hot key must not spawn one repair per concurrent read.
