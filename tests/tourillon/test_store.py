@@ -35,6 +35,8 @@ from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.models.repair import RepairIssue, decode_token, encode_token
 from tourillon.core.models.req import HintRequest
 from tourillon.core.models.storageschema import (
+    HintKey,
+    HintReference,
     Key,
     Keyspace,
     KVPair,
@@ -127,18 +129,25 @@ class _SessionStub:
     async def get(self, ref: KVRef) -> KVPair | None:
         return self._pairs.get((ref.keyspace, ref.key))
 
+    async def exists(self, ref: KVRef) -> bool:
+        return (ref.keyspace, ref.key) in self._pairs
+
+    def batch(self) -> "_WriteBatch":
+        return _WriteBatch(self)
+
     async def put(self, kv: KVPair) -> None:
         self.store.on_put(kv)
         self._pairs[(kv.keyspace, kv.key)] = kv
         if kv.keyspace == Keyspace.LOGS:
             key = Key.from_bytes(kv.key, Keyspace.LOGS)
             value = Value.from_bytes(kv.value)
+            stored_tag = self._pairs.get((Keyspace.TAGS, key.to_bytes(Keyspace.TAGS)))
             self.store.record = Record(
                 key=key,
                 value=value,
                 tag=(
-                    self.store.record.tag
-                    if self.store.record is not None
+                    Tag.from_bytes(stored_tag.value)
+                    if stored_tag is not None
                     else Tag(kind=TagKind.LIVE)
                 ),
             )
@@ -166,6 +175,26 @@ class _SessionStub:
         if not pairs:
             return None
         return max(pairs, key=lambda pair: pair.key)
+
+
+class _WriteBatch:
+    def __init__(self, session: _SessionStub) -> None:
+        self._session = session
+        self._puts: list[KVPair] = []
+
+    async def __aenter__(self) -> "_WriteBatch":
+        return self
+
+    async def __aexit__(self, *args: Any) -> bool:
+        return False
+
+    def put(self, kv: KVPair) -> None:
+        self._puts.append(kv)
+
+    async def result(self) -> list[None]:
+        for kv in self._puts:
+            await self._session.put(kv)
+        return [None] * len(self._puts)
 
 
 class _SessionProviderStub:
@@ -338,7 +367,6 @@ def _record(
 
 def _hint_record(
     addr: Address,
-    target_node_id: str,
     *,
     pid: int = 7,
     data: bytes = b"value",
@@ -354,7 +382,7 @@ def _hint_record(
             ts=HLCTimestamp(wall_ms=wall_ms, counter=0, node_id="node-a"),
         ),
         value=Value(data=data, quorum_write=1),
-        tag=Tag.hint(original, target_node_id),
+        tag=Tag.hint(original),
     )
 
 
@@ -393,6 +421,30 @@ def _build_store(
 
 
 @pytest.mark.tourillon
+@pytest.mark.parametrize(
+    "kind", [TagKind.LIVE, TagKind.TOMBSTONE, TagKind.HINT, TagKind.STAGING]
+)
+async def test_exists_reports_owned_exact_versions_even_while_draining(
+    kind: TagKind,
+) -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    original = _record(addr)
+    record = Record(key=original.key, value=original.value, tag=Tag(kind))
+    store, storage, _, _, client = _build_store(
+        node_id="node-a",
+        preferences=(),
+        members={},
+        local_store=_StoreStub(record),
+        remote_responses={},
+    )
+    store.pause()
+    assert await store.exists(record.key) is (kind in {TagKind.LIVE, TagKind.TOMBSTONE})
+    assert not await store.exists(_record(addr, wall_ms=4).key)
+    assert storage.open_calls == [7, 7]
+    assert client.requests == []
+
+
+@pytest.mark.tourillon
 def test_hint_request_roundtrip() -> None:
     req = HintRequest(
         target_node_id="node-b",
@@ -427,7 +479,9 @@ async def test_omitted_quorum_requires_a_replica(operation: str) -> None:
 async def test_omitted_quorums_record_one_and_allow_absent_reads() -> None:
     store, *_ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-a", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
         members={},
         local_store=_StoreStub(),
         remote_responses={},
@@ -457,9 +511,9 @@ async def test_get_elects_freshest_version_even_when_outnumbered() -> None:
     store, storage, peer_pool, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
-            Preference(node_id="node-c", readable=True, handoff=None),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-c", readable=True, handoff=None, writable=True),
         ),
         members={
             "node-b": _member("node-b", "127.0.0.1:9001"),
@@ -484,8 +538,8 @@ async def test_get_coordinates_locally_when_node_in_preference_list() -> None:
     store, storage, peer_pool, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(expected_record),
@@ -507,8 +561,8 @@ async def test_get_fans_out_to_all_available_preference_targets() -> None:
     store, storage, peer_pool, serializer, client = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-b", readable=True, handoff=None),
-            Preference(node_id="node-c", readable=True, handoff=None),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-c", readable=True, handoff=None, writable=True),
         ),
         members={
             "node-b": _member("node-b", "127.0.0.1:9001"),
@@ -538,20 +592,25 @@ async def test_put_coordinates_and_uses_handoff_target() -> None:
     addr = Address(namespace=b"ns", key=b"key")
     local = _record(addr, data=b"local")
     remote = _record(addr, data=b"remote")
-    hinted = _hint_record(addr, "node-c", data=b"hinted")
+    hinted = _hint_record(addr, data=b"hinted")
     store, storage, peer_pool, serializer, client = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
-            Preference(node_id="node-c", readable=False, handoff="node-d"),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
+            Preference(
+                node_id="node-c", readable=False, handoff="node-d", writable=False
+            ),
         ),
         members={
             "node-b": _member("node-b", "127.0.0.1:9001"),
             "node-d": _member("node-d", "127.0.0.1:9003"),
         },
         local_store=_StoreStub(local),
-        remote_responses={"replication.write": [remote.to_dict(), hinted.to_dict()]},
+        remote_responses={
+            "replication.write": remote.to_dict(),
+            "replication.hint": hinted.to_dict(),
+        },
     )
 
     version = await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
@@ -563,13 +622,16 @@ async def test_put_coordinates_and_uses_handoff_target() -> None:
     assert storage.open_calls == [7]
     assert [request.kind for request in client.requests] == [
         "replication.write",
-        "replication.write",
+        "replication.hint",
     ]
     second_payload = serializer.decode(client.requests[1].payload)
     assert second_payload["record"]["tag"]["kind"] == "HINT"
     assert second_payload["record"]["tag"]["payload"]["sub"] == "LIVE"
     hinted_tag = Tag.from_dict(second_payload["record"]["tag"])
-    assert Tag.unhint(hinted_tag, "node-c") == Tag(kind=TagKind.LIVE)
+    assert Tag.unhint(hinted_tag) == Tag(kind=TagKind.LIVE)
+    assert hinted_tag.payload.payload == b""
+    assert second_payload["intent"] == "node-c"
+    assert "intent" not in serializer.decode(client.requests[0].payload)
     assert peer_pool.acquire_calls == ["node-b", "node-d"]
 
 
@@ -577,19 +639,24 @@ async def test_put_coordinates_and_uses_handoff_target() -> None:
 @pytest.mark.asyncio
 async def test_put_replicates_to_handoff_and_readable_targets() -> None:
     addr = Address(namespace=b"ns", key=b"key")
-    hinted = _hint_record(addr, "node-b", data=b"hinted")
+    hinted = _hint_record(addr, data=b"hinted")
     store, storage, peer_pool, _, client = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-b", readable=True, handoff="node-z"),
-            Preference(node_id="node-c", readable=True, handoff=None),
+            Preference(
+                node_id="node-b", readable=True, handoff="node-z", writable=True
+            ),
+            Preference(node_id="node-c", readable=True, handoff=None, writable=True),
         ),
         members={
             "node-z": _member("node-z", "127.0.0.1:9009"),
             "node-c": _member("node-c", "127.0.0.1:9002"),
         },
         local_store=_StoreStub(),
-        remote_responses={"replication.write": [hinted.to_dict(), hinted.to_dict()]},
+        remote_responses={
+            "replication.write": hinted.to_dict(),
+            "replication.hint": hinted.to_dict(),
+        },
     )
 
     version = await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
@@ -598,7 +665,7 @@ async def test_put_replicates_to_handoff_and_readable_targets() -> None:
     assert storage.open_calls == []
     assert peer_pool.acquire_calls == ["node-z", "node-c"]
     assert [request.kind for request in client.requests] == [
-        "replication.write",
+        "replication.hint",
         "replication.write",
     ]
 
@@ -611,9 +678,11 @@ async def test_delete_returns_unique_versions() -> None:
     store, storage, peer_pool, _, client = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
-            Preference(node_id="node-c", readable=False, handoff="node-d"),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
+            Preference(
+                node_id="node-c", readable=False, handoff="node-d", writable=False
+            ),
         ),
         members={
             "node-b": _member("node-b", "127.0.0.1:9001"),
@@ -621,7 +690,8 @@ async def test_delete_returns_unique_versions() -> None:
         },
         local_store=_StoreStub(tombstone),
         remote_responses={
-            "replication.write": [tombstone.to_dict(), tombstone.to_dict()]
+            "replication.write": tombstone.to_dict(),
+            "replication.hint": tombstone.to_dict(),
         },
     )
 
@@ -634,7 +704,7 @@ async def test_delete_returns_unique_versions() -> None:
     assert storage.open_calls == [7]
     assert [request.kind for request in client.requests] == [
         "replication.write",
-        "replication.write",
+        "replication.hint",
     ]
     assert peer_pool.acquire_calls == ["node-b", "node-d"]
 
@@ -647,8 +717,8 @@ async def test_put_returns_after_quorum_without_waiting_for_slow_replicas() -> N
     store, _, peer_pool, _, client = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-b", readable=True, handoff=None),
-            Preference(node_id="node-c", readable=True, handoff=None),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-c", readable=True, handoff=None, writable=True),
         ),
         members={
             "node-b": _member("node-b", "127.0.0.1:9001"),
@@ -680,7 +750,9 @@ async def test_put_returns_after_quorum_without_waiting_for_slow_replicas() -> N
 async def test_get_returns_empty_list_when_remote_read_is_missing() -> None:
     store, _, peer_pool, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-b", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
+        ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(),
         remote_responses={"replication.read": None},
@@ -698,7 +770,9 @@ async def test_get_returns_empty_list_when_remote_read_is_missing() -> None:
 async def test_get_raises_when_no_replication_targets_available() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-b", readable=False, handoff=None),),
+        preferences=(
+            Preference(node_id="node-b", readable=False, handoff=None, writable=False),
+        ),
         members={},
         local_store=_StoreStub(),
         remote_responses={"replication.read": None},
@@ -732,14 +806,12 @@ async def test_get_reads_both_owner_and_handoff_before_counting_preference(
     )
     owner, handoff = ("node-a", "node-b") if local_is_owner else ("node-b", "node-a")
     if not local_is_owner:
-        local = Record(key=local.key, value=local.value, tag=Tag.hint(local.tag, owner))
+        local = Record(key=local.key, value=local.value, tag=Tag.hint(local.tag))
     if remote is not None and local_is_owner:
-        remote = Record(
-            key=remote.key, value=remote.value, tag=Tag.hint(remote.tag, owner)
-        )
+        remote = Record(key=remote.key, value=remote.value, tag=Tag.hint(remote.tag))
     store, _, pool, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(owner, True, handoff),),
+        preferences=(Preference(owner, True, handoff, writable=True),),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(local),
         remote_responses={
@@ -767,8 +839,8 @@ async def test_get_owner_and_handoff_cannot_satisfy_two_replica_quorum() -> None
     store, _, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference("node-a", True, "node-b"),
-            Preference("node-c", True, None),
+            Preference("node-a", True, "node-b", writable=True),
+            Preference("node-c", True, None, writable=True),
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(record),
@@ -788,8 +860,8 @@ async def test_get_owner_and_handoff_plus_another_owner_meet_two_replica_quorum(
     store, _, pool, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference("node-a", True, "node-b"),
-            Preference("node-c", True, None),
+            Preference("node-a", True, "node-b", writable=True),
+            Preference("node-c", True, None, writable=True),
         ),
         members={
             "node-b": _member("node-b", "127.0.0.1:9001"),
@@ -807,7 +879,7 @@ async def test_get_owner_and_handoff_plus_another_owner_meet_two_replica_quorum(
 async def test_get_reports_failure_when_neither_owner_nor_handoff_responds() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference("node-b", True, "node-c"),),
+        preferences=(Preference("node-b", True, "node-c", writable=True),),
         members={},
         local_store=_StoreStub(),
         remote_responses={},
@@ -827,7 +899,7 @@ async def test_get_uses_available_read_source_when_other_source_times_out(
     owner, handoff = ("node-a", "node-b") if local_is_owner else ("node-b", "node-a")
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(owner, True, handoff),),
+        preferences=(Preference(owner, True, handoff, writable=True),),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(record),
         remote_responses={"replication.read": None},
@@ -844,7 +916,7 @@ async def test_get_deduplicates_owner_and_handoff_destination() -> None:
     addr = Address(namespace=b"ns", key=b"key")
     store, storage, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference("node-a", True, "node-a"),),
+        preferences=(Preference("node-a", True, "node-a", writable=True),),
         members={},
         local_store=_StoreStub(_record(addr)),
         remote_responses={},
@@ -862,8 +934,8 @@ async def test_put_skips_unreadable_preference_without_handoff() -> None:
     store, storage, peer_pool, _, client = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-b", readable=False, handoff=None),
-            Preference(node_id="node-c", readable=True, handoff=None),
+            Preference(node_id="node-b", readable=False, handoff=None, writable=False),
+            Preference(node_id="node-c", readable=True, handoff=None, writable=True),
         ),
         members={"node-c": _member("node-c", "127.0.0.1:9002")},
         local_store=_StoreStub(),
@@ -913,7 +985,11 @@ async def test_put_raises_when_remote_response_kind_is_invalid() -> None:
             cast(
                 object,
                 _PlacementStub(
-                    (Preference(node_id="node-b", readable=True, handoff=None),)
+                    (
+                        Preference(
+                            node_id="node-b", readable=True, handoff=None, writable=True
+                        ),
+                    )
                 ),
             ),
         ),
@@ -937,7 +1013,9 @@ async def test_get_hides_tombstone_record() -> None:
     addr = Address(namespace=b"ns", key=b"key")
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-a", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
         members={},
         local_store=_StoreStub(_record(addr, tombstone=True)),
         remote_responses={"replication.read": None},
@@ -952,10 +1030,12 @@ async def test_get_hides_tombstone_record() -> None:
 @pytest.mark.asyncio
 async def test_get_returns_hint_record_as_visible_version() -> None:
     addr = Address(namespace=b"ns", key=b"key")
-    hinted = _hint_record(addr, "node-b", data=b"hinted")
+    hinted = _hint_record(addr, data=b"hinted")
     store, _, peer_pool, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-b", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
+        ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(),
         remote_responses={"replication.read": hinted.to_dict()},
@@ -972,7 +1052,9 @@ async def test_get_returns_hint_record_as_visible_version() -> None:
 async def test_get_forward_raises_when_peer_is_unknown() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-b", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
+        ),
         members={},
         local_store=_StoreStub(),
         remote_responses={"replication.read": None},
@@ -995,8 +1077,8 @@ async def test_get_raises_when_quorum_read_not_met() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-b", readable=True, handoff=None),
-            Preference(node_id="node-c", readable=True, handoff=None),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-c", readable=True, handoff=None, writable=True),
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(),
@@ -1014,16 +1096,18 @@ async def test_get_raises_when_quorum_read_not_met() -> None:
 @pytest.mark.asyncio
 async def test_put_raises_when_quorum_write_not_met() -> None:
     addr = Address(namespace=b"ns", key=b"key")
-    hinted = _hint_record(addr, "node-b", data=b"hinted")
+    hinted = _hint_record(addr, data=b"hinted")
     store, _, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-b", readable=True, handoff="node-z"),
-            Preference(node_id="node-c", readable=True, handoff=None),
+            Preference(
+                node_id="node-b", readable=True, handoff="node-z", writable=True
+            ),
+            Preference(node_id="node-c", readable=True, handoff=None, writable=True),
         ),
         members={"node-z": _member("node-z", "127.0.0.1:9009")},
         local_store=_StoreStub(),
-        remote_responses={"replication.write": hinted.to_dict()},
+        remote_responses={"replication.hint": hinted.to_dict()},
     )
 
     with pytest.raises(StoreOperationError, match="write quorum not met") as exc_info:
@@ -1044,9 +1128,9 @@ async def test_get_majority_tombstone_hides_live_version() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
-            Preference(node_id="node-c", readable=True, handoff=None),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-c", readable=True, handoff=None, writable=True),
         ),
         members={
             "node-b": _member("node-b", "127.0.0.1:9001"),
@@ -1067,13 +1151,13 @@ async def test_get_newer_hinted_tombstone_hides_older_live_version() -> None:
     addr = Address(namespace=b"ns", key=b"key")
     stale = _record(addr, data=b"stale", wall_ms=10)
     hinted_delete = _hint_record(
-        addr, "node-c", data=b"", wall_ms=20, original_kind=TagKind.TOMBSTONE
+        addr, data=b"", wall_ms=20, original_kind=TagKind.TOMBSTONE
     )
     store, _, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(stale),
@@ -1091,8 +1175,8 @@ async def test_get_unknown_key_meets_read_quorum_with_empty_responses() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(),
@@ -1109,7 +1193,9 @@ async def test_get_unknown_key_meets_read_quorum_with_empty_responses() -> None:
 async def test_put_raises_when_no_write_target_available() -> None:
     store, _, _, _, client = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-b", readable=False, handoff=None),),
+        preferences=(
+            Preference(node_id="node-b", readable=False, handoff=None, writable=False),
+        ),
         members={},
         local_store=_StoreStub(),
         remote_responses={},
@@ -1136,8 +1222,8 @@ async def test_get_counts_empty_replica_toward_read_quorum() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(),
@@ -1164,8 +1250,8 @@ async def test_get_counts_disagreeing_replicas_toward_read_quorum() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(_record(addr, data=b"v1", wall_ms=3)),
@@ -1187,8 +1273,8 @@ async def test_get_reports_unanswered_replica_as_timeout_error() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(record),
@@ -1203,6 +1289,118 @@ async def test_get_reports_unanswered_replica_as_timeout_error() -> None:
     errors = exc_info.value.to_dict()["errors"]
     assert errors == [
         {"type": "TimeoutError", "message": "no response from node-b within 0.05s"}
+    ]
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("operation", ["put", "delete"])
+async def test_writes_refuse_readable_but_unwritable_owner_without_handoff(
+    operation: str,
+) -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    record = _record(addr)
+    store, storage, _, _, client = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, None, writable=False),),
+        members={},
+        local_store=_StoreStub(record),
+        remote_responses={},
+    )
+    with pytest.raises(NoReplicaAvailableError):
+        if operation == "put":
+            await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+        else:
+            await store.delete(DeleteRequest(namespace=b"ns", key=b"key"))
+    assert client.requests == []
+    assert storage.open_calls == []
+
+
+@pytest.mark.tourillon
+async def test_put_uses_writable_owner_independently_of_readability() -> None:
+    store, _, _, _, _ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", False, None, writable=True),),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    version = await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"written"))
+    assert version is not None and version.data == b"written"
+
+
+@pytest.mark.tourillon
+async def test_put_uses_handoff_for_unwritable_owner() -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    hinted = _hint_record(addr)
+    store, storage, pool, serializer, client = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, "node-b", writable=False),),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(),
+        remote_responses={"replication.hint": hinted.to_dict()},
+    )
+    version = await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+    assert version is not None
+    assert storage.open_calls == []
+    assert pool.acquire_calls == ["node-b"]
+    payload = serializer.decode(client.requests[0].payload)
+    sent = Record.from_dict(payload["record"])
+    assert sent.tag.kind == TagKind.HINT
+    assert payload["intent"] == "node-a"
+    assert client.requests[0].kind == "replication.hint"
+
+
+@pytest.mark.tourillon
+async def test_explicit_repair_retains_readable_owner_routing() -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    record = _record(addr)
+    store, _, _, _, client = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference("node-a", True, None, writable=True),
+            Preference("node-b", True, None, writable=False),
+        ),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(record),
+        remote_responses={
+            "replication.lookup": None,
+            "replication.write": record.to_dict(),
+        },
+    )
+    result = await store.repair(
+        RepairRequest(token=_repair_token(record), quorum_write=2)
+    )
+    assert result.issue == RepairIssue.REPAIRED
+    assert [request.kind for request in client.requests] == [
+        "replication.lookup",
+        "replication.write",
+    ]
+
+
+@pytest.mark.tourillon
+async def test_read_repair_retains_readable_owner_routing() -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    winner = _record(addr, wall_ms=20)
+    stale = _record(addr, wall_ms=10)
+    store, _, _, _, client = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference("node-a", True, None, writable=True),
+            Preference("node-b", True, None, writable=False),
+        ),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(winner),
+        remote_responses={
+            "replication.read": stale.to_dict(),
+            "replication.write": winner.to_dict(),
+        },
+    )
+    version = await store.get(GetRequest(namespace=b"ns", key=b"key", quorum_read=2))
+    await store.close()
+    assert version is not None and version.meta.ts == winner.key.ts
+    assert [request.kind for request in client.requests] == [
+        "replication.read",
+        "replication.write",
     ]
 
 
@@ -1231,6 +1429,100 @@ def _hints(storage: _StorageStub) -> list[Tag]:
 
 
 @pytest.mark.tourillon
+async def test_incoming_hint_generates_local_distinct_obligations() -> None:
+    record = _hint_record(Address(namespace=b"ns", key=b"key"))
+    store, storage, _, _, client = _build_store(
+        node_id="keeper",
+        preferences=(),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    assert await store.hint(record, "node-b") == record
+    assert await store.hint(record, "node-c") == record
+    metas = [kv for kv in storage.store.written if kv.keyspace is Keyspace.META]
+    keys = [HintKey.from_bytes(kv.key) for kv in metas]
+    assert [key.intent for key in keys] == ["node-b", "node-c"]
+    assert all(key.hlc.node_id == "keeper" for key in keys)
+    assert keys[0].hlc < keys[1].hlc
+    references = [HintReference.from_bytes(kv.value) for kv in metas]
+    assert all(reference.key == record.key for reference in references)
+    assert storage.store.record == record
+    assert store.stats.hints_recorded == 2
+    assert client.requests == []
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("intent", ["", "x" * 64, "é" * 32])
+async def test_incoming_hint_rejects_invalid_intent_without_persisting(
+    intent: str,
+) -> None:
+    store, storage, _, _, _ = _build_store(
+        node_id="keeper",
+        preferences=(),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    with pytest.raises(ValueError):
+        await store.hint(_hint_record(Address(namespace=b"ns", key=b"key")), intent)
+    assert storage.store.written == []
+    assert store.stats.hints_recorded == 0
+
+
+@pytest.mark.tourillon
+async def test_incoming_hint_is_refused_while_draining() -> None:
+    store, storage, _, _, _ = _build_store(
+        node_id="keeper",
+        preferences=(),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    store.pause()
+    with pytest.raises(NodeDrainingError) as exc:
+        await store.hint(_hint_record(Address(namespace=b"ns", key=b"key")), "owner")
+    assert exc.value.operation == "replication.hint"
+    assert storage.store.written == []
+
+
+@pytest.mark.tourillon
+async def test_hint_and_plain_write_require_their_own_record_kinds() -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    store, storage, _, _, _ = _build_store(
+        node_id="keeper",
+        preferences=(),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    with pytest.raises(ValueError, match="HINT record"):
+        await store.hint(_record(addr), "owner")
+    with pytest.raises(ValueError, match="hint operation"):
+        await store.write(_hint_record(addr))
+    assert storage.store.written == []
+
+
+@pytest.mark.tourillon
+async def test_local_handoff_persists_obligation_without_network() -> None:
+    store, storage, _, _, client = _build_store(
+        node_id="keeper",
+        preferences=(Preference("owner", False, "keeper", False),),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+    metas = [kv for kv in storage.store.written if kv.keyspace is Keyspace.META]
+    assert len(metas) == 1
+    hint_key = HintKey.from_bytes(metas[0].key)
+    intent = hint_key.intent
+    assert intent == "owner"
+    assert storage.store.record.tag.kind is TagKind.HINT
+    assert client.requests == []
+
+
+@pytest.mark.tourillon
 @pytest.mark.asyncio
 async def test_failed_replica_write_records_local_hint() -> None:
     """A replica believed healthy that misses a write must leave a trace.
@@ -1243,8 +1535,8 @@ async def test_failed_replica_write_records_local_hint() -> None:
     store, storage, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
         ),
         members={},
         local_store=_StoreStub(),
@@ -1254,9 +1546,16 @@ async def test_failed_replica_write_records_local_hint() -> None:
     await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
 
     hints = _hints(storage)
-    assert len(hints) == 1
-    assert hints[0].payload.extract_source_prefix()[0] == "node-b"
-    assert hints[0].payload.sub == TagKind.LIVE
+    assert hints == []
+    assert storage.store.record.tag.kind is TagKind.LIVE
+    obligations = [
+        HintKey.from_bytes(kv.key)
+        for kv in storage.store.written
+        if kv.keyspace == Keyspace.META
+    ]
+    assert len(obligations) == 1
+    assert obligations[0].intent == "node-b"
+    assert obligations[0].hlc.node_id == "node-a"
 
 
 @pytest.mark.tourillon
@@ -1265,7 +1564,9 @@ async def test_local_write_failure_does_not_record_a_hint_for_this_node() -> Non
     """A hint is a handoff: there is nobody to hand off to when we are the target."""
     store, storage, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-a", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
         members={},
         local_store=_FailingStore(),
         remote_responses={},
@@ -1284,8 +1585,8 @@ async def test_hint_write_failure_does_not_mask_the_replication_error() -> None:
     store, storage, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
         ),
         members={},
         local_store=_HintRejectingStore(),
@@ -1316,8 +1617,8 @@ async def test_slow_replica_write_is_detached_rather_than_cancelled() -> None:
     store, storage, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-b", readable=True, handoff=None),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(),
@@ -1345,7 +1646,9 @@ async def test_slow_replica_write_is_detached_rather_than_cancelled() -> None:
 async def test_close_is_a_no_op_without_detached_writes() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-a", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
         members={},
         local_store=_StoreStub(),
         remote_responses={},
@@ -1369,7 +1672,9 @@ async def test_put_persists_the_requested_write_quorum() -> None:
     local_store = _StoreStub(local)
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-a", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
         members={},
         local_store=local_store,
         remote_responses={},
@@ -1391,7 +1696,9 @@ async def test_delete_persists_the_requested_write_quorum() -> None:
     local = _record(addr, data=b"", tombstone=True)
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-a", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
         members={},
         local_store=_StoreStub(local),
         remote_responses={},
@@ -1414,7 +1721,9 @@ async def test_put_refuses_a_quorum_the_store_cannot_record(quorum: int) -> None
     local_store = _StoreStub(_record(addr))
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-a", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
         members={},
         local_store=local_store,
         remote_responses={},
@@ -1435,7 +1744,9 @@ async def test_put_refuses_a_quorum_the_store_cannot_record(quorum: int) -> None
 async def test_delete_refuses_a_quorum_the_store_cannot_record() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-a", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
         members={},
         local_store=_StoreStub(),
         remote_responses={},
@@ -1450,7 +1761,9 @@ async def test_delete_refuses_a_quorum_the_store_cannot_record() -> None:
 async def test_get_refuses_a_quorum_the_store_cannot_record() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-a", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
         members={},
         local_store=_StoreStub(),
         remote_responses={},
@@ -1469,7 +1782,9 @@ async def test_replicated_write_with_a_consistent_pid_is_not_flagged() -> None:
     local_store = _StoreStub()
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-a", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
         members={},
         local_store=local_store,
         remote_responses={},
@@ -1493,7 +1808,9 @@ async def test_replicated_write_with_a_foreign_pid_is_traced_but_applied() -> No
     local_store = _StoreStub()
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-a", readable=True, handoff=None),),
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
         members={},
         local_store=local_store,
         remote_responses={},
@@ -1509,8 +1826,8 @@ async def test_replicated_write_with_a_foreign_pid_is_traced_but_applied() -> No
 
 def _two_owners() -> tuple[Preference, ...]:
     return (
-        Preference(node_id="node-a", readable=True, handoff=None),
-        Preference(node_id="node-b", readable=True, handoff=None),
+        Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        Preference(node_id="node-b", readable=True, handoff=None, writable=True),
     )
 
 
@@ -1633,8 +1950,10 @@ async def test_read_repair_skips_a_handoff_stand_in() -> None:
     store, _, _, _, client = _build_store(
         node_id="node-a",
         preferences=(
-            Preference(node_id="node-a", readable=True, handoff=None),
-            Preference(node_id="node-c", readable=False, handoff="node-b"),
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+            Preference(
+                node_id="node-c", readable=False, handoff="node-b", writable=False
+            ),
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(fresh),
@@ -1999,7 +2318,7 @@ async def test_repair_raises_when_no_replica_holds_the_version() -> None:
 @pytest.mark.asyncio
 async def test_repair_promotes_a_version_that_only_survives_as_a_hint() -> None:
     addr = Address(namespace=b"ns", key=b"key")
-    hinted = _hint_record(addr, "node-b", data=b"v1", wall_ms=9)
+    hinted = _hint_record(addr, data=b"v1", wall_ms=9)
     store, _, _, _, client = _build_store(
         node_id="node-a",
         preferences=_two_owners(),
@@ -2129,7 +2448,9 @@ async def test_repair_raises_when_no_replica_is_available() -> None:
     record = _record(addr, data=b"v1", wall_ms=9)
     store, _, _, _, _ = _build_store(
         node_id="node-a",
-        preferences=(Preference(node_id="node-b", readable=False, handoff=None),),
+        preferences=(
+            Preference(node_id="node-b", readable=False, handoff=None, writable=False),
+        ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(record),
         remote_responses={},

@@ -60,6 +60,9 @@ class LmdbSession(Session):
     async def get(self, ref: KVRef) -> KVPair | None:
         return await self._executor.execute(self._txn.get, ref)
 
+    async def exists(self, ref: KVRef) -> bool:
+        return await self._executor.execute(self._txn.exists, ref)
+
     async def put(self, kv: KVPair) -> None:
         await self._executor.execute(self._txn.put, kv)
 

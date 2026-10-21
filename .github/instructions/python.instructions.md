@@ -23,6 +23,12 @@ Never add `__all__` outside `__init__.py`.
 - Use `Protocol` for ports, `@dataclass(frozen=True)` for value objects and wire models, `enum.Enum` for closed sets.
 - Keep cyclomatic complexity `<= 8` per function (`C901`). Extract a private helper rather than adding another branch.
 - Private module/class members are `_`-prefixed; public surface stays intentionally small.
+- Inside instance methods, call private helpers through `self` (for example,
+  `self._decode_hint(...)`), not through the concrete class name. Do not make a
+  caller static just to invoke a private helper through the class.
+- Use `@staticmethod` when a method needs neither instance nor class access.
+  Use `@classmethod` with `cls` when it needs class access but not instance
+  access. Use an instance method when it needs `self`.
 
 ## Docstrings
 

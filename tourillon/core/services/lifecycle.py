@@ -32,6 +32,7 @@ from tourillon.core.log import logger
 from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.models.state import NodeState
 from tourillon.core.partition.partitioner import Partitioner
+from tourillon.core.partition.placement import PlacementStrategy
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports import Telemetry
 from tourillon.core.ports.storage import Storage
@@ -66,6 +67,7 @@ class NodeLifecycle:
         gossip_stats: GossipStats,
         telemetry: Telemetry,
         store: StoreService,
+        placement_strategy: PlacementStrategy,
     ) -> None:
         self._config = config
         self._persistence = persistence
@@ -82,6 +84,8 @@ class NodeLifecycle:
             peer_pool=peer_pool,
             serializer=serializer,
             total_groups=partitioner.total_groups,
+            placement_strategy=placement_strategy,
+            node_id=config.node.id,
         )
         self._peer_server = EnvelopeServer(
             name="peer",
@@ -223,7 +227,9 @@ class NodeLifecycle:
                     with_seeds=self._leave_seeds(state, topology.registry),
                 )
             self._store.pause()
+            self._hint_replayer.pause_local_writes()
             await self._publish_state(state)
+            await self._hint_replayer.start()
             self._leave_task = asyncio.create_task(
                 self._perform_leave(state), name="node-leave"
             )
@@ -243,11 +249,12 @@ class NodeLifecycle:
 
     async def _perform_leave(self, state: NodeState) -> None:
         try:
-            await self._hint_replayer.start()
             await self._store.drain()
+            await self._hint_replayer.drain_local_writes()
             await self._drain_transfers(state)
-            await self._hint_replayer.stop()
             await self._store.stop_read_repairs()
+            await self._hint_replayer.wait()
+            await self._hint_replayer.stop()
             self._store.pause(readable=False)
             await self._stop_client()
             idle = await self._transition_to(state, MemberPhase.IDLE)
@@ -325,6 +332,7 @@ class NodeLifecycle:
                 )
                 final = await self._transition_to(state, MemberPhase.READY)
                 self._store.resume()
+                self._hint_replayer.resume_local_writes()
                 await self._start_client()
                 ready = True
         else:
@@ -419,6 +427,7 @@ class NodeLifecycle:
         await self._gossiper.start()
         await self._publish_state(ready_state)
         self._store.resume()
+        self._hint_replayer.resume_local_writes()
         await self._start_client()
         await self._hint_replayer.start()
 
@@ -471,6 +480,7 @@ class NodeLifecycle:
     async def _startup_draining(self) -> None:
         await self._start_peer()
         self._store.pause()
+        self._hint_replayer.pause_local_writes()
         state = await self._load_state()
         await self._peer_pool.start()
         if state.seeds and not await self._sync_full(state):
@@ -481,6 +491,7 @@ class NodeLifecycle:
         await self._gossiper.start()
         await self._publish_state(state)
         await self._start_client()
+        await self._hint_replayer.start()
         self._leave_task = asyncio.create_task(
             self._perform_leave(state), name="node-leave"
         )

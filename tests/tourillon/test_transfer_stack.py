@@ -241,7 +241,7 @@ def _dataset() -> list[Record]:
         _record(0, 1),
         _record(0, 2),
         _kind(_record(1, 1), TagKind.TOMBSTONE),
-        _with_tag(_record(2, 1), Tag.hint(Tag(kind=TagKind.LIVE), "node-x")),
+        _record(2, 1),
         _record(3, 1),
         _record(3, 2),
     ]
@@ -380,8 +380,9 @@ async def test_stream_sends_transferable_records_in_key_order_in_numbered_chunks
     staged_elsewhere = _with_tag(
         _record(1, 5), Tag.staging(Tag(kind=TagKind.LIVE), "other")
     )
+    hinted = _with_tag(_record(2, 5), Tag.hint(Tag(kind=TagKind.LIVE)))
     stale = _kind(_record(2, 7), TagKind.STALE)
-    source.seed(*records, staged_elsewhere, stale)
+    source.seed(*records, staged_elsewhere, hinted, stale)
     streamer = _streamer(source, max_chunk_size=64)
 
     chunks = [chunk async for chunk in streamer.stream()]
@@ -502,6 +503,12 @@ async def test_receiver_rejects_corrupted_streams() -> None:
         (streamer.encode_record(_record(9, 1)), "outside its segment"),
         (
             streamer.encode_record(
+                _with_tag(_record(0, 1), Tag.hint(Tag(kind=TagKind.LIVE)))
+            ),
+            "received a HINT record",
+        ),
+        (
+            streamer.encode_record(
                 _with_tag(_record(0, 1), Tag.staging(Tag(kind=TagKind.LIVE), "x"))
             ),
             "received a STAGING record",
@@ -537,7 +544,7 @@ def _largest_record() -> Record:
             ),
         ),
         value=Value(data=b"v" * MAX_VALUE_DATA_LEN, quorum_write=MAX_QUORUM_WRITE),
-        tag=Tag.hint(Tag(kind=TagKind.TOMBSTONE), "h" * MAX_NODE_ID_LEN_BYTES),
+        tag=Tag(kind=TagKind.TOMBSTONE),
     )
 
 

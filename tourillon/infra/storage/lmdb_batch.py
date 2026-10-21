@@ -78,6 +78,10 @@ class LmdbBatch:
         )
         self._items.append(item)
 
+    def exists(self, ref: KVRef) -> None:
+        item = BatchItem(fn=self._txn.exists, args=(ref,), kwargs={})
+        self._items.append(item)
+
     def put(self, kv: KVPair) -> None:
         item = BatchItem(
             fn=self._txn.put,

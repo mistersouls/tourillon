@@ -165,21 +165,23 @@ def _build_lifecycle(
     )
     partitioner = Partitioner(hashspace=HashSpace(bits=128), pshift=17, gshift=5)
     storage = _StorageStub()
+    placement = SimplePlacementStrategy(
+        replication_factor=config.placement.replication_factor,
+        topologymgr=topologymgr,
+        partitioner=partitioner,
+        peer_pool=peer_pool,
+    )
     store = StoreService(
         node_id=config.node.id,
         storage=storage,  # type: ignore[arg-type]
         partitioner=partitioner,
-        placement_strategy=SimplePlacementStrategy(
-            replication_factor=config.placement.replication_factor,
-            topologymgr=topologymgr,
-            partitioner=partitioner,
-            peer_pool=peer_pool,
-        ),
+        placement_strategy=placement,
         clock=HLCClock(node_id=config.node.id),
         serializer=serializer,
         peer_pool=peer_pool,
     )
     return NodeLifecycle(
+        placement_strategy=placement,
         config=config,
         peer_dispatcher=Dispatcher(),
         client_dispatcher=Dispatcher(),
@@ -1045,9 +1047,21 @@ class _DrainStore:
 
 class _DrainHints:
     def __init__(self) -> None:
-        self.pending = True
+        self.local_paused = False
+        self.local_drained = False
+        self.pending = False
         self.started = False
         self.stopped = False
+        self.waiting = asyncio.Event()
+        self.satisfied = asyncio.Event()
+        self.wait_error: RuntimeError | None = None
+
+    def pause_local_writes(self) -> None:
+        self.local_paused = True
+
+    async def drain_local_writes(self) -> None:
+        assert self.local_paused
+        self.local_drained = True
 
     async def start(self) -> None:
         self.started = True
@@ -1055,6 +1069,14 @@ class _DrainHints:
 
     async def stop(self) -> None:
         self.stopped = True
+
+    async def wait(self) -> None:
+        self.waiting.set()
+        if self.wait_error is not None:
+            raise self.wait_error
+        if self.pending:
+            await self.satisfied.wait()
+            self.pending = False
 
 
 async def _leaving_lifecycle(tmp_path: Path):
@@ -1096,11 +1118,12 @@ async def _leaving_lifecycle(tmp_path: Path):
 
 
 @pytest.mark.tourillon
-async def test_leave_waits_repairs_and_transfers_but_not_hint_satisfaction(
+async def test_leave_waits_repairs_transfers_and_hint_satisfaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lifecycle, store, hints, runner = await _leaving_lifecycle(tmp_path)
+    hints.pending = True
     client_stopped = asyncio.Event()
 
     async def stop_client() -> None:
@@ -1110,9 +1133,11 @@ async def test_leave_waits_repairs_and_transfers_but_not_hint_satisfaction(
 
     monkeypatch.setattr(lifecycle, "_stop_client", stop_client)
     await lifecycle.leave()
+    assert hints.started
     try:
         await asyncio.wait_for(store.waiting.wait(), 1)
         assert store.paused
+        assert hints.local_paused
         assert store.readable
         assert not client_stopped.is_set()
         assert (await lifecycle._load_state()).phase == MemberPhase.DRAINING
@@ -1126,10 +1151,19 @@ async def test_leave_waits_repairs_and_transfers_but_not_hint_satisfaction(
             await lifecycle.join(["seed:9000"])
         store.settled.set()
         await asyncio.wait_for(runner.started.wait(), 1)
+        assert hints.local_drained
         assert not hints.stopped
         assert not store.repairs_stopped
         assert not client_stopped.is_set()
         runner.run_result.set_result((["range"], []))
+        await asyncio.wait_for(hints.waiting.wait(), 1)
+        assert (await lifecycle._load_state()).phase == MemberPhase.DRAINING
+        assert not lifecycle._leave_task.done()
+        assert not hints.stopped
+        assert store.repairs_stopped
+        assert not client_stopped.is_set()
+        assert store.readable
+        hints.satisfied.set()
         await asyncio.wait_for(lifecycle._leave_task, 1)
         assert runner.calls[0][2] == Ring([VNode(token=0, node_id="node-b")]).serial()
         state = await lifecycle._load_state()
@@ -1139,11 +1173,31 @@ async def test_leave_waits_repairs_and_transfers_but_not_hint_satisfaction(
         topology = await lifecycle._topologymgr.snapshot()
         assert {vnode.node_id for vnode in topology.ring} == {"node-b"}
         assert hints.stopped
-        assert hints.pending
+        assert not hints.pending
         assert hints.started
         assert store.repairs_stopped
         assert client_stopped.is_set()
         assert not store.readable
+    finally:
+        await lifecycle.stop()
+
+
+@pytest.mark.tourillon
+async def test_leave_does_not_schedule_drain_when_replayer_start_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle, _, hints, runner = await _leaving_lifecycle(tmp_path)
+
+    async def fail_start() -> None:
+        raise RuntimeError("replayer unavailable")
+
+    monkeypatch.setattr(hints, "start", fail_start)
+    try:
+        with pytest.raises(RuntimeError, match="replayer unavailable"):
+            await lifecycle.leave()
+        assert not lifecycle.is_leaving()
+        assert not runner.calls
+        assert (await lifecycle._load_state()).phase is MemberPhase.DRAINING
     finally:
         await lifecycle.stop()
 
@@ -1167,6 +1221,44 @@ async def test_failed_transfer_stays_draining_and_can_be_retried(
     await asyncio.wait_for(lifecycle._leave_task, 1)
     assert (await lifecycle._load_state()).phase == MemberPhase.IDLE
     await lifecycle.stop()
+
+
+@pytest.mark.tourillon
+async def test_failed_hint_wait_never_publishes_idle(tmp_path: Path, caplog) -> None:
+    lifecycle, store, hints, runner = await _leaving_lifecycle(tmp_path)
+    store.settled.set()
+    runner.run_result.set_result((["range"], []))
+    hints.wait_error = RuntimeError("hint storage unavailable")
+    try:
+        await lifecycle.leave()
+        await asyncio.wait_for(lifecycle._leave_task, 1)
+        assert (await lifecycle._load_state()).phase is MemberPhase.DRAINING
+        assert "hint storage unavailable" in caplog.text
+        assert not hints.stopped
+        assert store.readable
+    finally:
+        await lifecycle.stop()
+
+
+@pytest.mark.tourillon
+async def test_shutdown_cancels_waiting_leave_without_publishing_idle(
+    tmp_path: Path,
+) -> None:
+    lifecycle, store, hints, runner = await _leaving_lifecycle(tmp_path)
+    store.settled.set()
+    hints.pending = True
+    runner.run_result.set_result((["range"], []))
+    try:
+        await lifecycle.leave()
+        await asyncio.wait_for(hints.waiting.wait(), 1)
+        leave = lifecycle._leave_task
+        assert not leave.done()
+    finally:
+        await lifecycle.stop()
+    assert leave.cancelled()
+    assert hints.stopped
+    assert hints.pending
+    assert (await lifecycle._load_state()).phase is MemberPhase.DRAINING
 
 
 @pytest.mark.tourillon
@@ -1286,6 +1378,7 @@ async def test_restart_resumes_previously_requested_drain(
     store.settled.set()
     runner.run_result.set_result(([], []))
     await lifecycle.start()
+    assert hints.started
     await asyncio.wait_for(lifecycle._leave_task, 1)
     assert (await lifecycle._load_state()).phase == MemberPhase.IDLE
     await lifecycle.stop()

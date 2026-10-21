@@ -102,6 +102,14 @@ Therefore:
 8. **Do not change `uv.lock` by hand.** It is committed deliberately for reproducible builds.
 9. **Add tests for both success and failure paths** whenever you change runtime behaviour.
 
+### Development compatibility policy
+
+Tourillon is pre-alpha. Unless explicitly requested for a task, do not add
+backward-compatibility layers, legacy-format detection, migration machinery or
+dedicated legacy-data errors. Update producers, consumers, tests and documentation
+to the new format together. Development data may be recreated, but never delete
+existing data automatically.
+
 ---
 
 ## 5. Required file header

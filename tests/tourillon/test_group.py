@@ -17,6 +17,11 @@ from contextlib import asynccontextmanager
 import pytest
 
 from tourillon.core.models.storageschema import (
+    MAX_VALUE_DATA_LEN,
+    Hint,
+    HintKey,
+    HintPrefix,
+    HintReference,
     Key,
     Keyspace,
     KVPair,
@@ -51,6 +56,9 @@ class _FakeBatch:
     def get(self, ref: KVRef) -> None:
         self._ops.append(("get", ref))
 
+    def exists(self, ref: KVRef) -> None:
+        self._ops.append(("exists", ref))
+
     def put(self, kv: KVPair) -> None:
         self._ops.append(("put", kv))
 
@@ -81,6 +89,8 @@ class _FakeBatch:
             kind = op[0]
             if kind == "get":
                 results.append(self._store.get(op[1]))
+            elif kind == "exists":
+                results.append((op[1].keyspace, op[1].key) in self._store._items)
             elif kind == "put":
                 self._store.put(op[1])
                 results.append(None)
@@ -170,6 +180,9 @@ class _FakeSession:
     async def get(self, ref: KVRef) -> KVPair | None:
         return self._store.get(ref)
 
+    async def exists(self, ref: KVRef) -> bool:
+        return (ref.keyspace, ref.key) in self._store._items
+
     async def put(self, kv: KVPair) -> None:
         self._store.put(kv)
 
@@ -228,6 +241,38 @@ class _FakeSessionProvider:
         return None
 
 
+class _MetadataOnlyStore(_FakeStore):
+    def get(self, ref: KVRef) -> KVPair | None:
+        assert ref.keyspace is not Keyspace.LOGS, "existence must not load the value"
+        return super().get(ref)
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("kind", list(TagKind))
+@pytest.mark.parametrize("has_value", [False, True])
+async def test_exists_checks_exact_owned_version_without_loading_value(
+    kind: TagKind, has_value: bool
+) -> None:
+    store = _MetadataOnlyStore()
+    record = _record(1, 1)
+    store.put(
+        KVPair(record.key.to_bytes(Keyspace.TAGS), Tag(kind).to_bytes(), Keyspace.TAGS)
+    )
+    if has_value:
+        store.put(
+            KVPair(
+                record.key.to_bytes(Keyspace.LOGS),
+                record.value.to_bytes(),
+                Keyspace.LOGS,
+            )
+        )
+    group = PartitionGroupStore(_FakeSessionProvider(store))
+    assert await group.exists(record.key) is (
+        has_value and kind in {TagKind.LIVE, TagKind.TOMBSTONE}
+    )
+    assert not await group.exists(_record(1, 2).key)
+
+
 class _FakePartitioner:
     def __init__(self, start: int, end: int, group_id: int = 0) -> None:
         self._start = start
@@ -237,6 +282,39 @@ class _FakePartitioner:
     def group_bounds(self, gid: int) -> tuple[int, int]:
         assert gid == self._group_id
         return self._start, self._end
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("kind", list(TagKind))
+@pytest.mark.parametrize("has_value", [False, True])
+async def test_hint_promotion_checks_metadata_without_writing_when_readonly(
+    kind: TagKind, has_value: bool
+) -> None:
+    storage = _MetadataOnlyStore()
+    record = _record(1, 1)
+    tag = Tag(kind)
+    storage.put(
+        KVPair(record.key.to_bytes(Keyspace.TAGS), tag.to_bytes(), Keyspace.TAGS)
+    )
+    if has_value:
+        storage.put(
+            KVPair(
+                record.key.to_bytes(Keyspace.LOGS),
+                record.value.to_bytes(),
+                Keyspace.LOGS,
+            )
+        )
+    provider = _FakeSessionProvider(storage)
+    group = PartitionGroupHint(provider)
+    absent = _record(1, 2)
+
+    confirmed, applied = await group.promote([record, absent], writable=False)
+    assert confirmed == [
+        has_value and kind in {TagKind.LIVE, TagKind.TOMBSTONE},
+        False,
+    ]
+    assert applied == 0
+    assert provider.opened == 1
 
 
 def _record(pid: int, idx: int) -> Record:
@@ -296,6 +374,14 @@ def _staging(
 
 def _hints(store: _FakeStore) -> PartitionGroupHint:
     return PartitionGroupHint(_FakeSessionProvider(store))
+
+
+def _hint(record: Record, intent: str, wall_ms: int) -> Hint:
+    return Hint(
+        record=_with_tag(record, Tag.hint(record.tag)),
+        intent=intent,
+        hlc=HLCTimestamp(wall_ms=wall_ms, counter=0, node_id="hint"),
+    )
 
 
 async def _scan(staging: PartitionGroupStaging, **kwargs) -> list[Record]:
@@ -455,13 +541,13 @@ async def test_commit_activates_owned_records_only_and_is_idempotent() -> None:
 @pytest.mark.asyncio
 async def test_commit_restores_hint_and_tombstone_tags() -> None:
     store = _FakeStore()
-    hint = _with_tag(_record(7, 1), Tag.hint(Tag(kind=TagKind.LIVE), "node-b"))
+    hint = _with_tag(_record(7, 1), Tag.hint(Tag(kind=TagKind.LIVE)))
     tombstone = _with_tag(_record(7, 2), Tag(kind=TagKind.TOMBSTONE))
     staging = _staging(store)
     await staging.stage([hint, tombstone])
 
     assert await staging.commit() == 2
-    assert _stored_tag(store, hint) == Tag.hint(Tag(kind=TagKind.LIVE), "node-b")
+    assert _stored_tag(store, hint) == Tag.hint(Tag(kind=TagKind.LIVE))
     assert _stored_tag(store, tombstone) == Tag(kind=TagKind.TOMBSTONE)
 
 
@@ -504,42 +590,325 @@ async def test_commit_keeps_unreadable_entries_and_stops_at_the_segment_end() ->
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_hint_satisfy_restores_original_tags_and_is_idempotent() -> None:
+async def test_hint_put_persists_version_and_independent_obligations() -> None:
     store = _FakeStore()
-    live = _with_tag(_record(7, 1), Tag.hint(Tag(kind=TagKind.LIVE), "node-b"))
-    tombstone = _with_tag(
-        _record(7, 2), Tag.hint(Tag(kind=TagKind.TOMBSTONE), "node-b")
-    )
-    plain = _record(7, 3)
-    for record in (live, tombstone, plain):
-        _seed_record(store, record)
-
+    record = _record(7, 1)
+    first = _hint(record, "node-a", 500)
+    second = _hint(record, "node-b", 500)
     hints = _hints(store)
 
-    assert await hints.satisfy([live, tombstone, plain]) is True
-    assert _stored_tag(store, live) == Tag(kind=TagKind.LIVE)
-    assert _stored_tag(store, tombstone) == Tag(kind=TagKind.TOMBSTONE)
-    assert _stored_tag(store, plain) == plain.tag
-    assert await hints.satisfy([live, tombstone]) is False
+    first_key = await hints.put(first)
+    second_key = await hints.put(second)
+    await hints.put(first)
+
+    assert first_key != second_key
+    assert _stored_tag(store, record) == first.record.tag
+    assert store.get(
+        KVRef(record.key.to_bytes(Keyspace.LOGS), Keyspace.LOGS)
+    ) == KVPair(
+        record.key.to_bytes(Keyspace.LOGS), record.value.to_bytes(), Keyspace.LOGS
+    )
+    obligations = store.list(Keyspace.META, prefix=HintPrefix("node-a"))
+    assert len(obligations) == 1
+    reference = HintReference.from_bytes(obligations[0].value)
+    key = reference.key
+    assert key == record.key
+    assert len(store.list(Keyspace.META)) == 2
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("kind", [TagKind.LIVE, TagKind.TOMBSTONE])
+@pytest.mark.parametrize("has_value", [False, True])
+async def test_hint_put_preserves_owned_version_and_records_obligation(
+    kind: TagKind, has_value: bool
+) -> None:
+    class TrackingStore(_FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[Keyspace] = []
+
+        def put(self, kv: KVPair) -> None:
+            self.writes.append(kv.keyspace)
+            super().put(kv)
+
+    store = TrackingStore()
+    record = _with_tag(_record(7, 1), Tag(kind))
+    _seed_record(store, record)
+    if not has_value:
+        store.delete(KVRef(record.key.to_bytes(Keyspace.LOGS), Keyspace.LOGS))
+    store.writes.clear()
+    provider = _FakeSessionProvider(store)
+    hints = PartitionGroupHint(provider)
+    hint = _hint(record, "node-b", 500)
+
+    key = await hints.put(hint)
+
+    assert _stored_tag(store, record) == record.tag
+    assert store.writes == [Keyspace.META]
+    assert provider.opened == 1
+    assert store.get(KVRef(key.to_bytes(), Keyspace.META)) is not None
+    assert (
+        store.get(KVRef(record.key.to_bytes(Keyspace.LOGS), Keyspace.LOGS)) is not None
+    ) is has_value
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("kind", [TagKind.LIVE, TagKind.TOMBSTONE])
+async def test_hint_promotion_activates_in_one_session_and_preserves_obligations(
+    kind: TagKind,
+) -> None:
+    storage = _FakeStore()
+    provider = _FakeSessionProvider(storage)
+    group = PartitionGroupHint(provider)
+    record = _with_tag(_record(7, 1), Tag(kind))
+    first = _hint(record, "node-b", 800)
+    second = _hint(record, "node-c", 801)
+    await group.put(first)
+    await group.put(second)
+    obligations = storage.list(Keyspace.META)
+    before = provider.opened
+
+    assert await group.promote([record]) == ([True], 1)
+    assert provider.opened == before + 1
+    assert _stored_tag(storage, record) == record.tag
+    assert storage.list(Keyspace.META) == obligations
+    assert await group.promote([record]) == ([True], 0)
+    assert [hint async for hint in group.iter()] == [first, second]
+
+
+@pytest.mark.tourillon
+async def test_hint_promotion_rejects_unowned_records_before_opening_session() -> None:
+    storage = _FakeStore()
+    provider = _FakeSessionProvider(storage)
+    group = PartitionGroupHint(provider)
+    record = _record(7, 1)
+    hinted = _with_tag(record, Tag.hint(record.tag))
+
+    with pytest.raises(ValueError, match="promotion requires"):
+        await group.promote([record, hinted])
+
+    assert provider.opened == 0
+    assert storage.list(Keyspace.TAGS) == []
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_hint_satisfy_skips_missing_and_unreadable_entries() -> None:
+async def test_hint_satisfy_deletes_only_exact_obligation_and_keeps_version() -> None:
     store = _FakeStore()
-    missing = _with_tag(_record(7, 1), Tag.hint(Tag(kind=TagKind.LIVE), "node-b"))
-    broken = _with_tag(_record(7, 2), Tag.hint(Tag(kind=TagKind.LIVE), "node-b"))
-    _seed_record(store, broken)
-    store.put(
-        KVPair(
-            key=broken.key.to_bytes(Keyspace.TAGS),
-            value=b"\xff",
-            keyspace=Keyspace.TAGS,
-        )
+    record = _record(7, 1)
+    delivered = _hint(record, "node-b", 600)
+    newer = _hint(record, "node-b", 601)
+    hints = _hints(store)
+    await hints.put(delivered)
+    await hints.put(newer)
+
+    await hints.satisfy([delivered])
+    await hints.satisfy([delivered])
+    assert _stored_tag(store, record) == delivered.record.tag
+    assert (
+        store.get(KVRef(record.key.to_bytes(Keyspace.LOGS), Keyspace.LOGS)) is not None
+    )
+    remaining = store.list(Keyspace.META)
+    assert len(remaining) == 1
+    assert HintKey.from_bytes(remaining[0].key) == HintKey(newer.intent, newer.hlc)
+
+
+@pytest.mark.tourillon
+async def test_hint_satisfy_deletes_in_one_session_without_reading() -> None:
+    class NoReadStore(_FakeStore):
+        forbid_reads = False
+
+        def get(self, ref: KVRef) -> KVPair | None:
+            assert not self.forbid_reads, "satisfaction must not read before deleting"
+            return super().get(ref)
+
+    store = NoReadStore()
+    provider = _FakeSessionProvider(store)
+    hints = PartitionGroupHint(provider)
+    delivered = [_hint(_record(7, idx), "node-b", 800 + idx) for idx in (1, 2)]
+    for hint in delivered:
+        await hints.put(hint)
+    store.forbid_reads = True
+    before = provider.opened
+
+    await hints.satisfy([])
+    assert provider.opened == before
+    await hints.satisfy(delivered)
+
+    assert provider.opened == before + 1
+    assert store.list(Keyspace.META) == []
+    assert len(store.list(Keyspace.TAGS)) == 2
+    assert len(store.list(Keyspace.LOGS)) == 2
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_hint_iter_pages_with_short_sessions_and_deleted_boundary() -> None:
+    store = _FakeStore()
+    provider = _FakeSessionProvider(store)
+    hints = PartitionGroupHint(provider)
+    expected = [_hint(_record(7, idx), "node-a", 700 + idx) for idx in range(1, 6)]
+    for hint in expected:
+        await hints.put(hint)
+
+    before_scan = provider.opened
+    iterator = hints.iter(batch_size=2)
+    found = [await anext(iterator), await anext(iterator)]
+    assert provider.active == 0
+    boundary = found[-1]
+    store.delete(
+        KVRef(HintKey(boundary.intent, boundary.hlc).to_bytes(), Keyspace.META)
     )
 
-    assert await _hints(store).satisfy([missing, broken]) is False
-    assert store.get(KVRef(key=broken.key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS)).value == b"\xff"  # type: ignore[union-attr]
+    found.extend([hint async for hint in iterator])
+
+    assert found == expected
+    assert provider.opened - before_scan == 4
+    assert provider.active == 0
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "meta_key",
+        "meta_reference",
+        "empty_tag",
+        "unknown_tag",
+        "hint_tag",
+        "value",
+        "oversized_value",
+    ],
+)
+@pytest.mark.parametrize("batch_size", [1, 2])
+async def test_hint_iter_logs_invalid_entry_and_continues(
+    corruption: str, batch_size: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = _FakeStore()
+    hints = _hints(store)
+    invalid = _hint(_record(7, 1), "node-b", 800)
+    following = _hint(_record(7, 2), "node-b", 801)
+    invalid_key = await hints.put(invalid)
+    await hints.put(following)
+    key = invalid_key.to_bytes()
+    if corruption == "meta_key":
+        store.delete(KVRef(key, Keyspace.META))
+        key = HintPrefix().to_bytes()
+        reference = HintReference(invalid.record.key)
+        store.put(KVPair(key, reference.to_bytes(), Keyspace.META))
+    elif corruption == "meta_reference":
+        store.put(KVPair(key, b"", Keyspace.META))
+    else:
+        encoded = {
+            "empty_tag": b"",
+            "unknown_tag": b"\xff",
+            "hint_tag": TagKind.HINT.value,
+            "value": b"",
+            "oversized_value": (
+                b"\x01" + b"x" * (MAX_VALUE_DATA_LEN + 1)
+                if corruption == "oversized_value"
+                else b""
+            ),
+        }[corruption]
+        keyspace = (
+            Keyspace.LOGS
+            if corruption in {"value", "oversized_value"}
+            else Keyspace.TAGS
+        )
+        store.put(KVPair(invalid.record.key.to_bytes(keyspace), encoded, keyspace))
+    obligations = store.list(Keyspace.META)
+
+    found = [hint async for hint in hints.iter(batch_size=batch_size)]
+
+    assert found == [following]
+    assert "Cannot decode hint obligation" in caplog.text
+    assert key.hex() in caplog.text
+    assert store.list(Keyspace.META) == obligations
+    assert await hints.pending()
+
+
+@pytest.mark.tourillon
+async def test_hint_iter_propagates_storage_access_failure() -> None:
+    class FailingReadStore(_FakeStore):
+        def get(self, ref: KVRef) -> KVPair | None:
+            raise OSError("storage unavailable")
+
+    store = FailingReadStore()
+    hint = _hint(_record(7, 1), "node-b", 800)
+    hint_key = HintKey(hint.intent, hint.hlc)
+    reference = HintReference(hint.record.key)
+    store.put(KVPair(hint_key.to_bytes(), reference.to_bytes(), Keyspace.META))
+    hints = _hints(store)
+
+    with pytest.raises(OSError, match="storage unavailable"):
+        _ = [item async for item in hints.iter()]
+
+    assert await hints.pending()
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [Keyspace.TAGS, Keyspace.LOGS])
+@pytest.mark.parametrize("batch_size", [1, 2])
+async def test_hint_iter_logs_missing_version_and_continues(
+    missing: Keyspace, batch_size: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = _FakeStore()
+    hint = _hint(_record(7, 1), "node-b", 800)
+    following = _hint(_record(7, 2), "node-b", 801)
+    hints = _hints(store)
+    await hints.put(hint)
+    await hints.put(following)
+    store.delete(KVRef(hint.record.key.to_bytes(missing), missing))
+    obligations = store.list(Keyspace.META)
+
+    found = [item async for item in hints.iter(batch_size=batch_size)]
+
+    assert found == [following]
+    assert "Hint obligation references a missing version" in caplog.text
+    assert store.list(Keyspace.META) == obligations
+    assert await hints.pending()
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_hint_put_rolls_back_all_keyspaces_on_storage_failure(tmp_path) -> None:
+    import lmdb
+
+    from tourillon.core.storage.group import PartitionGroupHint
+    from tourillon.infra.storage.lmdb_session import (
+        LmdbConfig,
+        LmdbSessionProvider,
+    )
+
+    provider = LmdbSessionProvider(
+        LmdbConfig(path=tmp_path / "hints", map_size=1024 * 1024), group=0
+    )
+    record = _record(7, 1)
+    oversized = Record(
+        key=record.key,
+        value=Value(data=b"x" * (2 * 1024 * 1024), quorum_write=1),
+        tag=Tag.hint(record.tag),
+    )
+    hint = Hint(oversized, "node-b", HLCTimestamp(900, 0, "hint"))
+    try:
+        with pytest.raises(lmdb.MapFullError):
+            await PartitionGroupHint(provider).put(hint)
+
+        async with provider.session() as session:
+            for keyspace in (Keyspace.TAGS, Keyspace.LOGS):
+                assert (
+                    await session.get(KVRef(oversized.key.to_bytes(keyspace), keyspace))
+                    is None
+                )
+            assert (
+                await session.get(
+                    KVRef(HintKey(hint.intent, hint.hlc).to_bytes(), Keyspace.META)
+                )
+                is None
+            )
+    finally:
+        await provider.close()
 
 
 @pytest.mark.tourillon

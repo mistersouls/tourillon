@@ -38,7 +38,7 @@ MAX_FRAME_SIZE = MAX_ENVELOPE_PAYLOAD
 # Records staged per write transaction on the destination.
 STAGE_BATCH_SIZE = 256
 
-TRANSFERABLE_KINDS = frozenset({TagKind.LIVE, TagKind.TOMBSTONE, TagKind.HINT})
+TRANSFERABLE_KINDS = frozenset({TagKind.LIVE, TagKind.TOMBSTONE})
 
 _LENGTH_BYTES = 4
 

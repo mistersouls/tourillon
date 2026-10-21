@@ -40,6 +40,7 @@ from tourillon.core.models.repair import (
     encode_token,
 )
 from tourillon.core.models.storageschema import (
+    Hint,
     Key,
     Keyspace,
     PartitionAddress,
@@ -53,7 +54,7 @@ from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import PlacementStrategy, Preference
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports.storage import Storage
-from tourillon.core.storage.group import PartitionGroupStore
+from tourillon.core.storage.group import PartitionGroupHint, PartitionGroupStore
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT, MAX_CLOCK_SKEW_MS, MAX_QUORUM
 from tourlib.envelope import build_envelope
 from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest, RepairRequest
@@ -274,9 +275,30 @@ class StoreService:
         """Answer whether this node holds one exact version."""
         return await self._local_read_at(key)
 
+    async def exists(self, key: Key) -> bool:
+        group = self._partitioner.group_for(key.pid.value)
+        provider = await self._storage.session_provider_for(group)
+        store = PartitionGroupStore(provider)
+        return await store.exists(key)
+
     async def write(self, record: Record) -> Record:
         with self._operation("replication.write"):
             return await self._write(record)
+
+    async def hint(self, record: Record, intent: str) -> Record:
+        if record.tag.kind is not TagKind.HINT:
+            raise ValueError("hint requires a HINT record")
+        with self._operation("replication.hint"):
+            await self._hint(record, intent)
+        return record
+
+    async def _hint(self, record: Record, intent: str) -> None:
+        hint = Hint(record=record, intent=intent, hlc=self._clock.tick())
+        group = self._partitioner.group_for(record.key.pid.value)
+        provider = await self._storage.session_provider_for(group)
+        hints = PartitionGroupHint(provider)
+        await hints.put(hint)
+        self._stats.hints_recorded += 1
 
     async def _write(self, record: Record) -> Record:
         """Apply a replicated write received from a peer.
@@ -419,9 +441,10 @@ class StoreService:
         """
         fanout: list[tuple[str, str, str | None]] = []
         for entry in preferences:
-            target = StoreService._write_target(entry)
-            if target is not None:
-                fanout.append((entry.node_id, target[0], target[1]))
+            if entry.handoff is not None:
+                fanout.append((entry.node_id, entry.handoff, entry.node_id))
+            elif entry.readable:
+                fanout.append((entry.node_id, entry.node_id, None))
         return fanout
 
     async def _collect_repair_reads(
@@ -713,7 +736,7 @@ class StoreService:
     def _write_target(entry: Preference) -> tuple[str, str | None] | None:
         if entry.handoff is not None:
             return entry.handoff, entry.node_id
-        if entry.readable:
+        if entry.writable:
             return entry.node_id, None
         return None
 
@@ -724,8 +747,8 @@ class StoreService:
         hinted_node_id: str | None,
     ) -> Record:
         if hinted_node_id is not None:
-            return await self._apply_write(
-                target_node_id, self._hint_record(record, hinted_node_id)
+            return await self._apply_hint(
+                target_node_id, self._hint_record(record), hinted_node_id
             )
         try:
             return await self._apply_write(target_node_id, record)
@@ -741,6 +764,19 @@ class StoreService:
             return await self._local_write(record)
         return await self._remote_write(target_node_id, record)
 
+    async def _apply_hint(
+        self, target_node_id: str, record: Record, intent: str
+    ) -> Record:
+        if target_node_id == self._node_id:
+            await self._hint(record, intent)
+            return record
+        payload = await self._remote_request(
+            "replication.hint",
+            target_node_id,
+            {"record": record.to_dict(), "intent": intent},
+        )
+        return Record.from_dict(payload)
+
     async def _record_hint(self, target_node_id: str, record: Record) -> None:
         """Store a hint owed to `target_node_id`, never masking the write error.
 
@@ -753,8 +789,7 @@ class StoreService:
         if target_node_id == self._node_id:
             return
         try:
-            await self._local_write(self._hint_record(record, target_node_id))
-            self._stats.hints_recorded += 1
+            await self._hint(self._hint_record(record), target_node_id)
         except Exception as exc:
             logger.warning(
                 "hint.record failed target=%s key=%s error=%s",
@@ -870,6 +905,8 @@ class StoreService:
         return await store.get_at(key)
 
     async def _local_write(self, record: Record) -> Record:
+        if record.tag.kind is TagKind.HINT:
+            raise ValueError("HINT records must use the hint operation")
         group = self._partitioner.group_for(record.key.pid.value)
         session_provider = await self._storage.session_provider_for(group)
         store = PartitionGroupStore(session_provider)
@@ -877,11 +914,11 @@ class StoreService:
         return record
 
     @staticmethod
-    def _hint_record(record: Record, hinted_node_id: str) -> Record:
+    def _hint_record(record: Record) -> Record:
         return Record(
             key=record.key,
             value=record.value,
-            tag=Tag.hint(record.tag, hinted_node_id),
+            tag=Tag.hint(record.tag),
         )
 
     async def _drain_parallel_tasks(

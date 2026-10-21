@@ -44,6 +44,9 @@ class Batch(Protocol):
     def get(self, ref: KVRef) -> None:
         """Schedule a get operation for a key-value pair by its reference."""
 
+    def exists(self, ref: KVRef) -> None:
+        """Schedule a key-presence check without retrieving its value."""
+
     def put(self, kv: KVPair) -> None:
         """Schedule a put operation for a key-value pair into the storage."""
 
@@ -72,10 +75,16 @@ class Batch(Protocol):
         """
         Schedule a list operation for key-value pairs in the given keyspace,
         optionally filtered by prefix, start key, limit, and order.
+
+        For forward scans, start is exclusive: pass the last returned key
+        unchanged to resume, even if that key has since been deleted.
         """
 
 
 class Session(Protocol):
+    async def exists(self, ref: KVRef) -> bool:
+        """Check exact key presence without retrieving its value."""
+
     def batch(self) -> Batch:
         """Return a batch context manager for heavy multiple operations."""
 

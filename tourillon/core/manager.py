@@ -97,6 +97,7 @@ class Manager:
             repair=config.placement.repair,
         )
         self._lifecycle = NodeLifecycle(
+            placement_strategy=self._placement_strategy,
             config=config,
             peer_dispatcher=peer_dispatcher,
             client_dispatcher=client_dispatcher,

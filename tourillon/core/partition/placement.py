@@ -37,9 +37,18 @@ _ALWAYS_HANDOFF_PHASES = frozenset({MemberPhase.DRAINING, MemberPhase.PAUSED})
 
 @dataclass(frozen=True)
 class Preference:
+    """Owner capabilities and an optional substitute, from the local view.
+
+    Reads query the readable owner and any handoff. Writes prefer the handoff,
+    otherwise use the owner only when writable. A missing handoff does not
+    imply writability. Failure suspicion requests a handoff but does not change
+    the owner's phase-based capabilities; receivers still enforce admission.
+    """
+
     node_id: str
     readable: bool
     handoff: str | None
+    writable: bool
 
 
 @dataclass(frozen=True)
@@ -116,6 +125,7 @@ class SimplePlacementStrategy:
                     node_id=member.node_id,
                     readable=readable,
                     handoff=handoff,
+                    writable=member.phase == MemberPhase.READY,
                 )
             )
 
