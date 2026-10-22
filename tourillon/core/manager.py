@@ -245,5 +245,5 @@ class Manager:
     async def join(self, seeds: list[str] | None = None) -> None:
         await self._lifecycle.join(seeds=seeds)
 
-    async def leave(self) -> None:
-        await self._lifecycle.leave()
+    async def drain(self) -> None:
+        await self._lifecycle.drain()

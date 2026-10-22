@@ -31,28 +31,28 @@ class JoinResponse:
 
 
 @dataclass(frozen=True)
-class LeaveRequest:
+class DrainRequest:
     """Initiate asynchronous draining of the addressed node."""
 
     @classmethod
-    def from_document(cls, document: Any) -> "LeaveRequest":
+    def from_document(cls, document: Any) -> "DrainRequest":
         if not isinstance(document, Mapping) or document:
-            raise ValidationError("node.leave request must be an empty mapping")
+            raise ValidationError("node.drain request must be an empty mapping")
         return cls()
 
 
 @dataclass(frozen=True)
-class LeaveResponse:
+class DrainResponse:
     """Acknowledgement of initiation, not completion of draining."""
 
     message: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.message, str) or not self.message:
-            raise ValidationError("node.leave response message must be non-empty")
+            raise ValidationError("node.drain response message must be non-empty")
 
     @classmethod
-    def from_document(cls, document: Any) -> "LeaveResponse":
+    def from_document(cls, document: Any) -> "DrainResponse":
         if not isinstance(document, Mapping) or set(document) != {"message"}:
-            raise ValidationError("node.leave response must contain a message")
+            raise ValidationError("node.drain response must contain a message")
         return cls(message=document["message"])

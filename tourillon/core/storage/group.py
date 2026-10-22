@@ -518,9 +518,7 @@ class PartitionGroupHint:
         return tag.kind in {TagKind.LIVE, TagKind.TOMBSTONE}
 
     @staticmethod
-    async def _promote_records(
-        session: Session, records: Sequence[Record]
-    ) -> None:
+    async def _promote_records(session: Session, records: Sequence[Record]) -> None:
         if not records:
             return
         async with session.batch() as batch:

@@ -48,9 +48,9 @@ infra/       LMDB storage, OpenTelemetry telemetry
 4. `Manager` builds the node services (section 3).
 5. `Manager.serve_forever()` installs `SIGINT`/`SIGTERM` handlers, starts the node, and waits.
 
-Shutdown is ordered: `NodeLifecycle.stop()` (client server → leave task → hint replayer → join task → gossip → peer server), then peer pool, storage, telemetry. A failing step is logged and the remaining steps still run.
+Shutdown is ordered: `NodeLifecycle.stop()` (client server → drain task → hint replayer → join task → gossip → peer server), then peer pool, storage, telemetry. A failing step is logged and the remaining steps still run.
 
-Shutdown signals do not initiate a departure. Only an explicit `tourctl node leave`
+Shutdown signals do not initiate a drain. Only an explicit `tourctl node drain`
 request transitions a `READY` or `PAUSED` node to `DRAINING`. The command acknowledges
 initiation, not completion: use `tourctl node inspect` on the peer endpoint to
 observe the final `IDLE` phase. New writes (including replicated writes) are refused,
@@ -72,7 +72,7 @@ can satisfy an early quorum, both requests must settle; at the response deadline
 one successful response is sufficient. Version selection includes both sources,
 including hinted tombstones. Write routing continues to prefer the handoff.
 
-A failed drain stays `DRAINING` and can be retried with `node leave`; a restart
+A failed drain stays `DRAINING` and can be retried with `node drain`; a restart
 resumes a persisted drain. After successful transfers the client listener closes,
 then completion publishes `IDLE`, removing the node from the ring without
 terminating the process or deleting
@@ -80,7 +80,7 @@ its local data. The peer
 listener and gossip remain available. On startup, any `IDLE` node with persisted
 or configured seeds waits for an explicit join; without seeds it bootstraps.
 No previous-phase field is used to distinguish a drained node.
-Leaving the last node on the ring is rejected
+Draining the last node on the ring is rejected
 because there is no destination for its ranges.
 At departure, at most five eligible peer addresses are persisted as restart
 seeds; selection stops as soon as this bound is reached.
@@ -297,7 +297,7 @@ LOGS values. `PartitionGroupStore` retains only ordinary version operations and
 does not access META. No session
 is held across network
 calls. The lifecycle pauses
-local replay writes on leave and waits for admitted local deliveries before
+local replay writes during drain and waits for admitted local deliveries before
 transfers; existing owned copies may still be confirmed while draining.
 
 Replay deletes the exact obligation only after all required owners confirm
@@ -312,7 +312,7 @@ their references first. It does not modify the stored tag or `LOGS` value. A loc
 write can promote a hinted copy when the hint holder is now a writable owner;
 successful delivery alone does not confer ownership.
 
-During leave, replay runs alongside transfers. Once transfers succeed and
+During drain, replay runs alongside transfers. Once transfers succeed and
 background writes settle, `HintReplayer.wait()` waits until no persisted hint
 obligations remain, before replay stops and the node becomes `IDLE`. An
 required owner that remains unavailable keeps the node `DRAINING`.
@@ -389,12 +389,12 @@ Handlers are async generators registered once per kind on the peer or client dis
 | --- | --- | --- |
 | `probe` | client, peer | `probe.ping` → `probe.pong` |
 | `kv` | client, peer | `kv.put` / `kv.get` / `kv.delete` / `kv.repair` |
-| `node` | peer | `node.join` / `node.leave` |
+| `node` | peer | `node.join` / `node.drain` |
 | `inspect` | peer | `node.inspect` → paginated `node.info` |
 
 `gossip.*`, `replication.*` and `transfer.*` are internal to the cluster and deliberately have no client service.
 
-`tourctl` builds on those services with cyclopts commands (`probe ping`, `node inspect`, `node join`, `node leave`, `put`, `get`, `delete`, `repair`). Commands stay thin; rendering and error mapping live in `tourctl/core/`, which translates configuration, TLS/connectivity and protocol failures into actionable `SystemExit` messages instead of tracebacks.
+`tourctl` builds on those services with cyclopts commands (`probe ping`, `node inspect`, `node join`, `node drain`, `put`, `get`, `delete`, `repair`). Commands stay thin; rendering and error mapping live in `tourctl/core/`, which translates configuration, TLS/connectivity and protocol failures into actionable `SystemExit` messages instead of tracebacks.
 
 `tourillon config ca | client | node` generates the mTLS material and the TOML configuration files that both sides consume.
 

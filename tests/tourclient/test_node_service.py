@@ -25,7 +25,7 @@ from tourclient.exception import RequestRejectedError
 from tourlib.adapter import MsgPackSerializer
 from tourlib.envelope import Envelope, replay_envelope
 from tourlib.exceptions import ResponseError
-from tourlib.models.node import LeaveResponse
+from tourlib.models.node import DrainResponse
 
 pytestmark = pytest.mark.tourctl
 
@@ -33,14 +33,14 @@ pytestmark = pytest.mark.tourctl
 @pytest.mark.parametrize(
     ("kind", "document", "error"),
     [
-        ("node.leave.accept", {"message": "Draining initiated"}, None),
-        ("node.leave.reject", {"message": "Not ready"}, RequestRejectedError),
-        ("node.leave.other", None, ResponseError),
-        ("node.leave.accept", None, ResponseError),
-        ("node.leave.accept", {"message": 1}, ResponseError),
-        ("node.leave.accept", {"message": ""}, ResponseError),
-        ("node.leave.accept", {"message": "ok", "unknown": True}, ResponseError),
-        ("node.leave.reject", [], ResponseError),
+        ("node.drain.accept", {"message": "Draining initiated"}, None),
+        ("node.drain.reject", {"message": "Not ready"}, RequestRejectedError),
+        ("node.drain.other", None, ResponseError),
+        ("node.drain.accept", None, ResponseError),
+        ("node.drain.accept", {"message": 1}, ResponseError),
+        ("node.drain.accept", {"message": ""}, ResponseError),
+        ("node.drain.accept", {"message": "ok", "unknown": True}, ResponseError),
+        ("node.drain.reject", [], ResponseError),
     ],
 )
 async def test_leave_over_real_mtls_transport(
@@ -59,7 +59,7 @@ async def test_leave_over_real_mtls_transport(
             kind=kind, request=request, payload=serializer.encode(document)
         )
 
-    server = await start_envelope_server({"node.leave": handler}, server_ssl)
+    server = await start_envelope_server({"node.drain": handler}, server_ssl)
     host, port = server.endpoint
     transport = Transport(
         bind=f"{host}:{port}", ssl_context=client_ssl, serializer=serializer
@@ -71,12 +71,12 @@ async def test_leave_over_real_mtls_transport(
         )
         assert isinstance(service, NodeService)
         if error is None:
-            assert await service.leave() == LeaveResponse("Draining initiated")
+            assert await service.drain() == DrainResponse("Draining initiated")
         else:
             with pytest.raises(error) as caught:
-                await service.leave()
+                await service.drain()
             if isinstance(caught.value, RequestRejectedError):
-                assert caught.value.request_kind == "node.leave"
+                assert caught.value.request_kind == "node.drain"
                 assert str(caught.value) == "Not ready"
         assert calls == [{}]
     finally:
@@ -84,7 +84,7 @@ async def test_leave_over_real_mtls_transport(
         await server.stop()
 
 
-def test_node_leave_service_is_peer_only() -> None:
+def test_node_drain_service_is_peer_only() -> None:
     validate_service_endpoint("node", "peer")
     with pytest.raises(ValueError, match="not available on endpoint 'client'"):
         validate_service_endpoint("node", "client")

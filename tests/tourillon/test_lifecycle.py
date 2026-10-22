@@ -33,7 +33,7 @@ from tourillon.core.config import (
     TransportConfig,
     TransportPoolConfig,
 )
-from tourillon.core.exceptions import BootstrapError, JoinError, LeaveError
+from tourillon.core.exceptions import BootstrapError, DrainError, JoinError
 from tourillon.core.gossip.gossiper import GossipStats
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.models.clock import HLCClock
@@ -1079,7 +1079,7 @@ class _DrainHints:
             self.pending = False
 
 
-async def _leaving_lifecycle(tmp_path: Path):
+async def _draining_lifecycle(tmp_path: Path):
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path, node_id="node-a"),
         persistence=_DocumentStatePersistence(
@@ -1118,11 +1118,11 @@ async def _leaving_lifecycle(tmp_path: Path):
 
 
 @pytest.mark.tourillon
-async def test_leave_waits_repairs_transfers_and_hint_satisfaction(
+async def test_drain_waits_repairs_transfers_and_hint_satisfaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lifecycle, store, hints, runner = await _leaving_lifecycle(tmp_path)
+    lifecycle, store, hints, runner = await _draining_lifecycle(tmp_path)
     hints.pending = True
     client_stopped = asyncio.Event()
 
@@ -1132,7 +1132,7 @@ async def test_leave_waits_repairs_transfers_and_hint_satisfaction(
         client_stopped.set()
 
     monkeypatch.setattr(lifecycle, "_stop_client", stop_client)
-    await lifecycle.leave()
+    await lifecycle.drain()
     assert hints.started
     try:
         await asyncio.wait_for(store.waiting.wait(), 1)
@@ -1145,9 +1145,9 @@ async def test_leave_waits_repairs_transfers_and_hint_satisfaction(
         assert hints.started
         assert not hints.stopped
         assert not store.repairs_stopped
-        with pytest.raises(LeaveError, match="already in progress"):
-            await lifecycle.leave()
-        with pytest.raises(JoinError, match="Leave operation"):
+        with pytest.raises(DrainError, match="already in progress"):
+            await lifecycle.drain()
+        with pytest.raises(JoinError, match="Drain operation"):
             await lifecycle.join(["seed:9000"])
         store.settled.set()
         await asyncio.wait_for(runner.started.wait(), 1)
@@ -1158,13 +1158,13 @@ async def test_leave_waits_repairs_transfers_and_hint_satisfaction(
         runner.run_result.set_result((["range"], []))
         await asyncio.wait_for(hints.waiting.wait(), 1)
         assert (await lifecycle._load_state()).phase == MemberPhase.DRAINING
-        assert not lifecycle._leave_task.done()
+        assert not lifecycle._drain_task.done()
         assert not hints.stopped
         assert store.repairs_stopped
         assert not client_stopped.is_set()
         assert store.readable
         hints.satisfied.set()
-        await asyncio.wait_for(lifecycle._leave_task, 1)
+        await asyncio.wait_for(lifecycle._drain_task, 1)
         assert runner.calls[0][2] == Ring([VNode(token=0, node_id="node-b")]).serial()
         state = await lifecycle._load_state()
         assert state.phase == MemberPhase.IDLE
@@ -1183,10 +1183,10 @@ async def test_leave_waits_repairs_transfers_and_hint_satisfaction(
 
 
 @pytest.mark.tourillon
-async def test_leave_does_not_schedule_drain_when_replayer_start_fails(
+async def test_drain_does_not_schedule_drain_when_replayer_start_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    lifecycle, _, hints, runner = await _leaving_lifecycle(tmp_path)
+    lifecycle, _, hints, runner = await _draining_lifecycle(tmp_path)
 
     async def fail_start() -> None:
         raise RuntimeError("replayer unavailable")
@@ -1194,8 +1194,8 @@ async def test_leave_does_not_schedule_drain_when_replayer_start_fails(
     monkeypatch.setattr(hints, "start", fail_start)
     try:
         with pytest.raises(RuntimeError, match="replayer unavailable"):
-            await lifecycle.leave()
-        assert not lifecycle.is_leaving()
+            await lifecycle.drain()
+        assert not lifecycle.is_draining()
         assert not runner.calls
         assert (await lifecycle._load_state()).phase is MemberPhase.DRAINING
     finally:
@@ -1206,32 +1206,32 @@ async def test_leave_does_not_schedule_drain_when_replayer_start_fails(
 async def test_failed_transfer_stays_draining_and_can_be_retried(
     tmp_path: Path, caplog
 ) -> None:
-    lifecycle, store, hints, runner = await _leaving_lifecycle(tmp_path)
+    lifecycle, store, hints, runner = await _draining_lifecycle(tmp_path)
     store.settled.set()
     runner.run_result.set_result(([], ["failed-range"]))
-    await lifecycle.leave()
-    await asyncio.wait_for(lifecycle._leave_task, 1)
+    await lifecycle.drain()
+    await asyncio.wait_for(lifecycle._drain_task, 1)
     assert (await lifecycle._load_state()).phase == MemberPhase.DRAINING
-    assert "Leave failed" in caplog.text
+    assert "Drain failed" in caplog.text
     assert not hints.stopped
     assert not store.repairs_stopped
     runner.run_result = asyncio.get_running_loop().create_future()
     runner.run_result.set_result((["range"], []))
-    await lifecycle.leave()
-    await asyncio.wait_for(lifecycle._leave_task, 1)
+    await lifecycle.drain()
+    await asyncio.wait_for(lifecycle._drain_task, 1)
     assert (await lifecycle._load_state()).phase == MemberPhase.IDLE
     await lifecycle.stop()
 
 
 @pytest.mark.tourillon
 async def test_failed_hint_wait_never_publishes_idle(tmp_path: Path, caplog) -> None:
-    lifecycle, store, hints, runner = await _leaving_lifecycle(tmp_path)
+    lifecycle, store, hints, runner = await _draining_lifecycle(tmp_path)
     store.settled.set()
     runner.run_result.set_result((["range"], []))
     hints.wait_error = RuntimeError("hint storage unavailable")
     try:
-        await lifecycle.leave()
-        await asyncio.wait_for(lifecycle._leave_task, 1)
+        await lifecycle.drain()
+        await asyncio.wait_for(lifecycle._drain_task, 1)
         assert (await lifecycle._load_state()).phase is MemberPhase.DRAINING
         assert "hint storage unavailable" in caplog.text
         assert not hints.stopped
@@ -1241,21 +1241,21 @@ async def test_failed_hint_wait_never_publishes_idle(tmp_path: Path, caplog) -> 
 
 
 @pytest.mark.tourillon
-async def test_shutdown_cancels_waiting_leave_without_publishing_idle(
+async def test_shutdown_cancels_waiting_drain_without_publishing_idle(
     tmp_path: Path,
 ) -> None:
-    lifecycle, store, hints, runner = await _leaving_lifecycle(tmp_path)
+    lifecycle, store, hints, runner = await _draining_lifecycle(tmp_path)
     store.settled.set()
     hints.pending = True
     runner.run_result.set_result((["range"], []))
     try:
-        await lifecycle.leave()
+        await lifecycle.drain()
         await asyncio.wait_for(hints.waiting.wait(), 1)
-        leave = lifecycle._leave_task
-        assert not leave.done()
+        drain_task = lifecycle._drain_task
+        assert not drain_task.done()
     finally:
         await lifecycle.stop()
-    assert leave.cancelled()
+    assert drain_task.cancelled()
     assert hints.stopped
     assert hints.pending
     assert (await lifecycle._load_state()).phase is MemberPhase.DRAINING
@@ -1265,7 +1265,7 @@ async def test_shutdown_cancels_waiting_leave_without_publishing_idle(
 @pytest.mark.parametrize(
     "phase", [MemberPhase.IDLE, MemberPhase.JOINING, MemberPhase.FAILED]
 )
-async def test_leave_rejects_ineligible_phase_without_transition(
+async def test_drain_rejects_ineligible_phase_without_transition(
     tmp_path: Path, phase: MemberPhase
 ) -> None:
     lifecycle = _build_lifecycle(
@@ -1274,8 +1274,8 @@ async def test_leave_rejects_ineligible_phase_without_transition(
             {"node": {"node_id": "test-node", "phase": phase.value}}
         ),
     )
-    with pytest.raises(LeaveError, match="Cannot leave from phase"):
-        await lifecycle.leave()
+    with pytest.raises(DrainError, match="Cannot drain from phase"):
+        await lifecycle.drain()
     assert (await lifecycle._load_state()).phase == phase
 
 
@@ -1285,18 +1285,18 @@ async def test_last_node_cannot_silently_discard_its_ranges(tmp_path: Path) -> N
         _build_config(tmp_path),
         _DocumentStatePersistence({"node": {"node_id": "test-node", "phase": "ready"}}),
     )
-    with pytest.raises(LeaveError, match="another node"):
-        await lifecycle.leave()
+    with pytest.raises(DrainError, match="another node"):
+        await lifecycle.drain()
     assert (await lifecycle._load_state()).phase == MemberPhase.READY
 
 
 @pytest.mark.tourillon
-async def test_stop_during_leave_preserves_draining_for_restart(tmp_path: Path) -> None:
-    lifecycle, store, _, _ = await _leaving_lifecycle(tmp_path)
-    await lifecycle.leave()
+async def test_stop_during_drain_preserves_draining_for_restart(tmp_path: Path) -> None:
+    lifecycle, store, _, _ = await _draining_lifecycle(tmp_path)
+    await lifecycle.drain()
     await asyncio.wait_for(store.waiting.wait(), 1)
     await lifecycle.stop()
-    assert not lifecycle.is_leaving()
+    assert not lifecycle.is_draining()
     assert (await lifecycle._load_state()).phase == MemberPhase.DRAINING
 
 
@@ -1304,7 +1304,7 @@ async def test_stop_during_leave_preserves_draining_for_restart(tmp_path: Path) 
 async def test_drained_idle_restart_does_not_bootstrap_ready(
     tmp_path: Path, monkeypatch
 ) -> None:
-    lifecycle, _, hints, _ = await _leaving_lifecycle(tmp_path)
+    lifecycle, _, hints, _ = await _draining_lifecycle(tmp_path)
     state = await lifecycle._load_state()
     state = await lifecycle._transition_to(
         state, MemberPhase.DRAINING, with_seeds=["127.0.0.1:7002"]
@@ -1319,7 +1319,7 @@ async def test_drained_idle_restart_does_not_bootstrap_ready(
     monkeypatch.setattr(lifecycle._gossiper, "start", noop)
     await lifecycle.start()
     assert (await lifecycle._load_state()).phase == MemberPhase.IDLE
-    assert not lifecycle.is_leaving()
+    assert not lifecycle.is_draining()
     assert not hints.started
     assert not lifecycle._client_started
 
@@ -1364,7 +1364,7 @@ async def test_idle_with_persisted_seeds_joins_only_on_explicit_command(
 async def test_restart_resumes_previously_requested_drain(
     tmp_path: Path, monkeypatch
 ) -> None:
-    lifecycle, store, hints, runner = await _leaving_lifecycle(tmp_path)
+    lifecycle, store, hints, runner = await _draining_lifecycle(tmp_path)
     state = await lifecycle._load_state()
     await lifecycle._transition_to(state, MemberPhase.DRAINING)
 
@@ -1379,20 +1379,20 @@ async def test_restart_resumes_previously_requested_drain(
     runner.run_result.set_result(([], []))
     await lifecycle.start()
     assert hints.started
-    await asyncio.wait_for(lifecycle._leave_task, 1)
+    await asyncio.wait_for(lifecycle._drain_task, 1)
     assert (await lifecycle._load_state()).phase == MemberPhase.IDLE
     await lifecycle.stop()
 
 
 @pytest.mark.tourillon
-async def test_stop_without_leave_never_enters_draining(tmp_path: Path) -> None:
-    lifecycle, _, _, _ = await _leaving_lifecycle(tmp_path)
+async def test_stop_without_drain_never_enters_draining(tmp_path: Path) -> None:
+    lifecycle, _, _, _ = await _draining_lifecycle(tmp_path)
     await lifecycle.stop()
     assert (await lifecycle._load_state()).phase == MemberPhase.READY
 
 
 @pytest.mark.tourillon
-def test_leave_seeds_stops_after_five_eligible_peers_in_large_cluster() -> None:
+def test_drain_seeds_stops_after_five_eligible_peers_in_large_cluster() -> None:
     visited = []
 
     def members():
@@ -1407,14 +1407,14 @@ def test_leave_seeds_stops_after_five_eligible_peers_in_large_cluster() -> None:
             )
 
     state = NodeState(node_id="node-0")
-    assert NodeLifecycle._leave_seeds(state, members()) == [
+    assert NodeLifecycle._drain_seeds(state, members()) == [
         f"127.0.0.1:{10000 + index}" for index in range(1, 6)
     ]
     assert visited == list(range(6))
 
 
 @pytest.mark.tourillon
-def test_leave_seeds_skips_ineligible_peers_and_bounds_fallback() -> None:
+def test_drain_seeds_skips_ineligible_peers_and_bounds_fallback() -> None:
     state = NodeState(
         node_id="node-a", seeds=tuple(f"seed-{i}:9000" for i in range(10))
     )
@@ -1428,13 +1428,13 @@ def test_leave_seeds_skips_ineligible_peers_and_bounds_fallback() -> None:
         )
         for phase in MemberPhase
     ]
-    assert NodeLifecycle._leave_seeds(state, members) == [
+    assert NodeLifecycle._drain_seeds(state, members) == [
         member.peer_address
         for member in members
         if member.phase in (MemberPhase.READY, MemberPhase.PAUSED)
     ]
-    assert NodeLifecycle._leave_seeds(state, []) == list(state.seeds[:5])
-    assert NodeLifecycle._leave_seeds(NodeState(node_id="node-a"), []) == []
+    assert NodeLifecycle._drain_seeds(state, []) == list(state.seeds[:5])
+    assert NodeLifecycle._drain_seeds(NodeState(node_id="node-a"), []) == []
 
 
 @pytest.mark.tourillon
@@ -1445,7 +1445,10 @@ async def test_departure_replans_with_local_tokens_removed(tmp_path: Path) -> No
     runner.run_result.set_result((["stale"], []))
     runner.wait_result.set_result((["new-plan"], []))
     topology.changes.put_nowait(changed)
-    assert await lifecycle._run_transfers(_JOINING, leaving=True) == (["new-plan"], [])
+    assert await lifecycle._run_transfers(_JOINING, draining=True) == (
+        ["new-plan"],
+        [],
+    )
     assert runner.calls == [
         ("run", ring.serial(), ring.drop_nodes({"node-a"}).serial()),
         ("apply", changed.serial(), changed.drop_nodes({"node-a"}).serial()),
@@ -1454,12 +1457,12 @@ async def test_departure_replans_with_local_tokens_removed(tmp_path: Path) -> No
 
 
 @pytest.mark.tourillon
-async def test_departure_cannot_complete_after_all_other_nodes_leave(
+async def test_drain_cannot_complete_after_all_other_nodes_drain(
     tmp_path: Path,
 ) -> None:
     ring = Ring([VNode(token=0, node_id="node-b"), *_JOINING.vnodes])
     lifecycle, runner, topology = _joining_lifecycle(tmp_path, ring)
     topology.changes.put_nowait(ring.drop_nodes({"node-b"}))
-    with pytest.raises(LeaveError, match="another node"):
-        await lifecycle._run_transfers(_JOINING, leaving=True)
+    with pytest.raises(DrainError, match="another node"):
+        await lifecycle._run_transfers(_JOINING, draining=True)
     assert runner.cancelled

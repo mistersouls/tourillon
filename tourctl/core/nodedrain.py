@@ -17,11 +17,11 @@ from pathlib import Path
 from tourclient import client
 from tourclient.core.services.node import NodeService
 from tourclient.exception import RequestRejectedError, UnknownServiceError
-from tourctl.core.error import NODE_LEAVE_ERROR_PROFILE, handle_error
+from tourctl.core.error import NODE_DRAIN_ERROR_PROFILE, handle_error
 from tourlib.exceptions import EnvelopeError
 
 
-async def leave(
+async def drain(
     address: str,
     *,
     tourconf: str | Path | None,
@@ -38,11 +38,11 @@ async def leave(
         ) as node_service:
             if not isinstance(node_service, NodeService):
                 raise UnknownServiceError("Unknown service: node")
-            response = await node_service.leave()
+            response = await node_service.drain()
     except RequestRejectedError as exc:
         raise SystemExit(str(exc)) from None
     except (OSError, KeyError, ValueError, EnvelopeError, UnknownServiceError) as exc:
         raise SystemExit(
-            handle_error(exc, context_name, NODE_LEAVE_ERROR_PROFILE)
+            handle_error(exc, context_name, NODE_DRAIN_ERROR_PROFILE)
         ) from None
     return response.message

@@ -57,8 +57,8 @@ class JoinError(Exception):
         self.error = error
 
 
-class LeaveError(Exception):
-    """Raised when a node cannot begin or complete a graceful departure."""
+class DrainError(Exception):
+    """Raised when a node cannot begin or complete a drain."""
 
     def __init__(self, error: str) -> None:
         super().__init__(error)

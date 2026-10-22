@@ -16,8 +16,8 @@ from cyclopts import App
 
 from tourctl.bootstrap.usecases.common import GlobalOptions
 from tourctl.core import inspect_node
+from tourctl.core.nodedrain import drain
 from tourctl.core.nodejoin import join
-from tourctl.core.nodeleave import leave
 
 node_app = App(name="node", help="Node lifecycle and inspection commands.")
 
@@ -66,8 +66,8 @@ async def node_join(
     )
 
 
-@node_app.command(name="leave")
-async def node_leave(
+@node_app.command(name="drain")
+async def node_drain(
     address: str,
     opts: GlobalOptions | None = None,
 ) -> str:
@@ -77,7 +77,7 @@ async def node_leave(
     :param opts: Client configuration and context options.
     """
     opts = opts or GlobalOptions()
-    return await leave(
+    return await drain(
         address=address,
         tourconf=opts.tourconf,
         context_name=opts.context,

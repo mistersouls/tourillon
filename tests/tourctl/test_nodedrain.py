@@ -23,31 +23,31 @@ from tourclient.core.services.node import NodeService
 from tourclient.core.transport import Transport
 from tourclient.exception import RequestRejectedError
 from tourctl.bootstrap.usecases.common import GlobalOptions
-from tourctl.bootstrap.usecases.node import node_leave
-from tourctl.core.nodeleave import leave
+from tourctl.bootstrap.usecases.node import node_drain
+from tourctl.core.nodedrain import drain
 from tourlib.adapter import MsgPackSerializer
 from tourlib.envelope import Envelope, build_envelope
 from tourlib.exceptions import ResponseError
-from tourlib.models.node import LeaveRequest
+from tourlib.models.node import DrainRequest
 
 pytestmark = pytest.mark.tourctl
 
 
 class _TransportStub:
     async def request(self, kind: str, document: object) -> Envelope:
-        assert kind == "node.leave"
-        assert document == LeaveRequest()
+        assert kind == "node.drain"
+        assert document == DrainRequest()
         serializer = MsgPackSerializer()
         return build_envelope(
-            kind="node.leave.accept",
+            kind="node.drain.accept",
             payload=serializer.encode(
-                {"message": "Leave initiated; draining continues asynchronously."}
+                {"message": "Drain initiated; draining continues asynchronously."}
             ),
             schema_id=serializer.schema_id,
         )
 
 
-async def test_node_leave_command_uses_peer_endpoint_and_shared_options(
+async def test_node_drain_command_uses_peer_endpoint_and_shared_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = []
@@ -58,12 +58,12 @@ async def test_node_leave_command_uses_peer_endpoint_and_shared_options(
         calls.append((args, kwargs))
         yield service
 
-    monkeypatch.setattr("tourctl.core.nodeleave.client", client_context)
-    message = await node_leave(
+    monkeypatch.setattr("tourctl.core.nodedrain.client", client_context)
+    message = await node_drain(
         "127.0.0.1:7701",
         opts=GlobalOptions(tourconf=Path("tourconf.toml"), context="prod"),
     )
-    assert message == "Leave initiated; draining continues asynchronously."
+    assert message == "Drain initiated; draining continues asynchronously."
     assert calls == [
         (
             ("node",),
@@ -80,17 +80,17 @@ async def test_node_leave_command_uses_peer_endpoint_and_shared_options(
 @pytest.mark.parametrize(
     ("error", "message"),
     [
-        (RequestRejectedError("node.leave", {"message": "Not ready"}), "Not ready"),
+        (RequestRejectedError("node.drain", {"message": "Not ready"}), "Not ready"),
         (
             ConnectionRefusedError("offline"),
-            "Tourillon node refused the leave connection",
+            "Tourillon node refused the drain connection",
         ),
-        (OSError("unreachable"), "Unable to reach the Tourillon node for leave"),
-        (ResponseError("invalid"), "Tourillon node returned an invalid leave response"),
+        (OSError("unreachable"), "Unable to reach the Tourillon node for drain"),
+        (ResponseError("invalid"), "Tourillon node returned an invalid drain response"),
         (KeyError("prod"), "Unknown client context 'prod'"),
     ],
 )
-async def test_node_leave_command_renders_actionable_failures(
+async def test_node_drain_command_renders_actionable_failures(
     monkeypatch: pytest.MonkeyPatch, error: Exception, message: str
 ) -> None:
     @asynccontextmanager
@@ -98,18 +98,18 @@ async def test_node_leave_command_renders_actionable_failures(
         raise error
         yield
 
-    monkeypatch.setattr("tourctl.core.nodeleave.client", client_context)
+    monkeypatch.setattr("tourctl.core.nodedrain.client", client_context)
     with pytest.raises(SystemExit, match=message):
-        await leave("127.0.0.1:7701", tourconf=None, context_name="prod")
+        await drain("127.0.0.1:7701", tourconf=None, context_name="prod")
 
 
-async def test_node_leave_rejects_wrong_service(
+async def test_node_drain_rejects_wrong_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     @asynccontextmanager
     async def client_context(*args, **kwargs) -> AsyncIterator[object]:
         yield object()
 
-    monkeypatch.setattr("tourctl.core.nodeleave.client", client_context)
+    monkeypatch.setattr("tourctl.core.nodedrain.client", client_context)
     with pytest.raises(SystemExit, match="Unknown service: node"):
-        await leave("127.0.0.1:7701", tourconf=None, context_name=None)
+        await drain("127.0.0.1:7701", tourconf=None, context_name=None)

@@ -21,8 +21,8 @@ from pathlib import Path
 from tourillon.core.config import TourillonConfig
 from tourillon.core.exceptions import (
     BootstrapError,
+    DrainError,
     JoinError,
-    LeaveError,
     StartupError,
 )
 from tourillon.core.gossip.bootstrapper import GossipBootstrapper
@@ -47,7 +47,7 @@ from tourlib.constant import NODE_STATE_FILENAME
 from tourlib.helpers import parse_bind
 from tourlib.port import Persistence
 
-MAX_LEAVE_SEEDS = 5
+MAX_DRAIN_SEEDS = 5
 
 
 class NodeLifecycle:
@@ -119,7 +119,7 @@ class NodeLifecycle:
 
         self._state_file = Path(self._config.storage.data_dir) / NODE_STATE_FILENAME
         self._join_task: asyncio.Task[None] | None = None
-        self._leave_task: asyncio.Task[None] | None = None
+        self._drain_task: asyncio.Task[None] | None = None
         self._membership_lock = asyncio.Lock()
         self._peer_started = False
         self._client_started = False
@@ -149,11 +149,11 @@ class NodeLifecycle:
     async def stop(self) -> None:
         logger.info("Stopping node lifecycle for '%s'", self._config.node.id)
         await self._stop_client()
-        if self.is_leaving():
-            assert self._leave_task is not None
-            self._leave_task.cancel()
+        if self.is_draining():
+            assert self._drain_task is not None
+            self._drain_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._leave_task
+                await self._drain_task
         await self._hint_replayer.stop()
 
         if self.is_joining():
@@ -169,13 +169,13 @@ class NodeLifecycle:
     def is_joining(self) -> bool:
         return self._join_task is not None and not self._join_task.done()
 
-    def is_leaving(self) -> bool:
-        return self._leave_task is not None and not self._leave_task.done()
+    def is_draining(self) -> bool:
+        return self._drain_task is not None and not self._drain_task.done()
 
     async def join(self, seeds: list[str] | None = None) -> None:
         async with self._membership_lock:
-            if self.is_leaving():
-                raise JoinError("Leave operation already in progress.")
+            if self.is_draining():
+                raise JoinError("Drain operation already in progress.")
             if self.is_joining():
                 logger.warning("Join operation already in progress")
                 raise JoinError("Join operation already in progress.")
@@ -205,37 +205,37 @@ class NodeLifecycle:
                 self._perform_join(joining_state), name="node-join"
             )
 
-    async def leave(self) -> None:
+    async def drain(self) -> None:
         """Acknowledge an explicit drain request; completion is announced as IDLE."""
         async with self._membership_lock:
-            if self.is_joining() or self.is_leaving():
-                raise LeaveError("A membership operation is already in progress.")
+            if self.is_joining() or self.is_draining():
+                raise DrainError("A membership operation is already in progress.")
             state = await self._load_state()
             if state.phase not in (
                 MemberPhase.READY,
                 MemberPhase.PAUSED,
                 MemberPhase.DRAINING,
             ):
-                raise LeaveError(f"Cannot leave from phase '{state.phase.value}'.")
+                raise DrainError(f"Cannot drain from phase '{state.phase.value}'.")
             topology = await self._topologymgr.snapshot()
             if not len(topology.ring.drop_nodes({state.node_id})):
-                raise LeaveError("Cannot leave without another node on the ring.")
+                raise DrainError("Cannot drain without another node on the ring.")
             if state.phase != MemberPhase.DRAINING:
                 state = await self._transition_to(
                     state,
                     MemberPhase.DRAINING,
-                    with_seeds=self._leave_seeds(state, topology.registry),
+                    with_seeds=self._drain_seeds(state, topology.registry),
                 )
             self._store.pause()
             self._hint_replayer.pause_local_writes()
             await self._publish_state(state)
             await self._hint_replayer.start()
-            self._leave_task = asyncio.create_task(
-                self._perform_leave(state), name="node-leave"
+            self._drain_task = asyncio.create_task(
+                self._perform_drain(state), name="node-drain"
             )
 
     @staticmethod
-    def _leave_seeds(state: NodeState, members: Iterable[Member]) -> list[str]:
+    def _drain_seeds(state: NodeState, members: Iterable[Member]) -> list[str]:
         seeds: list[str] = []
         for member in members:
             if member.node_id == state.node_id:
@@ -243,11 +243,11 @@ class NodeLifecycle:
             if member.phase not in (MemberPhase.READY, MemberPhase.PAUSED):
                 continue
             seeds.append(member.peer_address)
-            if len(seeds) == MAX_LEAVE_SEEDS:
+            if len(seeds) == MAX_DRAIN_SEEDS:
                 break
-        return seeds or list(state.seeds[:MAX_LEAVE_SEEDS])
+        return seeds or list(state.seeds[:MAX_DRAIN_SEEDS])
 
-    async def _perform_leave(self, state: NodeState) -> None:
+    async def _perform_drain(self, state: NodeState) -> None:
         try:
             await self._store.drain()
             await self._hint_replayer.drain_local_writes()
@@ -261,16 +261,16 @@ class NodeLifecycle:
             await self._publish_state(idle)
         except Exception as exc:
             logger.exception(
-                "Leave failed for node '%s'; node remains DRAINING. Reason: %s",
+                "Drain failed for node '%s'; node remains DRAINING. Reason: %s",
                 state.node_id,
                 exc,
             )
 
     async def _drain_transfers(self, state: NodeState) -> None:
         member = await self._publish_state(state)
-        _, failed = await self._run_transfers(member, leaving=True)
+        _, failed = await self._run_transfers(member, draining=True)
         if failed:
-            raise LeaveError(f"Data transfer failed for {len(failed)} ranges.")
+            raise DrainError(f"Data transfer failed for {len(failed)} ranges.")
 
     def _generate_tokens(self) -> tuple[str, ...]:
         count = self._config.node.size.to_value()
@@ -347,9 +347,9 @@ class NodeLifecycle:
         await self._hint_replayer.start()
 
     async def _run_transfers(
-        self, member: Member, *, leaving: bool = False
+        self, member: Member, *, draining: bool = False
     ) -> tuple[list[str], list[str]]:
-        """Re-plan join or leave transfers on ring changes until they settle.
+        """Re-plan join or drain transfers on ring changes until they settle.
 
         Transfers that settled before a re-plan are awaited again, so the
         result always covers the latest plan. Cancelling the join cancels the
@@ -359,7 +359,7 @@ class NodeLifecycle:
         current_ring = topology.ring
         transfer = asyncio.create_task(
             self._transfer_runner.run(
-                current_ring, self._transfer_target(current_ring, member, leaving)
+                current_ring, self._transfer_target(current_ring, member, draining)
             ),
             name="transfer-run",
         )
@@ -380,7 +380,7 @@ class NodeLifecycle:
                 current_ring = ring_change.result()
                 logger.info("Ring changed during transfer; updating transfer plan")
                 await self._transfer_runner.apply(
-                    current_ring, self._transfer_target(current_ring, member, leaving)
+                    current_ring, self._transfer_target(current_ring, member, draining)
                 )
                 if transfer.done():
                     transfer = asyncio.create_task(
@@ -398,12 +398,12 @@ class NodeLifecycle:
                 await transfer
 
     @staticmethod
-    def _transfer_target(current: Ring, member: Member, leaving: bool) -> Ring:
-        if not leaving:
+    def _transfer_target(current: Ring, member: Member, draining: bool) -> Ring:
+        if not draining:
             return current.add_vnodes(member.vnodes)
         target = current.drop_nodes({member.node_id})
         if not len(target):
-            raise LeaveError("Cannot drain without another node on the ring.")
+            raise DrainError("Cannot drain without another node on the ring.")
         return target
 
     async def _publish_state(self, state: NodeState) -> Member:
@@ -492,8 +492,8 @@ class NodeLifecycle:
         await self._publish_state(state)
         await self._start_client()
         await self._hint_replayer.start()
-        self._leave_task = asyncio.create_task(
-            self._perform_leave(state), name="node-leave"
+        self._drain_task = asyncio.create_task(
+            self._perform_drain(state), name="node-drain"
         )
 
     async def _startup_failed(self) -> None:

@@ -18,7 +18,7 @@ import pytest
 
 import tourillon.bootstrap.handlers.node as node_handler
 import tourillon.bootstrap.handlers.probe as probe_handler
-from tourillon.core.exceptions import LeaveError
+from tourillon.core.exceptions import DrainError
 from tourlib.adapter import MsgPackSerializer
 from tourlib.envelope import Envelope, build_envelope
 from tourlib.models.inspect import NodeInspectRequest
@@ -30,8 +30,8 @@ class _ManagerStub:
         self.node_id = "node-local"
         self.inspect_requests: list[NodeInspectRequest] = []
         self.join_calls: list[list[str]] = []
-        self.leave_calls = 0
-        self.leave_error: Exception | None = None
+        self.drain_calls = 0
+        self.drain_error: Exception | None = None
 
     async def inspect(
         self, request: NodeInspectRequest
@@ -42,10 +42,10 @@ class _ManagerStub:
     async def join(self, seeds: list[str]) -> None:
         self.join_calls.append(seeds)
 
-    async def leave(self) -> None:
-        self.leave_calls += 1
-        if self.leave_error is not None:
-            raise self.leave_error
+    async def drain(self) -> None:
+        self.drain_calls += 1
+        if self.drain_error is not None:
+            raise self.drain_error
 
 
 @pytest.mark.tourillon
@@ -123,25 +123,25 @@ async def test_probe_handler_ping_replies_with_pong(
 
 @pytest.mark.tourillon
 @pytest.mark.parametrize("rejected", [False, True])
-async def test_node_leave_acknowledges_initiation_or_domain_rejection(
+async def test_node_drain_acknowledges_initiation_or_domain_rejection(
     monkeypatch: pytest.MonkeyPatch, rejected: bool
 ) -> None:
     manager = _ManagerStub()
     if rejected:
-        manager.leave_error = LeaveError("Node is not ready")
+        manager.drain_error = DrainError("Node is not ready")
     monkeypatch.setattr(node_handler, "get_manager", lambda: manager)
     request = build_envelope(
-        kind="node.leave",
+        kind="node.drain",
         payload=manager.serializer.encode({}),
         schema_id=manager.serializer.schema_id,
     )
 
-    responses = [item async for item in node_handler.leave(request)]
+    responses = [item async for item in node_handler.drain(request)]
 
-    assert manager.leave_calls == 1
+    assert manager.drain_calls == 1
     assert len(responses) == 1
     response = responses[0]
-    assert response.kind == ("node.leave.reject" if rejected else "node.leave.accept")
+    assert response.kind == ("node.drain.reject" if rejected else "node.drain.accept")
     assert response.correlation_id == request.correlation_id
     assert response.schema_id == request.schema_id
     assert response.proto_version == request.proto_version
@@ -150,38 +150,38 @@ async def test_node_leave_acknowledges_initiation_or_domain_rejection(
     assert message == (
         "Node is not ready"
         if rejected
-        else "Leave initiated; draining continues asynchronously."
+        else "Drain initiated; draining continues asynchronously."
     )
 
 
 @pytest.mark.tourillon
-async def test_node_leave_does_not_hide_unexpected_failures(
+async def test_node_drain_does_not_hide_unexpected_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _ManagerStub()
-    manager.leave_error = RuntimeError("unexpected")
+    manager.drain_error = RuntimeError("unexpected")
     monkeypatch.setattr(node_handler, "get_manager", lambda: manager)
     request = build_envelope(
-        kind="node.leave",
+        kind="node.drain",
         payload=manager.serializer.encode({}),
         schema_id=manager.serializer.schema_id,
     )
     with pytest.raises(RuntimeError, match="unexpected"):
-        _ = [item async for item in node_handler.leave(request)]
+        _ = [item async for item in node_handler.drain(request)]
 
 
 @pytest.mark.tourillon
 @pytest.mark.parametrize("document", [None, [], {"force": True}])
-async def test_node_leave_validates_request_before_delegating(
+async def test_node_drain_validates_request_before_delegating(
     monkeypatch: pytest.MonkeyPatch, document: object
 ) -> None:
     manager = _ManagerStub()
     monkeypatch.setattr(node_handler, "get_manager", lambda: manager)
     request = build_envelope(
-        kind="node.leave",
+        kind="node.drain",
         payload=manager.serializer.encode(document),
         schema_id=manager.serializer.schema_id,
     )
     with pytest.raises(ValueError, match="empty mapping"):
-        _ = [item async for item in node_handler.leave(request)]
-    assert manager.leave_calls == 0
+        _ = [item async for item in node_handler.drain(request)]
+    assert manager.drain_calls == 0

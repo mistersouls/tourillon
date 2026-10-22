@@ -69,12 +69,12 @@ NODE_JOIN_ERROR_PROFILE = ErrorProfile(
     invalid_response="Tourillon node returned an invalid join response",
 )
 
-NODE_LEAVE_ERROR_PROFILE = ErrorProfile(
-    action_failed="Node leave failed",
-    tls_failed="TLS setup or handshake failed during node leave",
-    refused="Tourillon node refused the leave connection",
-    unreachable="Unable to reach the Tourillon node for leave",
-    invalid_response="Tourillon node returned an invalid leave response",
+NODE_DRAIN_ERROR_PROFILE = ErrorProfile(
+    action_failed="Node drain failed",
+    tls_failed="TLS setup or handshake failed during node drain",
+    refused="Tourillon node refused the drain connection",
+    unreachable="Unable to reach the Tourillon node for drain",
+    invalid_response="Tourillon node returned an invalid drain response",
 )
 
 
