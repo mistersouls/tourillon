@@ -16,9 +16,10 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from tourillon.bootstrap.deps import get_manager, peer_dispatcher
+from tourillon.core.exceptions import DrainError
 from tourlib.envelope import Envelope, replay_envelope
 from tourlib.models.inspect import NodeInspectRequest
-from tourlib.models.node import JoinRequest
+from tourlib.models.node import DrainRequest, JoinRequest
 
 dispatcher = peer_dispatcher()
 
@@ -50,5 +51,28 @@ async def join(request: Envelope) -> AsyncIterator[Envelope]:
         request=request,
         payload=serializer.encode(
             {"message": "Join operation is successful triggered."}
+        ),
+    )
+
+
+@dispatcher.on("node.drain")
+async def drain(request: Envelope) -> AsyncIterator[Envelope]:
+    manager = get_manager()
+    serializer = manager.serializer
+    DrainRequest.from_document(serializer.decode(request.payload))
+    try:
+        await manager.drain()
+    except DrainError as exc:
+        yield replay_envelope(
+            kind="node.drain.reject",
+            request=request,
+            payload=serializer.encode({"message": str(exc)}),
+        )
+        return
+    yield replay_envelope(
+        kind="node.drain.accept",
+        request=request,
+        payload=serializer.encode(
+            {"message": "Drain initiated; draining continues asynchronously."}
         ),
     )

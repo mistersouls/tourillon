@@ -97,6 +97,7 @@ class Manager:
             repair=config.placement.repair,
         )
         self._lifecycle = NodeLifecycle(
+            placement_strategy=self._placement_strategy,
             config=config,
             peer_dispatcher=peer_dispatcher,
             client_dispatcher=client_dispatcher,
@@ -110,6 +111,7 @@ class Manager:
             topologymgr=self._topologymgr,
             storage=self._storage,
             telemetry=self._telemetry,
+            store=self._store,
         )
         self._inspector = NodeInspector(
             node_id=self._config.node.id,
@@ -242,3 +244,6 @@ class Manager:
 
     async def join(self, seeds: list[str] | None = None) -> None:
         await self._lifecycle.join(seeds=seeds)
+
+    async def drain(self) -> None:
+        await self._lifecycle.drain()

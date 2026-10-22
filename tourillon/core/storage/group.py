@@ -17,6 +17,10 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from tourillon.core.log import logger as _logger
 from tourillon.core.models.storageschema import (
     PID_SIZE,
+    Hint,
+    HintKey,
+    HintPrefix,
+    HintReference,
     Key,
     Keyspace,
     KVPair,
@@ -35,7 +39,6 @@ logger = _logger.storage()
 
 SCAN_BATCH_SIZE = 128
 COMMIT_BATCH_SIZE = 256
-_HINT_KINDS = frozenset({TagKind.HINT})
 
 
 def _decode_tag_kv(
@@ -95,6 +98,19 @@ async def _load_records(
 class PartitionGroupStore:
     def __init__(self, session_provider: SessionProvider) -> None:
         self._session_provider = session_provider
+
+    async def exists(self, key: Key) -> bool:
+        """Check exact owned-version presence without loading its value."""
+        async with self._session_provider.session(write=False) as session:
+            kv = await session.get(KVRef(key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
+            if kv is None:
+                return False
+            tag = Tag.from_bytes(kv.value)
+            if tag.kind not in {TagKind.LIVE, TagKind.TOMBSTONE}:
+                return False
+            return await session.exists(
+                KVRef(key.to_bytes(Keyspace.LOGS), Keyspace.LOGS)
+            )
 
     async def put(self, record: Record) -> None:
         async with self._session_provider.session(write=True) as session:
@@ -456,85 +472,212 @@ class PartitionGroupHint:
     def __init__(self, session_provider: SessionProvider) -> None:
         self._session_provider = session_provider
 
-    async def iter(self, batch_size: int = SCAN_BATCH_SIZE) -> AsyncIterator[Record]:
-        """Yield every pending hint, reading LOGS only for actual hints.
+    async def promote(
+        self, records: Sequence[Record], *, writable: bool = True
+    ) -> tuple[list[bool], int]:
+        """Confirm local copies and activate missing ones when writes are allowed.
 
-        The replayer runs this on every partition group a few times a second,
-        so the cost must track the number of hints, not the total amount of
-        stored data. Tags carry their own kind, which lets a non-hint entry be
-        discarded without a LOGS lookup; survivors are then fetched in batches
-        rather than one random read at a time.
-        """
-        async with self._session_provider.session(write=False) as session:
-            page: list[tuple[Key, Tag]] = []
-            async for kv in session.iter(keyspace=Keyspace.TAGS, batch_size=batch_size):
-                item = _decode_tag_kv(kv, _HINT_KINDS)
-                if item is None:
-                    continue
-                page.append(item)
-                if len(page) < batch_size:
-                    continue
-                for record in await _load_records(session, page):
-                    yield record
-                page = []
-
-            for record in await _load_records(session, page):
-                yield record
-
-    async def satisfy(self, records: Sequence[Record]) -> bool:
-        """Restore satisfied hints to their original tags and return whether any changed.
-
-        Like staging commit, this only rewrites the tag entry in `TAGS`: the
-        durable LOGS payload stays untouched so a later GC can clean it up.
+        Return confirmations in input order and the number promoted. Obligations
+        are untouched. Checks and writes share one short transaction.
         """
         if not records:
-            return False
-
-        async with self._session_provider.session(write=True) as session:
-            existing = await self._existing_tags(session, records)
-            restored = [
-                kv
-                for record, kv_tag in zip(records, existing, strict=True)
-                if (kv := self._restore_hint_kv(record, kv_tag)) is not None
+            return [], 0
+        if any(
+            record.tag.kind not in {TagKind.LIVE, TagKind.TOMBSTONE}
+            for record in records
+        ):
+            raise ValueError("promotion requires LIVE or TOMBSTONE records")
+        async with self._session_provider.session(write=writable) as session:
+            owned = await self._owned_versions(session, records)
+            pending = [
+                record
+                for record, present in zip(records, owned, strict=True)
+                if writable and not present
             ]
-            if not restored:
-                return False
+            await self._promote_records(session, pending)
+        return [present or writable for present in owned], len(pending)
 
-            async with session.batch() as batch:
-                for kv in restored:
-                    batch.put(kv)
-            await batch.result()
-        return True
-
-    @staticmethod
-    async def _existing_tags(
-        session: Session, records: Sequence[Record]
-    ) -> list[KVPair | None]:
+    async def _owned_versions(
+        self, session: Session, records: Sequence[Record]
+    ) -> list[bool]:
         async with session.batch() as batch:
             for record in records:
-                batch.get(
-                    KVRef(
-                        key=record.key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS
-                    )
-                )
-        return await batch.result()
+                batch.get(KVRef(record.key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
+                batch.exists(KVRef(record.key.to_bytes(Keyspace.LOGS), Keyspace.LOGS))
+        results = await batch.result()
+        return [
+            self._owned_tag(results[index * 2]) and results[index * 2 + 1]
+            for index in range(len(records))
+        ]
 
     @staticmethod
-    def _restore_hint_kv(record: Record, kv_tag: KVPair | None) -> KVPair | None:
-        if kv_tag is None:
-            return None
+    def _owned_tag(kv: KVPair | None) -> bool:
+        if kv is None:
+            return False
+        tag = Tag.from_bytes(kv.value)
+        return tag.kind in {TagKind.LIVE, TagKind.TOMBSTONE}
 
-        try:
-            tag = Tag.from_bytes(kv_tag.value)
-            if tag.kind != TagKind.HINT:
-                return None
-            restored = Tag.unhint(tag)
-        except ValueError as exc:
-            logger.warning("Cannot satisfy hinted entry %s: %s", record.key, exc)
-            return None
+    @staticmethod
+    async def _promote_records(session: Session, records: Sequence[Record]) -> None:
+        if not records:
+            return
+        async with session.batch() as batch:
+            for record in records:
+                batch.put(
+                    KVPair(
+                        record.key.to_bytes(Keyspace.TAGS),
+                        record.tag.to_bytes(),
+                        Keyspace.TAGS,
+                    )
+                )
+                batch.put(
+                    KVPair(
+                        record.key.to_bytes(Keyspace.LOGS),
+                        record.value.to_bytes(),
+                        Keyspace.LOGS,
+                    )
+                )
+        await batch.result()
 
-        return KVPair(
-            key=record.key.to_bytes(Keyspace.TAGS),
-            value=restored.to_bytes(),
-            keyspace=Keyspace.TAGS,
+    async def put(self, hint: Hint) -> HintKey:
+        """Persist an obligation without downgrading an existing owned version."""
+        record = hint.record
+        hint_key = HintKey(intent=hint.intent, hlc=hint.hlc)
+        reference = HintReference(record.key)
+        async with self._session_provider.session(write=True) as session:
+            kv_tag = await session.get(
+                KVRef(record.key.to_bytes(Keyspace.TAGS), Keyspace.TAGS)
+            )
+            owned = False
+            if kv_tag is not None:
+                tag = Tag.from_bytes(kv_tag.value)
+                owned = tag.kind in {TagKind.LIVE, TagKind.TOMBSTONE}
+            async with session.batch() as batch:
+                if not owned:
+                    batch.put(
+                        KVPair(
+                            record.key.to_bytes(Keyspace.TAGS),
+                            record.tag.to_bytes(),
+                            Keyspace.TAGS,
+                        )
+                    )
+                    batch.put(
+                        KVPair(
+                            record.key.to_bytes(Keyspace.LOGS),
+                            record.value.to_bytes(),
+                            Keyspace.LOGS,
+                        )
+                    )
+                batch.put(
+                    KVPair(
+                        hint_key.to_bytes(),
+                        reference.to_bytes(),
+                        Keyspace.META,
+                    )
+                )
+            await batch.result()
+        return hint_key
+
+    async def pending(self) -> bool:
+        """Return whether a persisted delivery obligation remains."""
+        async with self._session_provider.session(write=False) as session:
+            latest = session.last(Keyspace.META, prefix=HintPrefix())
+            return await latest is not None
+
+    async def iter(self, batch_size: int = SCAN_BATCH_SIZE) -> AsyncIterator[Hint]:
+        """Read bounded META pages without holding a transaction across delivery."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        position: bytes | None = None
+        while True:
+            async with self._session_provider.session(write=False) as session:
+                async with session.batch() as batch:
+                    batch.list(
+                        Keyspace.META,
+                        prefix=HintPrefix(),
+                        start=position,
+                        limit=batch_size,
+                    )
+                (page,) = await batch.result()
+                hints = await self._load_hints(session, page)
+            if not page:
+                return
+            position = page[-1].key
+            for hint in hints:
+                if hint is not None:
+                    yield hint
+
+    async def _load_hints(
+        self, session: Session, page: Sequence[KVPair]
+    ) -> list[Hint | None]:
+        selected: list[tuple[KVPair, Key]] = []
+        for kv in page:
+            try:
+                HintKey.from_bytes(kv.key)
+                reference = HintReference.from_bytes(kv.value)
+                selected.append((kv, reference.key))
+            except (ValueError, OverflowError) as exc:
+                self._invalid_hint(kv, exc)
+        if not selected:
+            return []
+        async with session.batch() as batch:
+            for _, key in selected:
+                batch.get(KVRef(key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
+                batch.get(KVRef(key.to_bytes(Keyspace.LOGS), Keyspace.LOGS))
+        results = await batch.result()
+        return [
+            self._load_hint(kv, results[index * 2], results[index * 2 + 1])
+            for index, (kv, _) in enumerate(selected)
+        ]
+
+    @staticmethod
+    def _invalid_hint(kv: KVPair, exc: Exception) -> None:
+        logger.warning(
+            "Cannot decode hint obligation: meta_key=%s error=%s",
+            kv.key.hex(),
+            exc,
         )
+
+    def _load_hint(
+        self, kv: KVPair, kv_tag: KVPair | None, kv_log: KVPair | None
+    ) -> Hint | None:
+        try:
+            return self._decode_hint(kv, kv_tag, kv_log)
+        except (ValueError, OverflowError) as exc:
+            self._invalid_hint(kv, exc)
+            return None
+
+    @staticmethod
+    def _decode_hint(
+        kv: KVPair, kv_tag: KVPair | None, kv_log: KVPair | None
+    ) -> Hint | None:
+        obligation = HintKey.from_bytes(kv.key)
+        reference = HintReference.from_bytes(kv.value)
+        key = reference.key
+        if kv_tag is None or kv_log is None:
+            logger.warning(
+                "Hint obligation references a missing version: intent=%s hlc=%s key=%s",
+                obligation.intent,
+                obligation.hlc,
+                key,
+            )
+            return None
+        tag = Tag.from_bytes(kv_tag.value)
+        original = Tag.unhint(tag) if tag.kind is TagKind.HINT else tag
+        record = Record(
+            key=key,
+            value=Value.from_bytes(kv_log.value),
+            tag=Tag.hint(original),
+        )
+        return Hint(record=record, intent=obligation.intent, hlc=obligation.hlc)
+
+    async def satisfy(self, hints: Sequence[Hint]) -> None:
+        """Idempotently delete exact delivered obligations, leaving versions intact."""
+        if not hints:
+            return
+        async with self._session_provider.session(write=True) as session:
+            async with session.batch() as batch:
+                for hint in hints:
+                    key = HintKey(hint.intent, hint.hlc)
+                    batch.delete(KVRef(key.to_bytes(), Keyspace.META))
+            await batch.result()

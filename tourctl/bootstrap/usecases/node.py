@@ -16,6 +16,7 @@ from cyclopts import App
 
 from tourctl.bootstrap.usecases.common import GlobalOptions
 from tourctl.core import inspect_node
+from tourctl.core.nodedrain import drain
 from tourctl.core.nodejoin import join
 
 node_app = App(name="node", help="Node lifecycle and inspection commands.")
@@ -60,6 +61,24 @@ async def node_join(
     return await join(
         address=address,
         seeds=seeds,
+        tourconf=opts.tourconf,
+        context_name=opts.context,
+    )
+
+
+@node_app.command(name="drain")
+async def node_drain(
+    address: str,
+    opts: GlobalOptions | None = None,
+) -> str:
+    """Initiate asynchronous draining; acknowledgement does not mean completion.
+
+    :param address: The peer endpoint of the node to drain.
+    :param opts: Client configuration and context options.
+    """
+    opts = opts or GlobalOptions()
+    return await drain(
+        address=address,
         tourconf=opts.tourconf,
         context_name=opts.context,
     )

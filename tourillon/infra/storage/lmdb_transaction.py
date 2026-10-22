@@ -42,6 +42,10 @@ class LmdbTransaction:
             return None
         return KVPair(ref.key, bytes(value), ref.keyspace)
 
+    def exists(self, ref: KVRef) -> bool:
+        with self._txn.cursor(db=self._dbis[ref.keyspace]) as cursor:
+            return cursor.set_key(ref.key)
+
     def put(self, kv: KVPair) -> None:
         key = kv.key
         value = kv.value

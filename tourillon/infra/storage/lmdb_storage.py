@@ -17,7 +17,7 @@ from pathlib import Path
 
 from tourillon.core.models.clock import HLCTimestamp
 from tourillon.core.models.config import StorageConfig
-from tourillon.core.models.storageschema import Key, Keyspace
+from tourillon.core.models.storageschema import HintKey, HintPrefix, Key, Keyspace
 from tourillon.core.ports.storage import SessionProvider, Storage, StorageProvider
 from tourillon.infra.storage.lmdb_session import LmdbConfig, LmdbSessionProvider
 
@@ -44,6 +44,12 @@ class LMDBStorage(Storage):
                     key = Key.from_bytes(kv.key, Keyspace.TAGS)
                     if key.ts > latest:
                         latest = key.ts
+                async for kv in session.iter(
+                    keyspace=Keyspace.META, prefix=HintPrefix()
+                ):
+                    hint_key = HintKey.from_bytes(kv.key)
+                    hlc = hint_key.hlc
+                    latest = max(latest, hlc)
 
         return latest
 

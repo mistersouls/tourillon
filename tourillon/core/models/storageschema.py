@@ -20,6 +20,7 @@ from typing import Any
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
 from tourlib.utils.buffer import BytesWalker
+from tourlib.validation import validate_node_id_size
 
 PID_SIZE = 4
 MAX_QUORUM_WRITE = 255
@@ -30,6 +31,49 @@ class Keyspace(StrEnum):
     LOGS = "logs"
     TAGS = "tags"
     META = "meta"
+
+
+class MetaKind(Enum):
+    HINT = b"\x01"
+
+
+@dataclass(frozen=True, slots=True, eq=True)
+class HintPrefix:
+    intent: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.intent is not None:
+            _validate_intent(self.intent)
+
+    def to_bytes(self) -> bytes:
+        if self.intent is None:
+            return MetaKind.HINT.value
+        _validate_intent(self.intent)
+        return MetaKind.HINT.value + _length_prefixed(self.intent.encode("utf-8"))
+
+    @classmethod
+    def from_bytes(cls, b: bytes) -> "HintPrefix":
+        walker = BytesWalker(b)
+        if walker.read(1, "metadata kind") != MetaKind.HINT.value:
+            raise ValueError("metadata prefix is not a hint prefix")
+        if b == MetaKind.HINT.value:
+            return cls()
+        intent = walker.read_field("hint intent").decode("utf-8")
+        if walker.read_remaining():
+            raise ValueError("hint prefix contains trailing bytes")
+        return cls(intent=intent)
+
+
+def _length_prefixed(value: bytes) -> bytes:
+    if len(value) > 0xFFFF:
+        raise ValueError("metadata field exceeds 65535 bytes")
+    return len(value).to_bytes(2, "big") + value
+
+
+def _validate_intent(intent: str) -> None:
+    if not isinstance(intent, str) or not intent:
+        raise ValueError("hint intent must be a non-empty string")
+    validate_node_id_size(intent)
 
 
 @dataclass(frozen=True, slots=True, eq=True, order=True)
@@ -192,6 +236,52 @@ class Key:
 
 
 @dataclass(frozen=True, slots=True, eq=True)
+class HintKey:
+    intent: str
+    hlc: HLCTimestamp
+
+    def __post_init__(self) -> None:
+        _validate_intent(self.intent)
+
+    def to_bytes(self) -> bytes:
+        return HintPrefix(self.intent).to_bytes() + self.hlc.to_bytes()
+
+    @classmethod
+    def from_bytes(cls, encoded: bytes) -> "HintKey":
+        walker = BytesWalker(encoded)
+        kind = walker.read(1, "metadata kind")
+        if kind != MetaKind.HINT.value:
+            raise ValueError("metadata key is not a hint obligation")
+        intent_bytes = walker.read_field("hint intent")
+        try:
+            intent = intent_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("hint intent is not valid UTF-8") from exc
+        hlc = HLCTimestamp.walk(walker)
+        if walker.read_remaining():
+            raise ValueError("hint key contains trailing bytes")
+        return cls(intent=intent, hlc=hlc)
+
+    def prefix(self) -> bytes:
+        return HintPrefix(self.intent).to_bytes()
+
+
+@dataclass(frozen=True, slots=True, eq=True)
+class HintReference:
+    key: Key
+
+    def to_bytes(self) -> bytes:
+        return self.key.to_bytes(Keyspace.TAGS)
+
+    @classmethod
+    def from_bytes(cls, encoded: bytes) -> "HintReference":
+        key = Key.from_bytes(encoded, Keyspace.TAGS)
+        if key.to_bytes(Keyspace.TAGS) != encoded:
+            raise ValueError("hint reference is not canonical")
+        return cls(key=key)
+
+
+@dataclass(frozen=True, slots=True, eq=True)
 class Value:
     data: bytes
     quorum_write: int
@@ -309,35 +399,24 @@ class Tag:
     payload: TagPayload = field(default_factory=TagPayload)
 
     @classmethod
-    def hint(cls, original: "Tag", node_id: str) -> "Tag":
-        payload = original.payload.with_source_prefix(node_id)
+    def hint(cls, original: "Tag") -> "Tag":
         return cls(
             kind=TagKind.HINT,
-            payload=TagPayload(sub=original.kind, payload=payload),
+            payload=TagPayload(sub=original.kind, payload=original.payload.to_bytes()),
         )
 
     @classmethod
-    def unhint(cls, hinted: "Tag", node_id: str | None = None) -> "Tag":
-        """
-        Reverse `Tag.hint` and recover the original Tag.
-
-        If `node_id` is provided, validate that the hinted node id matches it.
-        """
+    def unhint(cls, hinted: "Tag") -> "Tag":
+        """Reverse `Tag.hint` and recover the original tag."""
         if hinted.kind != TagKind.HINT:
             raise ValueError("Cannot unhint a non-HINT tag")
 
         if hinted.payload.sub is None:
             raise ValueError("Invalid HINT tag: missing original kind in payload.sub")
 
-        hinted_node_id, original_payload = hinted.payload.extract_source_prefix()
-        if node_id is not None and hinted_node_id != node_id:
-            raise ValueError(
-                f"Hint node id mismatch: expected '{node_id}', got '{hinted_node_id}'"
-            )
-
         return cls(
             kind=hinted.payload.sub,
-            payload=TagPayload.from_bytes(original_payload),
+            payload=TagPayload.from_bytes(hinted.payload.payload),
         )
 
     @classmethod
@@ -473,6 +552,19 @@ class Record(KeyTag):
         value = Value.from_dict(data["value"])
         tag = Tag.from_dict(data["tag"])
         return cls(key=key, value=value, tag=tag)
+
+
+@dataclass(frozen=True, slots=True)
+class Hint:
+    record: Record
+    intent: str
+    hlc: HLCTimestamp
+
+    def __post_init__(self) -> None:
+        _validate_intent(self.intent)
+        original = Tag.unhint(self.record.tag)
+        if original.kind not in {TagKind.LIVE, TagKind.TOMBSTONE}:
+            raise ValueError("hint must wrap a LIVE or TOMBSTONE tag")
 
 
 @dataclass

@@ -23,7 +23,8 @@ from typing import Any
 from tourillon.core.exceptions import StoreOperationError
 from tourillon.core.log import logger
 from tourillon.core.models.retry import BackoffRetry
-from tourillon.core.models.storageschema import Record, Tag
+from tourillon.core.models.storageschema import MAX_VALUE_DATA_LEN, Hint, Record, Tag
+from tourillon.core.partition.placement import PlacementStrategy, Preference
 from tourillon.core.peer import PeerPool
 from tourillon.core.ports.storage import SessionProvider, Storage
 from tourillon.core.storage.group import PartitionGroupHint
@@ -42,12 +43,22 @@ class HintReplayStats:
     last_failure_at: str | None = None
 
 
+@dataclass
+class _Delivery:
+    hint: Hint
+    record: Record
+    owners: frozenset[str]
+    targets: tuple[Preference, ...]
+    check_exists: bool
+    complete: bool = True
+
+
 class _TargetBackoff:
     """Defer retries per target node.
 
-    Hints are grouped by key, not by destination, so a single unreachable peer
-    holding many hints would otherwise be leased, dialled and timed out once
-    per hint on every cycle. Deferring by target collapses that to one attempt
+    A single unreachable peer holding many hints would otherwise be leased,
+    dialled and timed out once per hint on every cycle.
+    Deferring by target collapses that to one attempt
     and lets the delay grow while the peer stays down.
 
     There is no attempt ceiling: a hint represents an acknowledged write, so
@@ -85,21 +96,46 @@ class HintReplayer:
         peer_pool: PeerPool,
         serializer: Serializer,
         total_groups: int,
+        placement_strategy: PlacementStrategy,
+        node_id: str,
         poll_interval: float = 0.5,
         batch_size: int = 32,
         backoff: BackoffRetry | None = None,
+        concurrency: int = 4,
+        max_batch_bytes: int = 64 * 1024 * 1024,
     ) -> None:
+        if batch_size < 1 or concurrency < 1:
+            raise ValueError("batch_size and concurrency must be positive")
+        if max_batch_bytes < MAX_VALUE_DATA_LEN:
+            raise ValueError("max_batch_bytes must accommodate one maximum-size value")
         self._storage = storage
         self._peer_pool = peer_pool
         self._serializer = serializer
         self._total_groups = total_groups
+        self._placement = placement_strategy
+        self._node_id = node_id
+        self._local_writable = True
+        self._local_delivery = asyncio.Lock()
         self._poll_interval = poll_interval
         self._batch_size = batch_size
+        self._window_size = min(batch_size, max_batch_bytes // MAX_VALUE_DATA_LEN)
+        self._concurrency = concurrency
         self._backoff = _TargetBackoff(backoff or BackoffRetry())
 
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._stats = HintReplayStats()
+
+    def pause_local_writes(self) -> None:
+        self._local_writable = False
+
+    def resume_local_writes(self) -> None:
+        self._local_writable = True
+
+    async def drain_local_writes(self) -> None:
+        """Wait for local deliveries admitted before pause to finish."""
+        async with self._local_delivery:
+            pass
 
     async def start(self) -> None:
         """Start the hint replay process."""
@@ -118,6 +154,20 @@ class HintReplayer:
                 await self._task
         self._task = None
 
+    async def wait(self) -> None:
+        """Wait for durable exhaustion; callers must first settle hint producers."""
+        while await self._pending_hints():
+            if self._task is None or self._task.done():
+                raise RuntimeError("Cannot wait for hints without a running replayer")
+            await asyncio.sleep(self._poll_interval)
+
+    async def _pending_hints(self) -> bool:
+        for provider in await self._session_providers():
+            hints = PartitionGroupHint(provider)
+            if await hints.pending():
+                return True
+        return False
+
     def _envelope(self, kind: str, payload: dict[str, Any]) -> Envelope:
         return build_envelope(
             kind=kind,
@@ -130,7 +180,7 @@ class HintReplayer:
         if response.kind == kind:
             data = self._serializer.decode(response.payload)
             return data if isinstance(data, dict) else {}
-        if response.kind == "replication.write.reject":
+        if response.kind in {"replication.write.reject", "replication.exists.reject"}:
             raise StoreOperationError.from_dict(
                 self._serializer.decode(response.payload)
             )
@@ -151,36 +201,99 @@ class HintReplayer:
 
     async def _replay_once(self) -> None:
         for session_provider in await self._session_providers():
-            await self._replay_group(PartitionGroupHint(session_provider))
+            hints = PartitionGroupHint(session_provider)
+            await self._replay_group(hints)
 
     async def _replay_group(self, hint_group: PartitionGroupHint) -> None:
-        satisfied: list[Record] = []
-        async for record in hint_group.iter(batch_size=self._batch_size):
-            pending = self._pending(record)
-            if pending is None:
-                continue
+        window: list[Hint] = []
+        async for hint in hint_group.iter(batch_size=self._window_size):
+            window.append(hint)
+            if len(window) == self._window_size:
+                await self._replay_window(hint_group, window)
+                window.clear()
+        if window:
+            await self._replay_window(hint_group, window)
 
-            target_node_id, original = pending
-            if self._backoff.deferred(target_node_id):
-                continue
+    async def _prepare(self, hint: Hint) -> _Delivery | None:
+        pending = self._pending(hint)
+        if pending is None:
+            return None
+        _, original = pending
+        preference_list = await self._placement.preference_list(original.key.address)
+        preferences = preference_list.preferences
+        owners = frozenset(entry.node_id for entry in preferences)
+        if not owners:
+            return None
+        direct = hint.intent in owners
+        targets = tuple(
+            entry for entry in preferences if not direct or entry.node_id == hint.intent
+        )
+        return _Delivery(hint, original, owners, targets, not direct)
 
-            if not await self._replicate_to(target_node_id, original):
-                self._backoff.failed(target_node_id)
-                continue
+    async def _replay_window(
+        self, group: PartitionGroupHint, hints: list[Hint]
+    ) -> None:
+        deliveries = []
+        for hint in hints:
+            delivery = await self._prepare(hint)
+            if delivery is not None:
+                deliveries.append(delivery)
+        targets: dict[str, list[tuple[_Delivery, Preference]]] = {}
+        for delivery in deliveries:
+            for entry in delivery.targets:
+                targets.setdefault(entry.node_id, []).append((delivery, entry))
+        local = targets.pop(self._node_id, [])
+        await self._deliver_local_batch(group, local)
+        await self._deliver_targets(targets)
+        await self._satisfy(
+            group, [(item.hint, item.owners) for item in deliveries if item.complete]
+        )
 
-            self._backoff.succeeded(target_node_id)
-            satisfied.append(record)
-            if len(satisfied) >= self._batch_size:
-                await hint_group.satisfy(satisfied)
-                satisfied.clear()
+    async def _deliver_targets(
+        self, targets: dict[str, list[tuple[_Delivery, Preference]]]
+    ) -> None:
+        pending = iter(targets.items())
 
-        if satisfied:
-            await hint_group.satisfy(satisfied)
+        async def worker() -> None:
+            for node_id, deliveries in pending:
+                for delivery, entry in deliveries:
+                    await self._deliver_target(node_id, delivery, entry)
 
-    def _pending(self, record: Record) -> tuple[str, Record] | None:
+        async with asyncio.TaskGroup() as tasks:
+            for _ in range(min(self._concurrency, len(targets))):
+                tasks.create_task(worker())
+
+    async def _deliver_target(
+        self, node_id: str, delivery: _Delivery, entry: Preference
+    ) -> None:
+        if self._backoff.deferred(node_id):
+            delivery.complete = False
+            return
+        if await self._replicate_to(
+            node_id,
+            delivery.record,
+            check_exists=delivery.check_exists,
+            writable=entry.writable,
+        ):
+            self._backoff.succeeded(node_id)
+        else:
+            self._backoff.failed(node_id)
+            delivery.complete = False
+
+    async def _satisfy(
+        self, group: PartitionGroupHint, delivered: list[tuple[Hint, frozenset[str]]]
+    ) -> None:
+        stable: list[Hint] = []
+        for hint, owners in delivered:
+            current = await self._placement.preference_list(hint.record.key.address)
+            if frozenset(entry.node_id for entry in current.preferences) == owners:
+                stable.append(hint)
+        await group.satisfy(stable)
+
+    def _pending(self, hint: Hint) -> tuple[str, Record] | None:
         """Split a hint into its destination and the record to deliver."""
+        record = hint.record
         try:
-            target_node_id, _ = record.tag.payload.extract_source_prefix()
             original = Record(
                 key=record.key,
                 tag=Tag.unhint(record.tag),
@@ -188,39 +301,48 @@ class HintReplayer:
             )
         except ValueError as exc:
             logger.warning(
-                "Failed to extract source prefix from hint tag for key %s",
+                "Failed to decode hint tag for key %s",
                 record.key,
             )
             self._record_failure(exc)
             return None
-        return target_node_id, original
+        return hint.intent, original
 
     def _record_failure(self, exc: Exception) -> None:
         self._stats.failed_total += 1
         self._stats.last_failure = f"{type(exc).__name__}: {exc}"
         self._stats.last_failure_at = datetime.now(UTC).isoformat()
 
-    async def _replicate_to(self, target_node_id: str, record: Record) -> bool:
+    async def _replicate_to(
+        self,
+        target_node_id: str,
+        record: Record,
+        *,
+        check_exists: bool = False,
+        writable: bool = True,
+    ) -> bool:
         try:
             async with self._peer_pool.lease(target_node_id) as client:
-                try:
-                    await self._request(
-                        client,
-                        "replication.write",
-                        {"record": record.to_dict()},
-                        "replication.write.accept",
-                    )
-                    self._stats.applied_total += 1
+                if check_exists and await self._exists_remote(client, record):
                     return True
-                except (ProtocolError, StoreOperationError) as exc:
-                    self._record_failure(exc)
-                    logger.warning(
-                        "Failed to replicate hint to %s for key %s: %s",
-                        target_node_id,
-                        record.key,
-                        exc,
-                    )
-        except RuntimeError as exc:
+                if not writable:
+                    return False
+                await self._request(
+                    client,
+                    "replication.write",
+                    {"record": record.to_dict()},
+                    "replication.write.accept",
+                )
+                self._stats.applied_total += 1
+                return True
+        except (
+            RuntimeError,
+            ProtocolError,
+            StoreOperationError,
+            OSError,
+            TimeoutError,
+        ) as exc:
+            self._record_failure(exc)
             logger.warning(
                 "Failed to replicate hint to %s for key %s: %s",
                 target_node_id,
@@ -228,6 +350,58 @@ class HintReplayer:
                 exc,
             )
         return False
+
+    async def _deliver_local_batch(
+        self, group: PartitionGroupHint, deliveries: list[tuple[_Delivery, Preference]]
+    ) -> None:
+        if not deliveries:
+            return
+        if self._backoff.deferred(self._node_id):
+            for delivery, _ in deliveries:
+                delivery.complete = False
+            return
+        try:
+            async with self._local_delivery:
+                await self._apply_local_batch(group, deliveries)
+        except (RuntimeError, ValueError, OSError, TimeoutError) as exc:
+            self._record_failure(exc)
+            self._backoff.failed(self._node_id)
+            for delivery, _ in deliveries:
+                delivery.complete = False
+            logger.warning(
+                "Failed to apply local hints: node=%s error=%s", self._node_id, exc
+            )
+
+    async def _apply_local_batch(
+        self, group: PartitionGroupHint, deliveries: list[tuple[_Delivery, Preference]]
+    ) -> None:
+        for writable in (False, True):
+            selected = [
+                item
+                for item, entry in deliveries
+                if (entry.writable and self._local_writable) == writable
+            ]
+            confirmed, applied = await group.promote(
+                [item.record for item in selected], writable=writable
+            )
+            for item, present in zip(selected, confirmed, strict=True):
+                if not present or (not writable and not item.check_exists):
+                    item.complete = False
+            self._stats.applied_total += applied
+        self._backoff.succeeded(self._node_id)
+
+    async def _exists_remote(self, client: EnvelopeClient, record: Record) -> bool:
+        response = await self._request(
+            client,
+            "replication.exists",
+            {"key": record.key.to_dict()},
+            "replication.exists.accept",
+        )
+        if set(response) != {"owned"} or type(response["owned"]) is not bool:
+            raise ProtocolError(
+                "replication.exists response must contain an owned boolean"
+            )
+        return response["owned"]
 
     async def _request(
         self,

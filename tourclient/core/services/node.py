@@ -16,9 +16,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from tourclient.core import Transport
+from tourclient.exception import RequestRejectedError
 from tourlib import Serializer
 from tourlib.exceptions import ResponseError
-from tourlib.models.node import JoinRequest, JoinResponse
+from tourlib.models.node import DrainRequest, DrainResponse, JoinRequest, JoinResponse
 
 
 class NodeService:
@@ -39,3 +40,19 @@ class NodeService:
         if response.kind == "node.join.reject":
             return JoinResponse(message=data.get("message", ""), success=False)
         raise ResponseError(f"Unexpected node join response kind: {response.kind}")
+
+    async def drain(self) -> DrainResponse:
+        """Initiate draining without waiting for the node to finish."""
+        response = await self._transport.request(
+            kind="node.drain", document=DrainRequest()
+        )
+        if response.kind not in {"node.drain.accept", "node.drain.reject"}:
+            raise ResponseError(f"Unexpected node drain response kind: {response.kind}")
+        try:
+            document = self._serializer.decode(response.payload)
+            result = DrainResponse.from_document(document)
+        except (TypeError, ValueError) as exc:
+            raise ResponseError("Invalid node drain response payload") from exc
+        if response.kind == "node.drain.reject":
+            raise RequestRejectedError("node.drain", {"message": result.message})
+        return result

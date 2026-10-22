@@ -16,13 +16,15 @@ import asyncio
 import random
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 from tourillon.core.exceptions import (
     InvalidQuorumError,
     InvalidRepairTokenError,
+    NodeDrainingError,
     NoReplicaAvailableError,
     QuorumNotMetError,
     StoreOperationError,
@@ -38,6 +40,7 @@ from tourillon.core.models.repair import (
     encode_token,
 )
 from tourillon.core.models.storageschema import (
+    Hint,
     Key,
     Keyspace,
     PartitionAddress,
@@ -51,7 +54,7 @@ from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import PlacementStrategy, Preference
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports.storage import Storage
-from tourillon.core.storage.group import PartitionGroupStore
+from tourillon.core.storage.group import PartitionGroupHint, PartitionGroupStore
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT, MAX_CLOCK_SKEW_MS, MAX_QUORUM
 from tourlib.envelope import build_envelope
 from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest, RepairRequest
@@ -107,6 +110,54 @@ class StoreService:
         self._repair_slots = asyncio.Semaphore(self._read_repair.concurrency)
         self._repairs_inflight: set[tuple[bytes, str]] = set()
         self._repair_gate = asyncio.Semaphore((repair or RepairConfig()).concurrency)
+        self._accepting_operations = True
+        self._accepting_reads = True
+        self._accepting_read_repairs = True
+        self._mutations: set[asyncio.Future[None]] = set()
+
+    def pause(self, *, readable: bool = True) -> None:
+        """Refuse writes while draining, retaining reads until IDLE."""
+        self._accepting_operations = False
+        self._accepting_reads = readable
+
+    def resume(self) -> None:
+        self._accepting_operations = True
+        self._accepting_reads = True
+        self._accepting_read_repairs = True
+
+    async def stop_read_repairs(self) -> None:
+        """Stop scheduling repairs and let existing background writes settle."""
+        self._accepting_read_repairs = False
+        await self.close()
+
+    async def drain(self) -> None:
+        """Wait for admitted mutations and a snapshot of background writes."""
+        self.pause()
+        if self._mutations:
+            await asyncio.wait(tuple(self._mutations))
+        if self._pending_writes:
+            await asyncio.wait(tuple(self._pending_writes))
+
+    @contextmanager
+    def _operation(self, operation: str) -> Iterator[None]:
+        accepting = (
+            self._accepting_reads if operation == "read" else self._accepting_operations
+        )
+        if not accepting:
+            logger.warning(
+                "Node '%s' refuses %s while draining", self._node_id, operation
+            )
+            raise NodeDrainingError(operation)
+        if operation == "read":
+            yield
+            return
+        settled = asyncio.get_running_loop().create_future()
+        self._mutations.add(settled)
+        try:
+            yield
+        finally:
+            settled.set_result(None)
+            self._mutations.discard(settled)
 
     @property
     def stats(self) -> "ReplicationStats":
@@ -120,12 +171,15 @@ class StoreService:
         for the same reason: a half-applied repair is harmless, but tearing
         down storage mid-write is not.
         """
-        if not self._pending_writes:
-            return
-        await asyncio.gather(*tuple(self._pending_writes), return_exceptions=True)
+        while self._pending_writes:
+            await asyncio.wait(tuple(self._pending_writes))
 
     async def get(self, request: GetRequest) -> Version | None:
         """Get the versioned value for the given address."""
+        with self._operation("read"):
+            return await self._get(request)
+
+    async def _get(self, request: GetRequest) -> Version | None:
         self._validate_quorum("read", request.quorum_read)
         addr = Address(key=request.key, namespace=request.namespace)
         preflist = await self._placement_strategy.preference_list(addr)
@@ -142,14 +196,23 @@ class StoreService:
             raise self._replication_error("read", errors)
         version, _ = self._select_version(self._visible_versions(records))
         # A replica answering "I hold nothing" is still an answer: absence is
-        # information. The quorum counts responders, not holders of the winner.
-        self._ensure_quorum(len(records), request.quorum_read, "read", errors)
+        # information. A handoff and its owner count as one logical replica.
+        self._ensure_quorum(
+            self._read_response_count(targets, answers),
+            request.quorum_read,
+            "read",
+            errors,
+        )
         self._schedule_read_repair(answers, preflist.preferences, version)
         if self._is_tombstone(version, records):
             return None
         return version
 
     async def put(self, request: PutRequest) -> Version | None:
+        with self._operation("write"):
+            return await self._put(request)
+
+    async def _put(self, request: PutRequest) -> Version | None:
         self._validate_quorum("write", request.quorum_write)
         addr = Address(key=request.key, namespace=request.namespace)
         preflist = await self._placement_strategy.preference_list(addr)
@@ -178,6 +241,10 @@ class StoreService:
         return version
 
     async def delete(self, request: DeleteRequest) -> Version | None:
+        with self._operation("delete"):
+            return await self._delete(request)
+
+    async def _delete(self, request: DeleteRequest) -> Version | None:
         self._validate_quorum("write", request.quorum_write)
         addr = Address(key=request.key, namespace=request.namespace)
         preflist = await self._placement_strategy.preference_list(addr)
@@ -208,7 +275,32 @@ class StoreService:
         """Answer whether this node holds one exact version."""
         return await self._local_read_at(key)
 
+    async def exists(self, key: Key) -> bool:
+        group = self._partitioner.group_for(key.pid.value)
+        provider = await self._storage.session_provider_for(group)
+        store = PartitionGroupStore(provider)
+        return await store.exists(key)
+
     async def write(self, record: Record) -> Record:
+        with self._operation("replication.write"):
+            return await self._write(record)
+
+    async def hint(self, record: Record, intent: str) -> Record:
+        if record.tag.kind is not TagKind.HINT:
+            raise ValueError("hint requires a HINT record")
+        with self._operation("replication.hint"):
+            await self._hint(record, intent)
+        return record
+
+    async def _hint(self, record: Record, intent: str) -> None:
+        hint = Hint(record=record, intent=intent, hlc=self._clock.tick())
+        group = self._partitioner.group_for(record.key.pid.value)
+        provider = await self._storage.session_provider_for(group)
+        hints = PartitionGroupHint(provider)
+        await hints.put(hint)
+        self._stats.hints_recorded += 1
+
+    async def _write(self, record: Record) -> Record:
         """Apply a replicated write received from a peer.
 
         The partition id is recomputed from the address and compared with the
@@ -237,6 +329,10 @@ class StoreService:
         return await self._local_write(record)
 
     async def repair(self, request: RepairRequest) -> RepairResult:
+        with self._operation("repair"):
+            return await self._repair(request)
+
+    async def _repair(self, request: RepairRequest) -> RepairResult:
         """Spread an already-written version to the replicas that lack it.
 
         This is the resumable half of a write that did not reach its quorum.
@@ -345,9 +441,10 @@ class StoreService:
         """
         fanout: list[tuple[str, str, str | None]] = []
         for entry in preferences:
-            target = StoreService._write_target(entry)
-            if target is not None:
-                fanout.append((entry.node_id, target[0], target[1]))
+            if entry.handoff is not None:
+                fanout.append((entry.node_id, entry.handoff, entry.node_id))
+            elif entry.readable:
+                fanout.append((entry.node_id, entry.node_id, None))
         return fanout
 
     async def _collect_repair_reads(
@@ -474,7 +571,7 @@ class StoreService:
 
     async def _collect_reads(
         self,
-        targets: Sequence[str],
+        targets: Mapping[str, frozenset[str]],
         addr: PartitionAddress,
         quorum: int | None,
     ) -> tuple[dict[str, Record | None], list[Exception]]:
@@ -486,13 +583,15 @@ class StoreService:
         records: dict[str, Record | None] = {}
         errors: list[Exception] = []
 
+        pending: set[str] = set().union(*targets.values())
         tasks = {
             asyncio.create_task(self._read_from_target(target, addr), name=target)
-            for target in targets
+            for target in sorted(pending)
         }
 
         def collect(done: set[asyncio.Task[Record | None]]) -> None:
             for task in done:
+                pending.discard(task.get_name())
                 try:
                     records[task.get_name()] = task.result()
                 except Exception as exc:
@@ -502,13 +601,25 @@ class StoreService:
         def quorum_met() -> bool:
             if quorum is None:
                 return False
-            return len(records) >= quorum
+            return self._read_response_count(targets, records, pending) >= quorum
 
         unanswered = await self._drain_parallel_tasks(
             tasks, collect, quorum_met if quorum is not None else None
         )
         errors.extend(self._unanswered(unanswered))
         return records, errors
+
+    @staticmethod
+    def _read_response_count(
+        targets: Mapping[str, frozenset[str]],
+        answers: Mapping[str, Record | None],
+        pending: set[str] | frozenset[str] = frozenset(),
+    ) -> int:
+        """Count owners once, settling both read sources before an early return."""
+        return sum(
+            bool(sources.intersection(answers)) and not sources.intersection(pending)
+            for sources in targets.values()
+        )
 
     async def _read_from_target(
         self, target_node_id: str, addr: PartitionAddress
@@ -595,6 +706,9 @@ class StoreService:
         return sorted(targets)
 
     def _start_repair(self, node_id: str, record: Record) -> None:
+        if not self._accepting_read_repairs:
+            self._stats.read_repairs_skipped += 1
+            return
         marker = (record.key.to_bytes(Keyspace.LOGS), node_id)
         if marker in self._repairs_inflight:
             # A hot key must not spawn one repair per concurrent read.
@@ -622,7 +736,7 @@ class StoreService:
     def _write_target(entry: Preference) -> tuple[str, str | None] | None:
         if entry.handoff is not None:
             return entry.handoff, entry.node_id
-        if entry.readable:
+        if entry.writable:
             return entry.node_id, None
         return None
 
@@ -633,8 +747,8 @@ class StoreService:
         hinted_node_id: str | None,
     ) -> Record:
         if hinted_node_id is not None:
-            return await self._apply_write(
-                target_node_id, self._hint_record(record, hinted_node_id)
+            return await self._apply_hint(
+                target_node_id, self._hint_record(record), hinted_node_id
             )
         try:
             return await self._apply_write(target_node_id, record)
@@ -650,6 +764,19 @@ class StoreService:
             return await self._local_write(record)
         return await self._remote_write(target_node_id, record)
 
+    async def _apply_hint(
+        self, target_node_id: str, record: Record, intent: str
+    ) -> Record:
+        if target_node_id == self._node_id:
+            await self._hint(record, intent)
+            return record
+        payload = await self._remote_request(
+            "replication.hint",
+            target_node_id,
+            {"record": record.to_dict(), "intent": intent},
+        )
+        return Record.from_dict(payload)
+
     async def _record_hint(self, target_node_id: str, record: Record) -> None:
         """Store a hint owed to `target_node_id`, never masking the write error.
 
@@ -662,8 +789,7 @@ class StoreService:
         if target_node_id == self._node_id:
             return
         try:
-            await self._local_write(self._hint_record(record, target_node_id))
-            self._stats.hints_recorded += 1
+            await self._hint(self._hint_record(record), target_node_id)
         except Exception as exc:
             logger.warning(
                 "hint.record failed target=%s key=%s error=%s",
@@ -714,13 +840,18 @@ class StoreService:
         return self._serializer.decode(response.payload)
 
     @staticmethod
-    def _replication_targets(preferences: Sequence[Preference]) -> list[str]:
-        targets: list[str] = []
+    def _replication_targets(
+        preferences: Sequence[Preference],
+    ) -> dict[str, frozenset[str]]:
+        targets: dict[str, frozenset[str]] = {}
         for entry in preferences:
+            sources: set[str] = set()
+            if entry.readable:
+                sources.add(entry.node_id)
             if entry.handoff is not None:
-                targets.append(entry.handoff)
-            elif entry.readable:
-                targets.append(entry.node_id)
+                sources.add(entry.handoff)
+            if sources:
+                targets[entry.node_id] = frozenset(sources)
         if not targets:
             raise NoReplicaAvailableError("read")
         return targets
@@ -774,6 +905,8 @@ class StoreService:
         return await store.get_at(key)
 
     async def _local_write(self, record: Record) -> Record:
+        if record.tag.kind is TagKind.HINT:
+            raise ValueError("HINT records must use the hint operation")
         group = self._partitioner.group_for(record.key.pid.value)
         session_provider = await self._storage.session_provider_for(group)
         store = PartitionGroupStore(session_provider)
@@ -781,11 +914,11 @@ class StoreService:
         return record
 
     @staticmethod
-    def _hint_record(record: Record, hinted_node_id: str) -> Record:
+    def _hint_record(record: Record) -> Record:
         return Record(
             key=record.key,
             value=record.value,
-            tag=Tag.hint(record.tag, hinted_node_id),
+            tag=Tag.hint(record.tag),
         )
 
     async def _drain_parallel_tasks(

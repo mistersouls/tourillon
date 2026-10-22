@@ -57,6 +57,14 @@ class JoinError(Exception):
         self.error = error
 
 
+class DrainError(Exception):
+    """Raised when a node cannot begin or complete a drain."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__(error)
+        self.error = error
+
+
 class StoreOperationError(Exception):
     """Raised when a distributed store operation fails across one or more peers."""
 
@@ -111,6 +119,15 @@ class StoreOperationError(Exception):
             errors.append(Exception(f"{error_type}: {error_message}"))
         message = data.get("message", f"{operation} replication failed")
         return cls(operation=operation, errors=errors, message=message)
+
+
+class NodeDrainingError(StoreOperationError):
+    """Reject new work after an explicit departure has begun."""
+
+    code = "node_draining"
+
+    def __init__(self, operation: str) -> None:
+        self._set_details(operation, (), f"{operation}: node is draining or idle")
 
 
 class QuorumNotMetError(StoreOperationError):

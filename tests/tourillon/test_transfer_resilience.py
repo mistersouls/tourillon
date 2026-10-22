@@ -83,14 +83,14 @@ def _dataset() -> tuple[list[Record], list[Record]]:
     tags = [
         Tag(kind=TagKind.LIVE),
         Tag(kind=TagKind.TOMBSTONE),
-        Tag.hint(Tag(kind=TagKind.LIVE), "node-c"),
     ]
     transferable = [
-        _record(pid, idx, tags[(pid + idx) % 3])
+        _record(pid, idx, tags[(pid + idx) % 2])
         for pid in range(16)
         for idx in range(6)
     ]
     left_behind = [
+        _record(3, 98, Tag.hint(Tag(kind=TagKind.LIVE))),
         _record(3, 99, Tag.staging(Tag(kind=TagKind.LIVE), "node-z")),
         _record(9, 99, Tag(kind=TagKind.STALE)),
     ]

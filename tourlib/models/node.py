@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
+
+from tourlib.exceptions import ValidationError
 
 
 @dataclass
@@ -24,3 +28,31 @@ class JoinRequest:
 class JoinResponse:
     success: bool
     message: str
+
+
+@dataclass(frozen=True)
+class DrainRequest:
+    """Initiate asynchronous draining of the addressed node."""
+
+    @classmethod
+    def from_document(cls, document: Any) -> "DrainRequest":
+        if not isinstance(document, Mapping) or document:
+            raise ValidationError("node.drain request must be an empty mapping")
+        return cls()
+
+
+@dataclass(frozen=True)
+class DrainResponse:
+    """Acknowledgement of initiation, not completion of draining."""
+
+    message: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.message, str) or not self.message:
+            raise ValidationError("node.drain response message must be non-empty")
+
+    @classmethod
+    def from_document(cls, document: Any) -> "DrainResponse":
+        if not isinstance(document, Mapping) or set(document) != {"message"}:
+            raise ValidationError("node.drain response must contain a message")
+        return cls(message=document["message"])
