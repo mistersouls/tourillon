@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import AbstractContextManager
@@ -258,6 +259,7 @@ class _FakePool:
         self._client = client
         self._error = error
         self.calls: list[str] = []
+        self.released: list[str] = []
 
     async def acquire(self, node_id: str) -> _FakeClient:
         self.calls.append(node_id)
@@ -265,6 +267,14 @@ class _FakePool:
             raise self._error
         assert self._client is not None
         return self._client
+
+    @contextlib.asynccontextmanager
+    async def lease(self, node_id: str) -> AsyncIterator[_FakeClient]:
+        client = await self.acquire(node_id)
+        try:
+            yield client
+        finally:
+            self.released.append(node_id)
 
 
 def _member(
@@ -734,3 +744,77 @@ async def test_ae_loop_continues_after_network_errors() -> None:
     )
 
     await asyncio.gather(gossiper.stop(), return_exceptions=True)
+
+
+def _relay_engine(
+    pool: _FakePool, serializer: _MapSerializer, topology: TopologyManager
+) -> Gossiper:
+    engine = Gossiper(
+        node_id="node-a",
+        config=GossipConfig(),
+        stats=GossipStats(),
+        topologymgr=topology,
+        peer_pool=cast(PeerPool, cast(object, pool)),
+        serializer=serializer,
+        telemetry=build_noop_telemetry(),
+    )
+
+    engine._is_running = lambda: True  # type: ignore[method-assign]
+
+    return engine
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_gossiper_relay_forwards_with_remaining_budget_excluding_sender() -> None:
+    serializer = _MapSerializer()
+    topology = TopologyManager()
+
+    await topology.merge_registry(
+        (_member("node-a"), _member("node-b"), _member("node-c"), _member("node-x"))
+    )
+
+    accept = _envelope("gossip.push.accept", serializer, {"accepted": 1})
+    client = _FakeClient(request_responses=[accept, accept])
+    pool = _FakePool(client)
+    engine = _relay_engine(pool, serializer, topology)
+
+    engine.relay([_member("node-x", epoch=2)], 2, "node-b")
+    await asyncio.gather(*engine._relay_tasks)
+
+    # node-b sent it and node-x is the member itself: only node-c is left.
+    assert pool.calls == ["node-c"]
+    sent = cast(dict[str, object], serializer.decode(client.requests[0].payload))
+    assert sent["hop_limit"] == 2 and sent["sender"] == "node-a"
+    assert not engine._relay_tasks
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_gossiper_relay_drops_spent_budget_idle_engine_and_overflow() -> None:
+    serializer = _MapSerializer()
+    topology = TopologyManager()
+    await topology.merge_registry((_member("node-a"), _member("node-c")))
+    pool = _FakePool(_FakeClient())
+    engine = _relay_engine(pool, serializer, topology)
+    member = _member("node-x", epoch=2)
+
+    engine.relay([member], 0, "node-b")
+    engine.relay([], 3, "node-b")
+    assert not engine._relay_tasks
+
+    blocker = asyncio.Event()
+
+    engine._relay_tasks.update(
+        asyncio.create_task(blocker.wait()) for _ in range(Gossiper._MAX_PENDING_RELAYS)
+    )
+
+    engine.relay([member], 3, "node-b")
+    assert len(engine._relay_tasks) == Gossiper._MAX_PENDING_RELAYS
+
+    await engine._cancel_relays()
+    assert not engine._relay_tasks
+
+    engine._is_running = lambda: False  # type: ignore[method-assign]
+    engine.relay([member], 3, "node-b")
+    assert not engine._relay_tasks and pool.calls == []

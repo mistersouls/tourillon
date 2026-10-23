@@ -14,7 +14,7 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -28,6 +28,7 @@ from tourillon.core.models.storageschema import (
     KeyTag,
     KVPair,
     KVRef,
+    MetaKind,
     PartitionAddress,
     Pid,
     Record,
@@ -43,9 +44,13 @@ from tourillon.core.storage.group import (
     PartitionGroupStaging,
 )
 from tourillon.core.storage.session import (
+    BUCKET_PREFIX,
+    DEFAULT_BUCKET_SHIFT,
+    ROOT_PREFIX,
     DigestCell,
     GroupSessionManager,
     bucket_key,
+    root_key,
 )
 from tourillon.infra.storage.lmdb_session import LmdbConfig, LmdbSessionProvider
 from tourlib.models.ts import HLCTimestamp
@@ -592,3 +597,126 @@ async def test_hint_obligation_changes_roll_back_with_the_session(
 
     async with manager.session() as session:
         assert await session.has_hints()
+
+
+def _versioned(pid: int, wall_ms: int) -> Record:
+    return Record(
+        key=Key(
+            pid=Pid(pid),
+            address=Address(namespace=b"ns", key=f"key-{pid}-{wall_ms}".encode()),
+            ts=HLCTimestamp(wall_ms=wall_ms, counter=0, node_id="node"),
+        ),
+        tag=Tag(kind=TagKind.LIVE),
+        value=Value(data=b"value", quorum_write=1),
+    )
+
+
+@dataclass(frozen=True)
+class _Prefix:
+    raw: bytes
+
+    def to_bytes(self) -> bytes:
+        return self.raw
+
+
+async def _meta_cells(raw: Session, prefix: bytes) -> dict[bytes, DigestCell]:
+    async with raw.batch() as batch:
+        batch.list(Keyspace.META, prefix=_Prefix(prefix))
+
+    (page,) = await batch.result()
+
+    return {kv.key: DigestCell.from_bytes(kv.value) for kv in page}
+
+
+async def test_pid_root_combines_its_buckets_and_roots_are_contiguous(
+    provider: LmdbSessionProvider,
+) -> None:
+    bucket = 1 << DEFAULT_BUCKET_SHIFT
+
+    records = [
+        _versioned(2, 10),
+        _versioned(1, 10),
+        _versioned(1, bucket + 10),
+        _versioned(1, 3 * bucket),
+    ]
+
+    manager = GroupSessionManager(provider)
+
+    async with manager.session(write=True) as session:
+        assert await session.put_many(records[:2]) == [True, True]
+
+    async with manager.session(write=True) as session:
+        assert await session.put_many(records[2:]) == [True, True]
+
+    async with provider.session() as raw:
+        roots = await _meta_cells(raw, ROOT_PREFIX)
+        buckets = await _meta_cells(raw, BUCKET_PREFIX)
+
+    assert list(roots) == [root_key(1), root_key(2)]
+    assert roots[root_key(2)] == DigestCell.of(records[0].key)
+
+    assert roots[root_key(1)] == (
+        DigestCell.of(records[1].key)
+        + DigestCell.of(records[2].key)
+        + DigestCell.of(records[3].key)
+    )
+
+    assert list(buckets) == [
+        bucket_key(1, 0),
+        bucket_key(1, 1),
+        bucket_key(1, 3),
+        bucket_key(2, 0),
+    ]
+
+    pid_one = [cell for key, cell in buckets.items() if key != bucket_key(2, 0)]
+    assert sum(pid_one, DigestCell()) == roots[root_key(1)]
+
+
+async def test_pid_root_follows_ownership_changes_and_is_removed_when_empty(
+    provider: LmdbSessionProvider,
+) -> None:
+    first, second = _record(1), _record(2)
+    hint = Tag.hint(first.tag)
+    manager = GroupSessionManager(provider)
+
+    async with manager.session(write=True) as session:
+        await session.put_many([first, second])
+
+    async with manager.session(write=True) as session:
+        await session.update_tags([KeyTag(first.key, hint)])
+
+    async with provider.session() as raw:
+        kv = await raw.get(KVRef(root_key(1), Keyspace.META))
+        assert kv is not None
+        assert DigestCell.from_bytes(kv.value) == DigestCell.of(second.key)
+
+    async with manager.session(write=True) as session:
+        await session.update_tags([KeyTag(second.key, hint)])
+
+    async with provider.session() as raw:
+        assert await _meta_cells(raw, MetaKind.DIGEST.value) == {}
+
+
+async def test_pid_root_flush_failure_rolls_back_records_and_cells(
+    provider: LmdbSessionProvider,
+) -> None:
+    ref = KVRef(root_key(1), Keyspace.META)
+    maximum = DigestCell(count=2**64 - 1)
+
+    async with provider.session(write=True) as raw:
+        await raw.put(KVPair(ref.key, maximum.to_bytes(), Keyspace.META))
+
+    record = _record(1)
+
+    with pytest.raises(OverflowError):
+        async with GroupSessionManager(provider).session(write=True) as session:
+            await session.put(record)
+
+    async with provider.session() as raw:
+        assert await raw.get(ref) == KVPair(ref.key, maximum.to_bytes(), Keyspace.META)
+        assert await raw.get(KVRef(bucket_key(1, 0), Keyspace.META)) is None
+
+        assert (
+            await raw.get(KVRef(record.key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
+            is None
+        )

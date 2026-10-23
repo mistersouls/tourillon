@@ -260,3 +260,50 @@ class DataStorageError(Exception):
     Raised when there is an error during
     the data storage process of the node.
     """
+
+
+class AntiEntropyRejectError(Exception):
+    """A data anti-entropy request refused by its responder.
+
+    ``code`` is machine-readable so the initiator can react without parsing
+    text: ``stale_view`` and ``not_replica`` mean the two nodes disagree on who
+    holds the requested partitions (wait for the ring to converge), ``busy``
+    and ``not_ready`` mean the responder declines work for now and
+    ``retry_after`` seconds is a hint for the next attempt, ``invalid`` means
+    the request itself is malformed.
+    """
+
+    STALE_VIEW = "stale_view"
+    NOT_REPLICA = "not_replica"
+    BUSY = "busy"
+    NOT_READY = "not_ready"
+    INVALID = "invalid"
+
+    def __init__(self, code: str, reason: str = "", retry_after: float = 0.0) -> None:
+        super().__init__(reason or code)
+        self.code = code
+        self.reason = reason or code
+        self.retry_after = max(0.0, float(retry_after))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "reason": self.reason,
+            "retry_after": self.retry_after,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "AntiEntropyRejectError":
+        if not isinstance(data, dict):
+            return cls(cls.INVALID, "malformed reject payload")
+
+        retry_after = data.get("retry_after", 0.0)
+
+        if not isinstance(retry_after, int | float) or isinstance(retry_after, bool):
+            retry_after = 0.0
+
+        return cls(
+            code=str(data.get("code", cls.INVALID)),
+            reason=str(data.get("reason", "")),
+            retry_after=retry_after,
+        )

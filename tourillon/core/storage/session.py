@@ -17,6 +17,10 @@ Every write that makes a version owned (LIVE or TOMBSTONE) goes through
 `GroupSession`, so the per-(pid, time bucket) fingerprints kept in META
 always match TAGS. A cell is ``(count, xor of blake2b-128(TAGS key))``:
 commutative, and exact because a version already owned is never folded twice.
+
+Each pid also keeps a root cell, always equal to the combination of its
+bucket cells, so a pid is compared with a single read. Roots are laid out
+before buckets in META, so the roots of a pid range are contiguous.
 """
 
 import hashlib
@@ -48,7 +52,10 @@ from tourillon.core.ports.storage import Session, SessionProvider
 
 logger = _logger.storage()
 
-DIGEST_PREFIX: bytes = MetaKind.DIGEST.value + b"\x01"
+_ROOT = b"\x00"
+_BUCKET = b"\x01"
+ROOT_PREFIX: bytes = MetaKind.DIGEST.value + _ROOT
+BUCKET_PREFIX: bytes = MetaKind.DIGEST.value + _BUCKET
 DIGEST_BYTES = 16
 _COUNT_BYTES = 8
 _BUCKET_BYTES = 8
@@ -57,8 +64,6 @@ _BUCKET_BYTES = 8
 DEFAULT_BUCKET_SHIFT = 22
 
 OWNED_KINDS = frozenset({TagKind.LIVE, TagKind.TOMBSTONE})
-
-BucketId = tuple[int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,9 +104,13 @@ class DigestCell:
         )
 
 
+def root_key(pid: int) -> bytes:
+    return ROOT_PREFIX + pid.to_bytes(PID_SIZE, "big")
+
+
 def bucket_key(pid: int, bucket: int) -> bytes:
     return (
-        DIGEST_PREFIX
+        BUCKET_PREFIX
         + pid.to_bytes(PID_SIZE, "big")
         + bucket.to_bytes(_BUCKET_BYTES, "big")
     )
@@ -111,8 +120,9 @@ class GroupSession:
     """
     A single group session of new versions in a partition group.
 
-    Each bucket's META cell is read in the same batch as the first write
-    that touches it; deltas are accumulated in memory and written to META
+    The META cells of each bucket and of its pid root are read in the same
+    batch as the first write that touches them; deltas are accumulated in
+    memory and written to META
     once, just before commit. A transaction of new versions therefore costs
     four executor round trips (begin, insert, META write, commit) whatever
     the number of records.
@@ -125,9 +135,10 @@ class GroupSession:
     ) -> None:
         self._bucket_shift = bucket_shift
         self._session = session
-        self._deltas: dict[BucketId, DigestCell] = {}
-        # META cells as stored before this transaction, read once per bucket.
-        self._stored: dict[BucketId, DigestCell] = {}
+        # Keyed by META key: bucket and root cells share the same bookkeeping.
+        self._deltas: dict[bytes, DigestCell] = {}
+        # META cells as stored before this transaction, read once per cell.
+        self._stored: dict[bytes, DigestCell] = {}
 
     async def exists(self, key: Key) -> bool:
         """Check exact owned-version presence without loading its value."""
@@ -444,6 +455,106 @@ class GroupSession:
 
         await self._flush()
 
+    async def roots(self, pids: Sequence[int]) -> list[DigestCell]:
+        """Read the root cell of each pid in one batch; absent roots are empty."""
+        if not pids:
+            return []
+
+        async with self._session.batch() as batch:
+            for pid in pids:
+                batch.get(KVRef(root_key(pid), Keyspace.META))
+
+        results: list[KVPair | None] = await batch.result()
+
+        return [_cell(kv) for kv in results]
+
+    async def root_page(
+        self, after: int | None, limit: int
+    ) -> tuple[list[tuple[int, DigestCell]], int | None]:
+        """List non-empty roots in pid order after an exclusive pid cursor.
+
+        Only pids holding at least one owned version have a root, so this
+        enumerates the partitions this group actually stores without touching
+        TAGS. Returns the next cursor when the page is full.
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+
+        start = None if after is None else root_key(after)
+
+        async with self._session.batch() as batch:
+            batch.list(
+                Keyspace.META, prefix=_RawPrefix(ROOT_PREFIX), start=start, limit=limit
+            )
+
+        (page,) = await batch.result()
+
+        roots = [(_root_pid(kv.key), _cell(kv)) for kv in page]
+        cursor = roots[-1][0] if len(page) == limit else None
+
+        return roots, cursor
+
+    async def bucket_page(
+        self, pid: int, after: int | None, limit: int
+    ) -> tuple[list[tuple[int, DigestCell]], int | None]:
+        """List the non-empty bucket cells of one pid after an exclusive cursor."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+
+        prefix = BUCKET_PREFIX + pid.to_bytes(PID_SIZE, "big")
+        start = None if after is None else bucket_key(pid, after)
+
+        async with self._session.batch() as batch:
+            batch.list(
+                Keyspace.META, prefix=_RawPrefix(prefix), start=start, limit=limit
+            )
+
+        (page,) = await batch.result()
+
+        cells = [(_bucket_of(kv.key), _cell(kv)) for kv in page]
+        cursor = cells[-1][0] if len(page) == limit else None
+
+        return cells, cursor
+
+    async def owned_keys(
+        self, start: bytes, stop: bytes, limit: int
+    ) -> tuple[list[Key], bytes | None]:
+        """List owned version keys in the TAGS range ``(start, stop)``.
+
+        ``start`` is an exclusive cursor and ``stop`` an exclusive upper bound;
+        both begin with the 4-byte pid, which bounds the scan to one partition.
+        HINT and STAGING versions are skipped: they are not part of the digest.
+        The returned cursor is the last *physical* key read, so a page of
+        skipped entries still advances; it is None once ``stop`` is reached.
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+
+        async with self._session.batch() as batch:
+            batch.list(
+                Keyspace.TAGS,
+                prefix=_RawPrefix(start[:PID_SIZE]),
+                start=start,
+                limit=limit,
+            )
+
+        (page,) = await batch.result()
+
+        keys: list[Key] = []
+
+        for kv in page:
+            if kv.key >= stop:
+                return keys, None
+
+            key = _owned_key(kv)
+
+            if key is not None:
+                keys.append(key)
+
+        cursor = page[-1].key if len(page) == limit else None
+
+        return keys, cursor
+
     @staticmethod
     def _can_stage(kv: KVPair | None) -> bool:
         if kv is None:
@@ -555,10 +666,10 @@ class GroupSession:
         return Hint(record=record, intent=obligation.intent, hlc=obligation.hlc)
 
     def _change_digest(self, key: Key, owned: bool) -> None:
-        bid = self._bucket(key)
-        delta = self._deltas.get(bid, DigestCell())
         cell = DigestCell.of(key)
-        self._deltas[bid] = delta + cell if owned else delta - cell
+        for ref in self._cell_keys(key):
+            delta = self._deltas.get(ref, DigestCell())
+            self._deltas[ref] = delta + cell if owned else delta - cell
 
     async def _require_values(self, keys: Sequence[Key]) -> None:
         async with self._session.batch() as batch:
@@ -570,25 +681,26 @@ class GroupSession:
             raise ValueError("Cannot update a version without its LOGS entry")
 
     async def _load_cells(self, keys: Sequence[Key]) -> None:
-        bids = sorted({self._bucket(key) for key in keys} - self._stored.keys())
-        if not bids:
+        refs = self._unknown_cells(keys)
+
+        if not refs:
             return
 
         async with self._session.batch() as batch:
-            for bid in bids:
-                batch.get(KVRef(bucket_key(*bid), Keyspace.META))
+            for ref in refs:
+                batch.get(KVRef(ref, Keyspace.META))
 
         results: list[KVPair | None] = await batch.result()
-        for bid, kv in zip(bids, results, strict=True):
-            self._stored[bid] = _cell(kv)
+
+        for ref, kv in zip(refs, results, strict=True):
+            self._stored[ref] = _cell(kv)
 
     async def _insert(
         self, records: Sequence[Record], tags: Sequence[KVPair]
     ) -> list[bool]:
         """Insert tags and values if absent; preload the META cells needed."""
-        bids = sorted(
-            {self._bucket(r.key) for r in records if r.tag.kind in OWNED_KINDS}
-            - self._stored.keys()
+        refs = self._unknown_cells(
+            [r.key for r in records if r.tag.kind in OWNED_KINDS]
         )
 
         async with self._session.batch() as batch:
@@ -596,13 +708,14 @@ class GroupSession:
                 batch.put(kv, overwrite=False)
                 batch.put(_log_kv(record), overwrite=False)
 
-            for bid in bids:
-                batch.get(KVRef(bucket_key(*bid), Keyspace.META))
+            for ref in refs:
+                batch.get(KVRef(ref, Keyspace.META))
 
         results: list = await batch.result()
         n = 2 * len(records)
-        for bid, kv in zip(bids, results[n:], strict=True):
-            self._stored[bid] = _cell(kv)
+
+        for ref, kv in zip(refs, results[n:], strict=True):
+            self._stored[ref] = _cell(kv)
 
         # Flat results: (tags, logs) per record, then META cells; keep tags only.
         return results[:n:2]
@@ -638,19 +751,23 @@ class GroupSession:
 
         return promoted
 
-    def _bucket(self, key: Key) -> BucketId:
-        return key.pid.value, key.ts.wall_ms >> self._bucket_shift
+    def _cell_keys(self, key: Key) -> tuple[bytes, bytes]:
+        """Return the META keys of the root and bucket cells covering `key`."""
+        pid = key.pid.value
+
+        return root_key(pid), bucket_key(pid, key.ts.wall_ms >> self._bucket_shift)
+
+    def _unknown_cells(self, keys: Sequence[Key]) -> list[bytes]:
+        refs = {ref for key in keys for ref in self._cell_keys(key)}
+        return sorted(refs - self._stored.keys())
 
     def _fold(self, key: Key) -> None:
-        bid = self._bucket(key)
-        cell = self._deltas.get(bid, DigestCell()) + DigestCell.of(key)
-        self._deltas[bid] = cell
+        self._change_digest(key, owned=True)
 
     async def _flush(self) -> None:
         """Write the updated META cells in one batch (preloaded by `_insert`)."""
         cells = [
-            (bucket_key(*bid), self._stored[bid] + self._deltas[bid])
-            for bid in sorted(self._deltas)
+            (ref, self._stored[ref] + self._deltas[ref]) for ref in sorted(self._deltas)
         ]
         updates = [
             (KVRef(key, Keyspace.META), None if cell.empty else cell.to_bytes())
@@ -687,6 +804,54 @@ class GroupSessionManager:
 
 def _cell(kv: KVPair | None) -> DigestCell:
     return DigestCell() if kv is None else DigestCell.from_bytes(kv.value)
+
+
+@dataclass(frozen=True, slots=True)
+class _RawPrefix:
+    """A literal key prefix accepted by the storage ``prefix`` parameters."""
+
+    value: bytes
+
+    def to_bytes(self) -> bytes:
+        return self.value
+
+    @classmethod
+    def from_bytes(cls, b: bytes) -> "_RawPrefix":
+        return cls(b)
+
+
+def _root_pid(meta_key: bytes) -> int:
+    return int.from_bytes(meta_key[len(ROOT_PREFIX) :], "big")
+
+
+def _bucket_of(meta_key: bytes) -> int:
+    return int.from_bytes(meta_key[len(BUCKET_PREFIX) + PID_SIZE :], "big")
+
+
+def _owned_key(kv: KVPair) -> Key | None:
+    try:
+        if Tag.from_bytes(kv.value).kind not in OWNED_KINDS:
+            return None
+        return Key.from_bytes(kv.key, Keyspace.TAGS)
+    except (ValueError, OverflowError) as exc:
+        logger.warning("Skipping unreadable tag entry %s: %s", kv.key.hex(), exc)
+        return None
+
+
+def bucket_bounds(
+    pid: int, bucket: int, shift: int = DEFAULT_BUCKET_SHIFT
+) -> tuple[bytes, bytes]:
+    """Return the TAGS ``(start, stop)`` bounds, both exclusive, of a bucket.
+
+    TAGS keys are ``pid | wall_ms | ...``, so a bucket is a contiguous range.
+    No real key equals the 12-byte ``pid | lo`` start, so the exclusive cursor
+    skips nothing.
+    """
+    pid_bytes = pid.to_bytes(PID_SIZE, "big")
+    lo = bucket << shift
+    hi = (bucket + 1) << shift
+
+    return pid_bytes + lo.to_bytes(8, "big"), pid_bytes + hi.to_bytes(8, "big")
 
 
 def _kind(kv: KVPair | None) -> TagKind | None:

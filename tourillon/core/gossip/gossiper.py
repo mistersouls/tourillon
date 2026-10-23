@@ -87,10 +87,20 @@ class Gossiper:
     All member state is delegated to TopologyManager. Internal state is limited
     to hot_queue and the node's own epoch counter (from NodeState.epoch at startup).
 
+    Every push carries a ``hop_limit``. A responder that accepts at least one
+    newer member forwards it through :meth:`relay` with ``hop_limit - 1`` to a
+    fresh random fan-out that excludes the sender, so an announcement reaches
+    nodes several hops away without waiting for the slower AE loop.
+
+    Peer clients are always borrowed through ``PeerPool.lease`` so every
+    exchange releases its connection reference, even on failure.
+
     stop() drains the hot_queue before cancelling both loops, guaranteeing that
     any announce() call made before stop() — including critical FAILED
     announcements — is fully sent before the engine terminates.
     """
+
+    _MAX_PENDING_RELAYS = 64
 
     def __init__(
         self,
@@ -113,6 +123,7 @@ class Gossiper:
         self._hot_task: asyncio.Task | None = None
         self._ae_task: asyncio.Task | None = None
         self._hot_queue: asyncio.Queue[Member] = asyncio.Queue()
+        self._relay_tasks: set[asyncio.Task[None]] = set()
         self._update_hot_queue_size_metric()
 
     async def start(self) -> None:
@@ -181,6 +192,7 @@ class Gossiper:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
+        await self._cancel_relays()
         self._hot_task = None
         self._ae_task = None
         self._update_hot_queue_size_metric()
@@ -222,6 +234,15 @@ class Gossiper:
             task is not None and not task.done()
             for task in (self._hot_task, self._ae_task)
         )
+
+    async def _cancel_relays(self) -> None:
+        relays = list(self._relay_tasks)
+
+        for task in relays:
+            task.cancel()
+
+        await asyncio.gather(*relays, return_exceptions=True)
+        self._relay_tasks.clear()
 
     def _on_loop_done(self, loop_name: str, task: asyncio.Task) -> None:
         if task.cancelled():
@@ -312,8 +333,54 @@ class Gossiper:
         ]
         return eligible
 
-    async def _push_member(self, member: Member) -> None:
-        eligible = await self._eligible_members()
+    def relay(self, members: list[Member], hop_limit: int, sender: str) -> None:
+        """Forward freshly accepted members one more gossip hop.
+
+        Called by the ``gossip.push`` responder for the members it actually
+        applied. ``hop_limit`` is the budget *remaining* for the forwarded
+        push (the caller already decremented it); a budget of zero ends the
+        epidemic. Relays run as background tasks so the responder never waits
+        on outbound pushes, and the number of in-flight relays is bounded so a
+        burst of membership changes cannot fan out without limit. A member is
+        only re-forwarded when it was newer than the local view, so duplicate
+        pushes die out on their own even before the hop budget is spent.
+        """
+        if hop_limit < 1 or not members or not self._is_running():
+            return
+
+        if len(self._relay_tasks) >= self._MAX_PENDING_RELAYS:
+            logger.debug(
+                "gossip.relay dropped; too many pending relays node_id=%s",
+                self._node_id,
+            )
+            return
+
+        task = asyncio.get_running_loop().create_task(
+            self._relay(list(members), hop_limit, sender),
+            name=f"gossip-relay-{self._node_id}",
+        )
+
+        self._relay_tasks.add(task)
+        task.add_done_callback(self._relay_tasks.discard)
+
+    async def _relay(self, members: list[Member], hop_limit: int, sender: str) -> None:
+        excluded = {sender, *(member.node_id for member in members)}
+        for member in members:
+            await self._push_member(member, hop_limit=hop_limit, excluded=excluded)
+
+    async def _push_member(
+        self,
+        member: Member,
+        *,
+        hop_limit: int | None = None,
+        excluded: set[str] | None = None,
+    ) -> None:
+        eligible = [
+            peer
+            for peer in await self._eligible_members()
+            if not excluded or peer.node_id not in excluded
+        ]
+
         if not eligible:
             logger.debug(
                 "gossip._push_member no eligible peers node_id=%s member=%s",
@@ -325,27 +392,34 @@ class Gossiper:
         n = len(eligible)
         k = min(math.ceil(math.log2(n + 1)) + 1, self._config.max_fan_out)
         targets = random.sample(eligible, min(k, n))
+        budget = self._config.hop_limit if hop_limit is None else hop_limit
 
         await asyncio.gather(
-            *(self._send_push(member, target) for target in targets),
+            *(self._send_push(member, target, budget) for target in targets),
             return_exceptions=True,
         )
 
-    async def _send_push(self, member: Member, target: Member) -> None:
+    async def _send_push(
+        self, member: Member, target: Member, hop_limit: int | None = None
+    ) -> None:
         self._telemetry.gossip_push_attempt_total.add()
         with self._telemetry.start_span(
             "gossip.push",
             attributes={"target": target.node_id, "member": member.node_id},
         ) as span:
             try:
-                client = await self._peer_pool.acquire(target.node_id)
                 payload = {
                     "sender": self._node_id,
-                    "hop_limit": self._config.hop_limit,
+                    "hop_limit": (
+                        self._config.hop_limit if hop_limit is None else hop_limit
+                    ),
                     "members": [member.to_dict()],
                 }
                 envelope = self._build_envelope("gossip.push", payload)
-                resp = await client.request(envelope)
+
+                async with self._peer_pool.lease(target.node_id) as client:
+                    resp = await client.request(envelope)
+
                 if resp.kind == "gossip.error":
                     self._telemetry.gossip_push_error_total.add()
                     span.set_attribute("response.kind", resp.kind)
@@ -424,39 +498,8 @@ class Gossiper:
             attributes={"peer": peer.node_id},
         ) as span:
             try:
-                client = await self._peer_pool.acquire(peer.node_id)
-                fingerprint = await self._topologymgr.member_fingerprint()
-                topology = await self._topologymgr.snapshot()
-                payload = {
-                    "sender": self._node_id,
-                    "fingerprint": fingerprint,
-                    "count": len(topology.registry),
-                }
-                ping = self._build_envelope("gossip.ping", payload)
-                pong = await client.request(ping)
-                if pong.kind != "gossip.pong":
-                    return
-
-                pong_data: dict[str, Any] = self._serializer.decode(pong.payload)
-                self._stats.last_ae_peer = peer.node_id
-                self._stats.last_ae_at = self._utc_now()
-                self._set_last_ae_metrics(peer.node_id)
-
-                same = pong_data.get("same", True)
-                logger.debug(
-                    "gossip.ping result node_id=%s peer=%s same=%s fingerprint=%.8s",
-                    self._node_id,
-                    peer.node_id,
-                    same,
-                    fingerprint,
-                )
-
-                if same:
-                    return
-
-                self._stats.ae_diverged += 1
-                self._telemetry.gossip_ae_diverged.add()
-                await self._ae_digest_delta(peer, client)
+                async with self._peer_pool.lease(peer.node_id) as client:
+                    await self._ae_exchange(peer, client)
             except (EnvelopeError, ValidationError) as exc:
                 span.record_exception(exc)
                 span.set_status_error(str(exc))
@@ -466,6 +509,44 @@ class Gossiper:
                     peer.node_id,
                     exc,
                 )
+
+    async def _ae_exchange(self, peer: Member, client: EnvelopeClient) -> None:
+        fingerprint = await self._topologymgr.member_fingerprint()
+        topology = await self._topologymgr.snapshot()
+
+        payload = {
+            "sender": self._node_id,
+            "fingerprint": fingerprint,
+            "count": len(topology.registry),
+        }
+
+        ping = self._build_envelope("gossip.ping", payload)
+        pong = await client.request(ping)
+
+        if pong.kind != "gossip.pong":
+            return
+
+        pong_data: dict[str, Any] = self._serializer.decode(pong.payload)
+        self._stats.last_ae_peer = peer.node_id
+        self._stats.last_ae_at = self._utc_now()
+        self._set_last_ae_metrics(peer.node_id)
+
+        same = pong_data.get("same", True)
+
+        logger.debug(
+            "gossip.ping result node_id=%s peer=%s same=%s fingerprint=%.8s",
+            self._node_id,
+            peer.node_id,
+            same,
+            fingerprint,
+        )
+
+        if same:
+            return
+
+        self._stats.ae_diverged += 1
+        self._telemetry.gossip_ae_diverged.add()
+        await self._ae_digest_delta(peer, client)
 
     async def _ae_digest_delta(self, peer: Member, client: EnvelopeClient) -> None:
         """
