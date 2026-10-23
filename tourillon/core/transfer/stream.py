@@ -20,6 +20,7 @@ from tourillon.core.models.transfer import RangeTransfer, TransferChunk
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.ports.storage import SessionProvider, Storage
 from tourillon.core.storage.group import PartitionGroupStaging
+from tourillon.core.storage.session import GroupSessionManager
 from tourlib import Serializer
 from tourlib.constant import MAX_ENVELOPE_PAYLOAD, MAX_USER_ENVELOPE_PAYLOAD
 
@@ -203,7 +204,7 @@ class TransferStreamer:
         """Return the staging of one group, limited to the transfer segment."""
         return PartitionGroupStaging(
             self._transfer.src,
-            session_provider,
+            GroupSessionManager(session_provider),
             self._partitioner,
             segment=self._transfer.segment,
         )

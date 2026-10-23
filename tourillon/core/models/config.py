@@ -567,6 +567,124 @@ class RepairConfig:
         return cls(concurrency=concurrency)
 
 
+_AE_PREFIX = "placement.anti_entropy."
+
+
+def _ae_number(
+    document: Mapping[str, Any],
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float | None = None,
+) -> float:
+    value = document.get(name, default)
+
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValidationError(f"{_AE_PREFIX}{name} must be a number")
+
+    if value < minimum or (maximum is not None and value > maximum):
+        bound = f">= {minimum}" if maximum is None else f"in [{minimum}, {maximum}]"
+        raise ValidationError(f"{_AE_PREFIX}{name} must be {bound}")
+
+    return float(value)
+
+
+def _ae_int(document: Mapping[str, Any], name: str, default: int, minimum: int) -> int:
+    value = document.get(name, default)
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValidationError(f"{_AE_PREFIX}{name} must be an integer >= {minimum}")
+
+    return value
+
+
+@dataclass(frozen=True)
+class AntiEntropyConfig:
+    """Data anti-entropy runtime options (``[placement.anti_entropy]``).
+
+    - ``sweep_period``: target time, in seconds, for this node to compare every
+      partition it shares with every co-replica once. Cycles are spread evenly
+      over it, so the per-node request rate stays flat whatever the cluster
+      size.
+    - ``min_interval``: floor between two cycles, protecting small clusters
+      where one node shares many partitions with few peers.
+    - ``jitter``: relative random spread applied to every delay (0 to 1), so
+      nodes never synchronise their cycles.
+    - ``grace``: versions written less than this many seconds ago are ignored;
+      they are still in flight through the normal write path and hints.
+    - ``settle_delay``: wait after a ring change before resuming, so a burst of
+      membership updates triggers one replica-map rebuild, not many.
+    - ``concurrency``: anti-entropy requests this node serves at once as
+      responder; extra requests are refused with ``busy`` instead of
+      queueing. The initiator side runs one session at a time.
+    - ``pids_per_cycle``: partitions compared by one cycle; split into as
+      many root exchanges as needed to fit an envelope.
+    - ``keys_per_request``: version keys listed per page while descending
+      (pages larger than an envelope holds are clamped, never refused).
+    - ``max_batch_bytes``: payload ceiling of one fetch or push batch (a batch
+      always carries at least one record). Larger values are clamped below
+      the 18 MiB envelope payload limit; a single maximal value (16 MiB)
+      always fits, so the remainder simply goes in the next batch.
+    - ``max_repairs_per_cycle``: versions copied by one cycle; the rest is
+      found again by the next cycle since the digests still differ.
+    - ``max_keys_per_cycle``: version keys one cycle may list while
+      descending (local and remote), bounding the scan cost of a cycle even
+      when nothing needs copying.
+    """
+
+    enabled: bool = True
+    sweep_period: float = 600.0
+    min_interval: float = 1.0
+    jitter: float = 0.2
+    grace: float = 120.0
+    settle_delay: float = 5.0
+    concurrency: int = 4
+    pids_per_cycle: int = 4096
+    keys_per_request: int = 1024
+    max_batch_bytes: int = 4 * 1024 * 1024
+    max_repairs_per_cycle: int = 10_000
+    max_keys_per_cycle: int = 1_000_000
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "sweep_period": self.sweep_period,
+            "min_interval": self.min_interval,
+            "jitter": self.jitter,
+            "grace": self.grace,
+            "settle_delay": self.settle_delay,
+            "concurrency": self.concurrency,
+            "pids_per_cycle": self.pids_per_cycle,
+            "keys_per_request": self.keys_per_request,
+            "max_batch_bytes": self.max_batch_bytes,
+            "max_repairs_per_cycle": self.max_repairs_per_cycle,
+            "max_keys_per_cycle": self.max_keys_per_cycle,
+        }
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> "AntiEntropyConfig":
+        enabled = document.get("enabled", True)
+
+        if not isinstance(enabled, bool):
+            raise ValidationError(f"{_AE_PREFIX}enabled must be a boolean")
+
+        return cls(
+            enabled=enabled,
+            sweep_period=_ae_number(document, "sweep_period", 600.0, minimum=1.0),
+            min_interval=_ae_number(document, "min_interval", 1.0, minimum=0.01),
+            jitter=_ae_number(document, "jitter", 0.2, minimum=0.0, maximum=1.0),
+            grace=_ae_number(document, "grace", 120.0, minimum=0.0),
+            settle_delay=_ae_number(document, "settle_delay", 5.0, minimum=0.0),
+            concurrency=_ae_int(document, "concurrency", 4, 1),
+            pids_per_cycle=_ae_int(document, "pids_per_cycle", 4096, 1),
+            keys_per_request=_ae_int(document, "keys_per_request", 1024, 1),
+            max_batch_bytes=_ae_int(document, "max_batch_bytes", 4 * 1024 * 1024, 1),
+            max_repairs_per_cycle=_ae_int(document, "max_repairs_per_cycle", 10_000, 1),
+            max_keys_per_cycle=_ae_int(document, "max_keys_per_cycle", 1_000_000, 1),
+        )
+
+
 @dataclass(frozen=True)
 class PlacementConfig:
     """Placement runtime options."""
@@ -574,12 +692,14 @@ class PlacementConfig:
     replication_factor: int = 3
     read_repair: ReadRepairConfig = field(default_factory=ReadRepairConfig)
     repair: RepairConfig = field(default_factory=RepairConfig)
+    anti_entropy: AntiEntropyConfig = field(default_factory=AntiEntropyConfig)
 
     def to_document(self) -> dict[str, Any]:
         return {
             "replication_factor": self.replication_factor,
             "read_repair": self.read_repair.to_document(),
             "repair": self.repair.to_document(),
+            "anti_entropy": self.anti_entropy.to_document(),
         }
 
     @classmethod
@@ -595,10 +715,17 @@ class PlacementConfig:
         repair_doc = document.get("repair", {})
         if not isinstance(repair_doc, Mapping):
             raise ValidationError("placement.repair must be a table")
+
+        anti_entropy_doc = document.get("anti_entropy", {})
+
+        if not isinstance(anti_entropy_doc, Mapping):
+            raise ValidationError("placement.anti_entropy must be a table")
+
         return cls(
             replication_factor=replication_factor,
             read_repair=ReadRepairConfig.from_document(read_repair_doc),
             repair=RepairConfig.from_document(repair_doc),
+            anti_entropy=AntiEntropyConfig.from_document(anti_entropy_doc),
         )
 
 

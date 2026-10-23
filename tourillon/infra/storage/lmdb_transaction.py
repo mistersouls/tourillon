@@ -46,11 +46,11 @@ class LmdbTransaction:
         with self._txn.cursor(db=self._dbis[ref.keyspace]) as cursor:
             return cursor.set_key(ref.key)
 
-    def put(self, kv: KVPair) -> None:
+    def put(self, kv: KVPair, overwrite: bool = True) -> bool:
         key = kv.key
         value = kv.value
         dbi = self._dbis[kv.keyspace]
-        self._txn.put(key, value, db=dbi)
+        return self._txn.put(key, value, db=dbi, overwrite=overwrite)
 
     def delete(self, ref: KVRef) -> None:
         key = ref.key

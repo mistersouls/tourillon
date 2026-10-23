@@ -111,6 +111,7 @@ The peer server starts first; the client server only opens once the node has joi
 | `StoreService` | KV coordination: placement, replication, quorum, conflicts |
 | `NodeLifecycle` | Startup, join, transfers, servers, shutdown |
 | `GossipService` / `Gossiper` | Membership dissemination and anti-entropy |
+| `AntiEntropyService` | Data anti-entropy: background digest comparison between replicas |
 | `TransferService` | Peer-facing partition transfer endpoint |
 | `NodeInspector` | Paginated introspection for `node.inspect` |
 | `HLCClock` | Hybrid logical clock, restored from storage at boot |
@@ -333,6 +334,10 @@ Gossip kinds:
 
 `Gossiper` runs two loops: a **hot loop** for recent changes and an **anti-entropy loop** for convergence. `TopologyManager` applies accepted updates to the registry, rebuilds the ring, and signals waiters so join-time transfer planning can replan on topology change.
 
+Every `gossip.push` carries a `hop_limit` (`gossip.hop_limit`, 3 by default). A responder that accepts at least one *newer* member relays exactly those members once more through `Gossiper.relay` with `hop_limit - 1`, skipping the sender and the members themselves; a budget of zero ends the epidemic. Relays run as background tasks (the push handler never waits on them), at most 64 are in flight, and a member is only relayed when it was newer locally, so duplicates die out on their own. `wanted` members of a `gossip.delta` (known by the initiator with a newer epoch, or unknown to the responder) are pulled back with `hop_limit = 1`. All gossip requests hold their pooled connection through `PeerPool.lease`.
+
+Membership anti-entropy (the gossip `ae_interval` loop) and data anti-entropy (§9) are separate loops: membership state is tiny and must converge in seconds, data comparison is large and is paced over minutes.
+
 `PhiAccrual` turns inter-arrival times of successful probes into a suspicion value; `PeerFailureDetector` drives probes per peer and exposes a status consumed by placement.
 
 Invariants:
@@ -362,7 +367,185 @@ During join, `NodeLifecycle` watches for ring changes and replans transfers unti
 
 ---
 
-## 9. Wire protocol
+## 9. Data anti-entropy
+
+Writes, hinted handoff and transfers each leave narrow gaps where a replica
+can miss a version for good: a write landing behind a transfer cursor, a hint
+delivered while the ring moves, a node applying a topology update late and
+accepting a write for a partition it no longer replicates. Read repair only
+heals what is read. `AntiEntropyService` (`tourillon/core/antientropy/`)
+closes these gaps proactively by comparing digests between replicas, whatever
+caused the divergence.
+
+### Digests
+
+Every group maintains digest cells in its `META` keyspace, updated in the same
+transaction as the data (`GroupSession.update_tags` / `_flush`):
+
+| Key | Cell |
+| --- | --- |
+| `DIGEST · 0x00 · pid` (`ROOT_PREFIX`) | fold of every owned version of the partition |
+| `DIGEST · 0x01 · pid · bucket` (`BUCKET_PREFIX`) | fold of the owned versions whose `wall_ms >> 22` is `bucket` (~70 min) |
+
+A cell is `(count, xor of blake2b(tags key))`: order-independent, cheap to
+update incrementally, and two equal cells mean the same set of versions with
+overwhelming probability. Only owned versions (`LIVE`, `TOMBSTONE`) are
+counted; staged transfer copies and hint copies are not. Since a version is
+immutable and identified by its TAGS key (pid, address, HLC), comparing *sets
+of keys* is enough: a value never needs comparing.
+
+### The descent
+
+One session compares a slice of partitions with one peer
+(`core/antientropy/sync.py`, `PeerSync`):
+
+1. `antientropy.roots` — the initiator sends its root cell for up to
+   `pids_per_cycle` pids; the responder answers only those that differ.
+2. `antientropy.buckets` — for each differing pid, page through the peer's
+   bucket cells and compare them with the local ones.
+3. `antientropy.range` — the bucket straddling the grace cutoff also counts
+   versions too young to judge, so both sides recompute the digest of its
+   eligible part only by scanning.
+4. `antientropy.keys` — for each differing bucket, list version keys page by
+   page and merge them against the local keys of the same window.
+5. `antientropy.push` the versions the peer lacks; `antientropy.fetch` and
+   apply the ones this node lacks (`put_many`, which also promotes a local
+   staged or hint copy into an owned one).
+
+The cost follows the size of the difference, not the size of the data: in
+the steady state a session is one `roots` round-trip that returns nothing.
+
+**Grace.** Versions younger than `grace` seconds (wall clock of the HLC) are
+never compared: they are still travelling through the write path and the hint
+replayer, and copying them would only race with those.
+
+**Repairs are direct copies.** Missing versions are pushed or fetched directly,
+not turned into hint obligations. The copy is idempotent (an existing version
+is never rewritten), adds no durable state to replay, and bounded per session;
+the data and its digests *are* the progress state, so a session stopped half
+way loses nothing — the next sweep finds the rest because digests still differ.
+
+### Replica mode and handoff mode
+
+- **Replica mode** — for every co-replica `peer`, the pids both replicate
+  (`ReplicaView.shared[peer]`) are compared two ways. Only one node of each
+  pair initiates (`initiates()`: a hash of the sorted pair), so a pair is
+  compared once per sweep, not twice.
+- **Handoff mode** — this node scans its own non-empty roots
+  (`root_page`), keeps the pids it does **not** replicate in the current view,
+  and pushes their versions one way to every current replica (`push_only`). It
+  never pulls and never deletes: the local copy stays until the GC reclaims it.
+  When every replica was reached and the pid held no version still inside the
+  grace window, the pid is marked with `(view hash, local root)` and skipped
+  until either changes (a young version would otherwise never be pushed: the
+  root does not change when it ages). Marks are in
+  memory: after a restart each orphan pid is re-checked once (cheap: a `roots`
+  exchange).
+
+A version written on a pid it does not hash to is logged as foreign by the
+responder; it is still accepted, since refusing it would lose data.
+
+### Agreeing on replicas without agreeing on the ring
+
+`ViewTracker` rebuilds a `ReplicaView` (the replica tuple of every pid, built
+off the hot path and yielding every 4096 pids) whenever the ring changes,
+after `settle_delay` so a burst of updates causes one rebuild. Every request
+carries a `Scope`: its pids plus a 16-byte hash of the replica tuples the
+sender computed for them. The responder recomputes it and refuses with
+`stale_view` on mismatch, so both sides always reason about the same
+replicas without needing identical rings — only the scoped pids must agree.
+
+A ring change sets the view's *stale* signal (`wait_for_ring_change`): the
+running session stops at its next request (`ViewChangedError`), the sweep is
+abandoned, and a new plan is drawn on the rebuilt view.
+
+### Scheduling at scale
+
+Once per `sweep_period` (600 s by default) a node walks a shuffled plan of
+units — replica slices of at most `pids_per_cycle` pids per initiated peer,
+plus handoff slices covering the pid space — spaced by
+`sweep_period / len(plan)` (at least `min_interval`, ±`jitter`), with a random
+first delay. The initiator runs **one session at a time**.
+
+With `1 << 17` partitions, RF 3 and 10,000 nodes a node replicates ~39 pids
+and shares them with a few dozen peers: its plan is a few dozen replica units
+(half of its pairs, since only one side initiates) plus 32 handoff units that
+only read local roots unless orphans exist. That is one `roots` request every
+~10–20 s per node, flat in the cluster size. Cluster-wide this is ~1,000
+small requests per second spread uniformly over 10,000 nodes — each node
+serves about as many as it sends, which is noise next to client traffic.
+On a small cluster each unit covers more pids instead, and `min_interval`
+caps the rate.
+
+### Storm safety
+
+- The responder serves at most `concurrency` requests at once and refuses the
+  rest immediately with `busy` + `retry_after`, instead of queueing.
+- Rejects carrying `retry_after` (`busy`, `not_ready`, `stale_view`) defer the
+  peer for that long; transport failures and other rejects defer it with
+  exponential backoff. Peers that are not `READY` or are suspected by the
+  failure detector are skipped.
+- Per-session budgets: `max_keys_per_cycle` keys listed and
+  `max_repairs_per_cycle` versions copied (`BudgetSpentError`).
+- Writes go through small transactions (`APPLY_BATCH` = 64 records, 8 MiB) and
+  every scan yields to the event loop, so client `kv.put/get/delete` are never
+  blocked behind a long anti-entropy transaction.
+- The service starts only once the node is `READY` and stops before drain and
+  shutdown; a stop waits for the requests already admitted.
+
+### Envelope bounds and pagination
+
+An envelope carries at most 18 MiB. Anti-entropy never refuses work for size:
+senders paginate and receivers clamp.
+
+| Request | Bound |
+| --- | --- |
+| `roots` | split into chunks of at most `1 << 17` pids (~4 MiB) |
+| `buckets`, `keys` | `limit` clamped to 16,384 entries per page; the cursor continues |
+| `fetch` | at most 16,384 keys; answers at most `min(max_bytes, 17 MiB)` of records but always at least one, and returns how many keys it `consumed` so the requester resumes |
+| `push` | batches of at most `min(max_batch_bytes, 17 MiB)`, at least one record |
+
+A maximal record (16 MiB value) always fits one batch on its own.
+
+### Configuration
+
+`[placement.anti_entropy]` in the node configuration (`AntiEntropyConfig`):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | run the loop and serve requests |
+| `sweep_period` | `600` | seconds to compare every unit once |
+| `min_interval` | `1` | floor between two units |
+| `jitter` | `0.2` | relative spread of every delay |
+| `grace` | `120` | seconds before a version is compared |
+| `settle_delay` | `5` | wait after a ring change before rebuilding the view |
+| `concurrency` | `4` | requests served at once as responder |
+| `pids_per_cycle` | `4096` | pids per unit |
+| `keys_per_request` | `1024` | keys per page while descending |
+| `max_batch_bytes` | `4 MiB` | payload of one push or fetch |
+| `max_repairs_per_cycle` | `10000` | versions copied by one session |
+| `max_keys_per_cycle` | `1000000` | keys listed by one session |
+
+Values are only bounded below; anything an envelope cannot carry is clamped
+and paginated.
+
+### Known limits
+
+- **GC interplay.** The GC keeps the most recent versions of each address. It
+  must never collect a version that a replica could still push back, or
+  anti-entropy would resurrect it; the GC must therefore collect consistently
+  across replicas (for example only versions older than a horizon well beyond
+  `grace` plus a sweep). The GC is not implemented yet.
+- **Handoff restart.** A budget stop on a very large orphan partition
+  restarts its descent from the beginning on the next sweep (copies already
+  made are not redone, only rescanned).
+- **Digest migration.** Data written before digests were maintained has no
+  roots and is invisible to anti-entropy until rewritten.
+- The responder's `range` scan is bounded by the bucket size, not by a budget.
+
+---
+
+## 10. Wire protocol
 
 ```
 Envelope := header(32 bytes) || kind(UTF-8) || payload
@@ -381,7 +564,7 @@ Handlers are async generators registered once per kind on the peer or client dis
 
 ---
 
-## 10. Client and CLI
+## 11. Client and CLI
 
 `tourclient` exposes a **service registry** mapping a service name to a factory and the endpoints it is valid on:
 
@@ -392,7 +575,7 @@ Handlers are async generators registered once per kind on the peer or client dis
 | `node` | peer | `node.join` / `node.drain` |
 | `inspect` | peer | `node.inspect` → paginated `node.info` |
 
-`gossip.*`, `replication.*` and `transfer.*` are internal to the cluster and deliberately have no client service.
+`gossip.*`, `replication.*`, `transfer.*` and `antientropy.*` are internal to the cluster and deliberately have no client service.
 
 `tourctl` builds on those services with cyclopts commands (`probe ping`, `node inspect`, `node join`, `node drain`, `put`, `get`, `delete`, `repair`). Commands stay thin; rendering and error mapping live in `tourctl/core/`, which translates configuration, TLS/connectivity and protocol failures into actionable `SystemExit` messages instead of tracebacks.
 
@@ -400,7 +583,7 @@ Handlers are async generators registered once per kind on the peer or client dis
 
 ---
 
-## 11. Storage model
+## 12. Storage model
 
 ```
 Storage ──session_provider_for(group)──▶ SessionProvider ──session(write=)──▶ Session ──batch()──▶ Batch
@@ -411,22 +594,51 @@ Storage ──session_provider_for(group)──▶ SessionProvider ──session
 - Keyspaces and record layout live in `tourillon/core/models/storageschema.py`. Keys are length-prefixed byte compositions — never ad-hoc strings.
 - `Storage.latest_hlc(total_groups)` is read at boot to restore the hybrid logical clock so timestamps never move backwards across restarts.
 
+`core/storage/session.py` provides a typed `GroupSession` through
+`GroupSessionManager.session(write=...)`. Its `read` and `get_many` methods
+read exact versions; `get` reads the latest version and `tags` loads only tags.
+`exists_many` checks owned tags and value presence in a single batch without
+loading values. `stage_many` writes transfer versions without hiding active
+copies; retries may replace the staging source.
+`put_many` inserts versions and promotes non-owned copies without rewriting
+existing values. `update_tags` maintains the per-bucket count/XOR digest
+across ownership changes, including duplicate keys and repeated flushes.
+Tag updates reject incomplete versions before changing any tag or digest.
+The caller retains responsibility for placement, transfer authorization and
+hint obligations. The manager flushes digests before committing the underlying
+transaction; errors roll back records and digests together.
+Store operations use managed sessions directly, without a separate store facade.
+`PartitionGroupStaging` and `PartitionGroupHint` remain separate workflows:
+the former owns transfer bounds, resumes and source authorization; the latter
+owns delivery obligations and acknowledgements. Both receive a
+`GroupSessionManager` and delegate record writes to its typed session.
+Each staging activation page selects its tags and restores exactly one wrapper
+with `update_tags` in the same write transaction, so another writer cannot
+change its source or ownership between selection and activation.
+`GroupSession` does not expose its underlying raw session. `tag_page` returns
+typed tags and a physical continuation cursor, while `load_records` fetches
+only selected values. `last_staged_keys` reads durable transfer progress.
+`put_hint_obligation`, `has_hints`, `hint_page` and `remove_hint_obligations`
+encapsulate delivery metadata without allowing arbitrary META writes.
+Paged scans log and skip unreadable entries while still advancing their
+cursor; no transaction stays open while the caller consumes a page.
+
 Configuration and node state are persisted through the `Persistence` port, TOML by default, with per-path locking and atomic replace.
 
 ---
 
-## 12. Observability
+## 13. Observability
 
 Telemetry goes through the `Telemetry` / `TelemetryProvider` ports, implemented by the OpenTelemetry adapter in `tourillon/infra/adapter/telemetry/`. The peer pool, transport and gossip paths are instrumented. Logging uses `tourillon.core.log.logger` with lazy `%s` formatting and node/correlation context on request paths.
 
 ---
 
-## 13. Where the design is deliberately open
+## 14. Where the design is deliberately open
 
 The following are design decisions that have **not** been settled yet; see [`backlog.md`](backlog.md) for the actionable list.
 
 - Namespaces exist on the wire and in addressing but have no registry, quota, or access-control semantics.
 - Consistency is expressed as raw per-request quorum integers; there is no named consistency-level API.
-- There is no anti-entropy between replicas outside the read path: divergence is healed opportunistically by read repair, or on demand through `kv.repair`, and never proactively.
+- Data anti-entropy heals replicas proactively (§9), but the version GC that bounds storage is not implemented, and its consistency constraint with anti-entropy is not enforced yet.
 - Placement has no failure-domain (anti-affinity) awareness.
 - Steady-state rebalancing is not implemented; transfers are driven by joins and explicit departures.

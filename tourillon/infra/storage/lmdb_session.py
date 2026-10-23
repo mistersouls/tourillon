@@ -63,8 +63,8 @@ class LmdbSession(Session):
     async def exists(self, ref: KVRef) -> bool:
         return await self._executor.execute(self._txn.exists, ref)
 
-    async def put(self, kv: KVPair) -> None:
-        await self._executor.execute(self._txn.put, kv)
+    async def put(self, kv: KVPair, overwrite: bool = True) -> bool:
+        return await self._executor.execute(self._txn.put, kv, overwrite=overwrite)
 
     async def delete(self, ref: KVRef) -> None:
         await self._executor.execute(self._txn.delete, ref)

@@ -189,3 +189,57 @@ async def test_gossip_service_delta_returns_empty_page_for_unknown_after_node_id
     assert response.members == []
     assert response.has_more is False
     assert response.after_node_id == ""
+
+
+class _RelaySpy:
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], int, str]] = []
+
+    def __call__(self, members: list[Member], hop_limit: int, sender: str) -> None:
+        self.calls.append(([m.node_id for m in members], hop_limit, sender))
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_gossip_service_accept_relays_only_newer_members_with_budget() -> None:
+    topologymgr = TopologyManager()
+    await topologymgr.apply_member(_member("node-a", epoch=5))
+    relay = _RelaySpy()
+    service = GossipService(node_id="node-a", topologymgr=topologymgr, relay=relay)
+
+    await service.accept(
+        GossipPush(
+            sender="node-b",
+            hop_limit=3,
+            members=[_member("node-c", epoch=2), _member("node-a", epoch=1)],
+        )
+    )
+
+    assert relay.calls == [(["node-c"], 2, "node-b")]
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_gossip_service_accept_does_not_relay_spent_or_stale_pushes() -> None:
+    topologymgr = TopologyManager()
+    await topologymgr.apply_member(_member("node-a", epoch=5))
+    relay = _RelaySpy()
+    service = GossipService(node_id="node-a", topologymgr=topologymgr, relay=relay)
+
+    await service.accept(
+        GossipPush(sender="node-b", hop_limit=1, members=[_member("node-c", epoch=2)])
+    )
+
+    await service.accept(
+        GossipPush(sender="node-b", hop_limit=3, members=[_member("node-a", epoch=1)])
+    )
+
+    assert relay.calls == []
+
+
+@pytest.mark.tourillon
+def test_gossip_service_wanted_lists_unknown_and_newer_remote_members() -> None:
+    wanted = GossipService._wanted(
+        {"node-a": 3, "node-b": 1, "node-c": 2}, {"node-a": 2, "node-b": 1}
+    )
+    assert wanted == ["node-a", "node-c"]

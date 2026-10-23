@@ -51,7 +51,8 @@ from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.ports.storage import Storage
 from tourillon.core.services.transfer import TransferService
 from tourillon.core.spaces.hashspace import HashSpace
-from tourillon.core.storage.group import PartitionGroupStaging, PartitionGroupStore
+from tourillon.core.storage.group import PartitionGroupStaging
+from tourillon.core.storage.session import GroupSession, GroupSessionManager
 from tourillon.core.transfer.applicator import TransferApplicator
 from tourillon.core.transfer.stream import TransferStreamer, _read_frames
 from tourillon.infra.storage.lmdb_storage import LMDBStorageProvider
@@ -107,7 +108,8 @@ async def _seed(storage: Storage, records: list[Record]) -> None:
         provider = await storage.session_provider_for(
             PARTITIONER.group_for(record.key.pid.value)
         )
-        await PartitionGroupStore(provider).put(record)
+        async with GroupSessionManager(provider).session(write=True) as session:
+            await session.put(record)
 
 
 async def _tags(storage: Storage) -> dict[bytes, Tag]:
@@ -127,7 +129,7 @@ async def _staged_keys(storage: Storage) -> dict[int, Key]:
     for group in range(PARTITIONER.total_groups):
         provider = await storage.session_provider_for(group)
         staging = PartitionGroupStaging(
-            RANGE.src, provider, PARTITIONER, segment=RANGE.segment
+            RANGE.src, GroupSessionManager(provider), PARTITIONER, segment=RANGE.segment
         )
         staged.update(await staging.last_keys())
     return staged
@@ -143,7 +145,8 @@ async def _assert_transferred(storage: Storage, records: list[Record]) -> None:
             PARTITIONER.group_for(record.key.pid.value)
         )
         address = PartitionAddress(pid=record.key.pid, address=record.key.address)
-        assert await PartitionGroupStore(provider).get(address) == record
+        async with GroupSessionManager(provider).session() as session:
+            assert await session.get(address) == record
 
 
 def _decode(storage: Storage, chunks: list[TransferChunk]) -> list[Record]:
@@ -236,14 +239,14 @@ async def test_commit_interrupted_by_a_crash_is_completed_without_hiding_active_
     source, dest = _storage(tmp_path, "source"), _storage(tmp_path, "dest")
     flushes: list[int] = []
     writes_after_crash: list[int] = []
-    flush_tags = PartitionGroupStaging._flush_tags  # noqa: SLF001
+    update_tags = GroupSession.update_tags
     stage = PartitionGroupStaging.stage
 
-    async def crashing_flush(self, kv_tags) -> None:
-        flushes.append(len(kv_tags))
+    async def crashing_flush(self, entries) -> None:
+        flushes.append(len(entries))
         if len(flushes) == 2:
             raise RuntimeError("disk unavailable")
-        await flush_tags(self, kv_tags)
+        await update_tags(self, entries)
 
     async def spying_stage(self, records) -> int:
         written = await stage(self, records)
@@ -251,7 +254,7 @@ async def test_commit_interrupted_by_a_crash_is_completed_without_hiding_active_
             writes_after_crash.append(written)
         return written
 
-    monkeypatch.setattr(PartitionGroupStaging, "_flush_tags", crashing_flush)
+    monkeypatch.setattr(GroupSession, "update_tags", crashing_flush)
     monkeypatch.setattr(PartitionGroupStaging, "stage", spying_stage)
     try:
         await _seed(source, transferable)

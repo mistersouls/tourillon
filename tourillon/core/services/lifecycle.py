@@ -18,6 +18,7 @@ import ssl
 from collections.abc import Iterable
 from pathlib import Path
 
+from tourillon.core.antientropy.service import AntiEntropyService
 from tourillon.core.config import TourillonConfig
 from tourillon.core.exceptions import (
     BootstrapError,
@@ -117,12 +118,33 @@ class NodeLifecycle:
             storage=storage,
         )
 
+        # Runs only while the node is READY: a joining node is still being
+        # filled by transfers and a draining one hands its data off instead.
+        self._antientropy = AntiEntropyService(
+            node_id=config.node.id,
+            storage=storage,
+            partitioner=partitioner,
+            topologymgr=topologymgr,
+            peer_pool=peer_pool,
+            serializer=serializer,
+            replication_factor=config.placement.replication_factor,
+            config=config.placement.anti_entropy,
+        )
+
         self._state_file = Path(self._config.storage.data_dir) / NODE_STATE_FILENAME
         self._join_task: asyncio.Task[None] | None = None
         self._drain_task: asyncio.Task[None] | None = None
         self._membership_lock = asyncio.Lock()
         self._peer_started = False
         self._client_started = False
+
+    @property
+    def antientropy(self) -> AntiEntropyService:
+        return self._antientropy
+
+    @property
+    def gossiper(self) -> Gossiper:
+        return self._gossiper
 
     async def start(self, seeds: list[str] | None = None) -> None:
         logger.info("Starting node lifecycle for '%s'", self._config.node.id)
@@ -154,6 +176,8 @@ class NodeLifecycle:
             self._drain_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._drain_task
+
+        await self._antientropy.stop()
         await self._hint_replayer.stop()
 
         if self.is_joining():
@@ -226,6 +250,8 @@ class NodeLifecycle:
                     MemberPhase.DRAINING,
                     with_seeds=self._drain_seeds(state, topology.registry),
                 )
+
+            await self._antientropy.stop()
             self._store.pause()
             self._hint_replayer.pause_local_writes()
             await self._publish_state(state)
@@ -345,6 +371,7 @@ class NodeLifecycle:
             return
 
         await self._hint_replayer.start()
+        await self._antientropy.start()
 
     async def _run_transfers(
         self, member: Member, *, draining: bool = False
@@ -430,6 +457,7 @@ class NodeLifecycle:
         self._hint_replayer.resume_local_writes()
         await self._start_client()
         await self._hint_replayer.start()
+        await self._antientropy.start()
 
     async def _startup_idle(
         self, state: NodeState, seeds: list[str] | None = None

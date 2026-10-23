@@ -47,8 +47,11 @@ class Batch(Protocol):
     def exists(self, ref: KVRef) -> None:
         """Schedule a key-presence check without retrieving its value."""
 
-    def put(self, kv: KVPair) -> None:
-        """Schedule a put operation for a key-value pair into the storage."""
+    def put(self, kv: KVPair, overwrite: bool = True) -> None:
+        """
+        Schedule a put operation for a key-value pair into the storage,
+        optionally overwriting existing values.
+        """
 
     def delete(self, ref: KVRef) -> None:
         """Schedule a delete operation for a key-value pair by its reference."""
@@ -91,8 +94,11 @@ class Session(Protocol):
     async def get(self, ref: KVRef) -> KVPair | None:
         """Get a key-value pair by its reference."""
 
-    async def put(self, kv: KVPair) -> None:
-        """Put a key-value pair into the storage."""
+    async def put(self, kv: KVPair, overwrite: bool = True) -> bool:
+        """
+        Put a key-value pair into the storage, optionally overwriting existing values.
+        Returns True if the value was inserted or overwritten, False otherwise.
+        """
 
     async def delete(self, ref: KVRef) -> None:
         """Delete a key-value pair by its reference."""

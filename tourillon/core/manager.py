@@ -18,6 +18,7 @@ import signal
 import ssl
 from collections.abc import AsyncIterator
 
+from tourillon.core.antientropy.service import AntiEntropyService
 from tourillon.core.config import TourillonConfig
 from tourillon.core.gossip.gossiper import GossipStats
 from tourillon.core.gossip.topology import TopologyManager
@@ -123,6 +124,7 @@ class Manager:
         self._gossip = GossipService(
             node_id=self._config.node.id,
             topologymgr=self._topologymgr,
+            relay=self._lifecycle.gossiper.relay,
         )
         self._transfer = TransferService(
             topologymgr=self._topologymgr,
@@ -166,6 +168,11 @@ class Manager:
     def store(self) -> StoreService:
         """Get the store service."""
         return self._store
+
+    @property
+    def antientropy(self) -> AntiEntropyService:
+        """Get the data anti-entropy service."""
+        return self._lifecycle.antientropy
 
     async def start(self, seeds: list[str] | None = None) -> None:
         """Start the Tourillon daemon.
