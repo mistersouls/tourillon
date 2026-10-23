@@ -36,6 +36,7 @@ from tourillon.core.models.repair import RepairIssue, decode_token, encode_token
 from tourillon.core.models.req import HintRequest
 from tourillon.core.models.storageschema import (
     HintKey,
+    HintPrefix,
     HintReference,
     Key,
     Keyspace,
@@ -135,7 +136,9 @@ class _SessionStub:
     def batch(self) -> "_WriteBatch":
         return _WriteBatch(self)
 
-    async def put(self, kv: KVPair) -> None:
+    async def put(self, kv: KVPair, overwrite: bool = True) -> bool:
+        if not overwrite and (kv.keyspace, kv.key) in self._pairs:
+            return False
         self.store.on_put(kv)
         self._pairs[(kv.keyspace, kv.key)] = kv
         if kv.keyspace == Keyspace.LOGS:
@@ -157,6 +160,7 @@ class _SessionStub:
                 value=self.store.record.value,
                 tag=Tag.from_bytes(kv.value),
             )
+        return True
 
     async def last(
         self,
@@ -180,7 +184,7 @@ class _SessionStub:
 class _WriteBatch:
     def __init__(self, session: _SessionStub) -> None:
         self._session = session
-        self._puts: list[KVPair] = []
+        self._ops: list[tuple[str, KVPair | KVRef, bool]] = []
 
     async def __aenter__(self) -> "_WriteBatch":
         return self
@@ -188,13 +192,27 @@ class _WriteBatch:
     async def __aexit__(self, *args: Any) -> bool:
         return False
 
-    def put(self, kv: KVPair) -> None:
-        self._puts.append(kv)
+    def put(self, kv: KVPair, overwrite: bool = True) -> None:
+        self._ops.append(("put", kv, overwrite))
 
-    async def result(self) -> list[None]:
-        for kv in self._puts:
-            await self._session.put(kv)
-        return [None] * len(self._puts)
+    def get(self, ref: KVRef) -> None:
+        self._ops.append(("get", ref, False))
+
+    def exists(self, ref: KVRef) -> None:
+        self._ops.append(("exists", ref, False))
+
+    async def result(self) -> list[Any]:
+        results = []
+        for kind, item, overwrite in self._ops:
+            if kind == "put":
+                assert isinstance(item, KVPair)
+                results.append(await self._session.put(item, overwrite=overwrite))
+            elif kind == "exists":
+                assert isinstance(item, KVRef)
+                results.append(await self._session.exists(item))
+            else:
+                results.append(await self._session.get(item))
+        return results
 
 
 class _SessionProviderStub:
@@ -1551,7 +1569,7 @@ async def test_failed_replica_write_records_local_hint() -> None:
     obligations = [
         HintKey.from_bytes(kv.key)
         for kv in storage.store.written
-        if kv.keyspace == Keyspace.META
+        if kv.keyspace == Keyspace.META and kv.key.startswith(HintPrefix().to_bytes())
     ]
     assert len(obligations) == 1
     assert obligations[0].intent == "node-b"

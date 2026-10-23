@@ -29,7 +29,8 @@ from tourillon.core.models.storageschema import (
     TagKind,
     Value,
 )
-from tourillon.core.storage.group import PartitionGroupHint, PartitionGroupStore
+from tourillon.core.storage.group import PartitionGroupHint
+from tourillon.core.storage.session import GroupSessionManager
 from tourillon.infra.storage.lmdb_session import (
     LmdbConfig,
     LmdbSession,
@@ -89,8 +90,9 @@ async def test_owned_exists_uses_key_presence_without_reading_logs(
             return original_get(self, ref)
 
         monkeypatch.setattr(LmdbTransaction, "get", metadata_get)
-        assert await PartitionGroupStore(provider).exists(key)
-        assert not await PartitionGroupStore(provider).exists(_record(1, 2)[0])
+        async with GroupSessionManager(provider).session() as session:
+            assert await session.exists(key)
+            assert not await session.exists(_record(1, 2)[0])
     finally:
         await provider.close()
 
@@ -100,7 +102,7 @@ async def test_group_batches_owned_checks_and_writes_without_loading_values(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     provider = _provider(tmp_path)
-    group = PartitionGroupHint(provider)
+    group = PartitionGroupHint(GroupSessionManager(provider))
     records = [
         Record(key=key, value=value, tag=tag)
         for key, value, tag in (_record(1, 1), _record(1, 2, TagKind.TOMBSTONE))
@@ -333,7 +335,9 @@ async def test_latest_hlc_restores_pending_obligation_clock_after_restart(
         HLCTimestamp(wall_ms=2000, counter=7, node_id="keeper"),
     ]
     try:
-        hints = PartitionGroupHint(await storage.session_provider_for(0))
+        hints = PartitionGroupHint(
+            GroupSessionManager(await storage.session_provider_for(0))
+        )
         for intent, hlc in zip(("z-target", "a-target"), timestamps, strict=True):
             await hints.put(Hint(record=record, intent=intent, hlc=hlc))
     finally:

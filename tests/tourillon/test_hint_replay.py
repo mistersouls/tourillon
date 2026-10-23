@@ -99,8 +99,8 @@ class _FakeBatch:
     def exists(self, ref: KVRef) -> None:
         self._ops.append(("exists", ref))
 
-    def put(self, kv: KVPair) -> None:
-        self._ops.append(("put", kv))
+    def put(self, kv: KVPair, overwrite: bool = True) -> None:
+        self._ops.append(("put", kv, overwrite))
 
     def delete(self, ref: KVRef) -> None:
         self._ops.append(("delete", ref))
@@ -128,8 +128,11 @@ class _FakeBatch:
             elif op[0] == "exists":
                 results.append((op[1].keyspace, op[1].key) in self._store._items)
             elif op[0] == "put":
-                self._store.put(op[1])
-                results.append(None)
+                present = (op[1].keyspace, op[1].key) in self._store._items
+                written = op[2] or not present
+                if written:
+                    self._store.put(op[1])
+                results.append(written)
             elif op[0] == "delete":
                 self._store.delete(op[1])
                 results.append(None)
@@ -1228,7 +1231,8 @@ async def test_local_window_batches_reads_promotions_and_satisfaction() -> None:
 
     assert provider.write_sessions == 2
     assert provider.opened == 4
-    assert storage.batches == 6
+    # Conditional insertion, tag promotion and digest flush add three batches.
+    assert storage.batches == 9
     assert replayer._stats.applied_total == 3
     assert storage.list(Keyspace.META, HintPrefix()) == []
 

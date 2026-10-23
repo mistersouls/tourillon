@@ -411,6 +411,35 @@ Storage ──session_provider_for(group)──▶ SessionProvider ──session
 - Keyspaces and record layout live in `tourillon/core/models/storageschema.py`. Keys are length-prefixed byte compositions — never ad-hoc strings.
 - `Storage.latest_hlc(total_groups)` is read at boot to restore the hybrid logical clock so timestamps never move backwards across restarts.
 
+`core/storage/session.py` provides a typed `GroupSession` through
+`GroupSessionManager.session(write=...)`. Its `read` and `get_many` methods
+read exact versions; `get` reads the latest version and `tags` loads only tags.
+`exists_many` checks owned tags and value presence in a single batch without
+loading values. `stage_many` writes transfer versions without hiding active
+copies; retries may replace the staging source.
+`put_many` inserts versions and promotes non-owned copies without rewriting
+existing values. `update_tags` maintains the per-bucket count/XOR digest
+across ownership changes, including duplicate keys and repeated flushes.
+Tag updates reject incomplete versions before changing any tag or digest.
+The caller retains responsibility for placement, transfer authorization and
+hint obligations. The manager flushes digests before committing the underlying
+transaction; errors roll back records and digests together.
+Store operations use managed sessions directly, without a separate store facade.
+`PartitionGroupStaging` and `PartitionGroupHint` remain separate workflows:
+the former owns transfer bounds, resumes and source authorization; the latter
+owns delivery obligations and acknowledgements. Both receive a
+`GroupSessionManager` and delegate record writes to its typed session.
+Each staging activation page selects its tags and restores exactly one wrapper
+with `update_tags` in the same write transaction, so another writer cannot
+change its source or ownership between selection and activation.
+`GroupSession` does not expose its underlying raw session. `tag_page` returns
+typed tags and a physical continuation cursor, while `load_records` fetches
+only selected values. `last_staged_keys` reads durable transfer progress.
+`put_hint_obligation`, `has_hints`, `hint_page` and `remove_hint_obligations`
+encapsulate delivery metadata without allowing arbitrary META writes.
+Paged scans log and skip unreadable entries while still advancing their
+cursor; no transaction stays open while the caller consumes a page.
+
 Configuration and node state are persisted through the `Persistence` port, TOML by default, with per-path locking and atomic replace.
 
 ---

@@ -36,8 +36,8 @@ from tourillon.core.models.storageschema import (
 from tourillon.core.storage.group import (
     PartitionGroupHint,
     PartitionGroupStaging,
-    PartitionGroupStore,
 )
+from tourillon.core.storage.session import GroupSessionManager
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
 
@@ -59,8 +59,8 @@ class _FakeBatch:
     def exists(self, ref: KVRef) -> None:
         self._ops.append(("exists", ref))
 
-    def put(self, kv: KVPair) -> None:
-        self._ops.append(("put", kv))
+    def put(self, kv: KVPair, overwrite: bool = True) -> None:
+        self._ops.append(("put", kv, overwrite))
 
     def delete(self, ref: KVRef) -> None:
         self._ops.append(("delete", ref))
@@ -92,8 +92,7 @@ class _FakeBatch:
             elif kind == "exists":
                 results.append((op[1].keyspace, op[1].key) in self._store._items)
             elif kind == "put":
-                self._store.put(op[1])
-                results.append(None)
+                results.append(self._put(op[1], op[2]))
             elif kind == "delete":
                 self._store.delete(op[1])
                 results.append(None)
@@ -114,6 +113,12 @@ class _FakeBatch:
                     )
                 )
         return results
+
+    def _put(self, kv: KVPair, overwrite: bool) -> bool:
+        if not overwrite and (kv.keyspace, kv.key) in self._store._items:
+            return False
+        self._store.put(kv)
+        return True
 
 
 class _FakeStore:
@@ -266,11 +271,11 @@ async def test_exists_checks_exact_owned_version_without_loading_value(
                 Keyspace.LOGS,
             )
         )
-    group = PartitionGroupStore(_FakeSessionProvider(store))
-    assert await group.exists(record.key) is (
-        has_value and kind in {TagKind.LIVE, TagKind.TOMBSTONE}
-    )
-    assert not await group.exists(_record(1, 2).key)
+    async with GroupSessionManager(_FakeSessionProvider(store)).session() as session:
+        assert await session.exists(record.key) is (
+            has_value and kind in {TagKind.LIVE, TagKind.TOMBSTONE}
+        )
+        assert not await session.exists(_record(1, 2).key)
 
 
 class _FakePartitioner:
@@ -305,7 +310,7 @@ async def test_hint_promotion_checks_metadata_without_writing_when_readonly(
             )
         )
     provider = _FakeSessionProvider(storage)
-    group = PartitionGroupHint(provider)
+    group = PartitionGroupHint(GroupSessionManager(provider))
     absent = _record(1, 2)
 
     confirmed, applied = await group.promote([record, absent], writable=False)
@@ -366,14 +371,14 @@ def _staging(
 ) -> PartitionGroupStaging:
     return PartitionGroupStaging(
         "source",
-        _FakeSessionProvider(store),
+        GroupSessionManager(_FakeSessionProvider(store)),
         _FakePartitioner(start, end),  # type: ignore[arg-type]
         segment=segment,
     )
 
 
 def _hints(store: _FakeStore) -> PartitionGroupHint:
-    return PartitionGroupHint(_FakeSessionProvider(store))
+    return PartitionGroupHint(GroupSessionManager(_FakeSessionProvider(store)))
 
 
 def _hint(record: Record, intent: str, wall_ms: int) -> Hint:
@@ -471,7 +476,7 @@ async def test_scan_holds_no_session_while_records_are_consumed() -> None:
     for idx in range(1, 6):
         _seed_record(store, _record(7, idx))
     provider = _FakeSessionProvider(store)
-    staging = PartitionGroupStaging("source", provider, _FakePartitioner(7, 8))  # type: ignore[arg-type]
+    staging = PartitionGroupStaging("source", GroupSessionManager(provider), _FakePartitioner(7, 8))  # type: ignore[arg-type]
 
     with pytest.raises(ValueError, match=">= 1"):
         await _scan(staging, batch_size=0)
@@ -638,7 +643,7 @@ async def test_hint_put_preserves_owned_version_and_records_obligation(
         store.delete(KVRef(record.key.to_bytes(Keyspace.LOGS), Keyspace.LOGS))
     store.writes.clear()
     provider = _FakeSessionProvider(store)
-    hints = PartitionGroupHint(provider)
+    hints = PartitionGroupHint(GroupSessionManager(provider))
     hint = _hint(record, "node-b", 500)
 
     key = await hints.put(hint)
@@ -659,7 +664,7 @@ async def test_hint_promotion_activates_in_one_session_and_preserves_obligations
 ) -> None:
     storage = _FakeStore()
     provider = _FakeSessionProvider(storage)
-    group = PartitionGroupHint(provider)
+    group = PartitionGroupHint(GroupSessionManager(provider))
     record = _with_tag(_record(7, 1), Tag(kind))
     first = _hint(record, "node-b", 800)
     second = _hint(record, "node-c", 801)
@@ -671,7 +676,7 @@ async def test_hint_promotion_activates_in_one_session_and_preserves_obligations
     assert await group.promote([record]) == ([True], 1)
     assert provider.opened == before + 1
     assert _stored_tag(storage, record) == record.tag
-    assert storage.list(Keyspace.META) == obligations
+    assert storage.list(Keyspace.META, prefix=HintPrefix()) == obligations
     assert await group.promote([record]) == ([True], 0)
     assert [hint async for hint in group.iter()] == [first, second]
 
@@ -680,7 +685,7 @@ async def test_hint_promotion_activates_in_one_session_and_preserves_obligations
 async def test_hint_promotion_rejects_unowned_records_before_opening_session() -> None:
     storage = _FakeStore()
     provider = _FakeSessionProvider(storage)
-    group = PartitionGroupHint(provider)
+    group = PartitionGroupHint(GroupSessionManager(provider))
     record = _record(7, 1)
     hinted = _with_tag(record, Tag.hint(record.tag))
 
@@ -724,7 +729,7 @@ async def test_hint_satisfy_deletes_in_one_session_without_reading() -> None:
 
     store = NoReadStore()
     provider = _FakeSessionProvider(store)
-    hints = PartitionGroupHint(provider)
+    hints = PartitionGroupHint(GroupSessionManager(provider))
     delivered = [_hint(_record(7, idx), "node-b", 800 + idx) for idx in (1, 2)]
     for hint in delivered:
         await hints.put(hint)
@@ -746,7 +751,7 @@ async def test_hint_satisfy_deletes_in_one_session_without_reading() -> None:
 async def test_hint_iter_pages_with_short_sessions_and_deleted_boundary() -> None:
     store = _FakeStore()
     provider = _FakeSessionProvider(store)
-    hints = PartitionGroupHint(provider)
+    hints = PartitionGroupHint(GroupSessionManager(provider))
     expected = [_hint(_record(7, idx), "node-a", 700 + idx) for idx in range(1, 6)]
     for hint in expected:
         await hints.put(hint)
@@ -893,7 +898,7 @@ async def test_hint_put_rolls_back_all_keyspaces_on_storage_failure(tmp_path) ->
     hint = Hint(oversized, "node-b", HLCTimestamp(900, 0, "hint"))
     try:
         with pytest.raises(lmdb.MapFullError):
-            await PartitionGroupHint(provider).put(hint)
+            await PartitionGroupHint(GroupSessionManager(provider)).put(hint)
 
         async with provider.session() as session:
             for keyspace in (Keyspace.TAGS, Keyspace.LOGS):
@@ -921,13 +926,9 @@ def test_partition_group_staging_rejects_segment_outside_its_group() -> None:
         _staging(_FakeStore(), segment=(8, 7))
 
 
-def _store_over(store: _FakeStore) -> PartitionGroupStore:
-    return PartitionGroupStore(_FakeSessionProvider(store))  # type: ignore[arg-type]
-
-
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_get_at_returns_the_version_stored_at_that_exact_timestamp() -> None:
+async def test_read_returns_the_version_stored_at_that_exact_timestamp() -> None:
     store = _FakeStore()
     older = _record(7, 1)
     newer = _record(7, 1)
@@ -941,15 +942,16 @@ async def test_get_at_returns_the_version_stored_at_that_exact_timestamp() -> No
     _seed_record(store, older)
     _seed_record(store, newer)
 
-    found = await _store_over(store).get_at(older.key)
+    async with GroupSessionManager(_FakeSessionProvider(store)).session() as session:
+        found = await session.read(older.key)
 
-    # `get` would answer the newest version; `get_at` answers the one asked for.
+    # `get` would answer the newest version; `read` answers the one asked for.
     assert found == older
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_get_at_returns_none_for_a_timestamp_never_written() -> None:
+async def test_read_returns_none_for_a_timestamp_never_written() -> None:
     store = _FakeStore()
     record = _record(7, 1)
     _seed_record(store, record)
@@ -959,12 +961,13 @@ async def test_get_at_returns_none_for_a_timestamp_never_written() -> None:
         ts=HLCTimestamp(wall_ms=1, counter=0, node_id="n"),
     )
 
-    assert await _store_over(store).get_at(absent) is None
+    async with GroupSessionManager(_FakeSessionProvider(store)).session() as session:
+        assert await session.read(absent) is None
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_get_at_returns_none_when_the_tag_is_missing() -> None:
+async def test_read_returns_none_when_the_tag_is_missing() -> None:
     store = _FakeStore()
     record = _record(7, 1)
     store.put(
@@ -975,4 +978,5 @@ async def test_get_at_returns_none_when_the_tag_is_missing() -> None:
         )
     )
 
-    assert await _store_over(store).get_at(record.key) is None
+    async with GroupSessionManager(_FakeSessionProvider(store)).session() as session:
+        assert await session.read(record.key) is None

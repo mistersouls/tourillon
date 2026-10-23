@@ -82,11 +82,11 @@ class LmdbBatch:
         item = BatchItem(fn=self._txn.exists, args=(ref,), kwargs={})
         self._items.append(item)
 
-    def put(self, kv: KVPair) -> None:
+    def put(self, kv: KVPair, overwrite: bool = True) -> None:
         item = BatchItem(
             fn=self._txn.put,
             args=(kv,),
-            kwargs={},
+            kwargs={"overwrite": overwrite},
         )
         self._items.append(item)
 

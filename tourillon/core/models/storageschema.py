@@ -35,6 +35,7 @@ class Keyspace(StrEnum):
 
 class MetaKind(Enum):
     HINT = b"\x01"
+    DIGEST = b"\x02"
 
 
 @dataclass(frozen=True, slots=True, eq=True)
