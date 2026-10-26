@@ -13,7 +13,8 @@ irreplaceable data.
 - Request numeric read and write quorums for individual operations.
 - Authenticate client and peer connections with mandatory mTLS.
 - Inspect nodes and use join-time data transfers, hinted handoff, background
-  read repair, and on-demand repair of an under-replicated write.
+  read repair, background data anti-entropy between replicas, and on-demand
+  repair of an under-replicated write.
 
 These mechanisms are implemented; their presence is not a guarantee of
 production reliability or a particular performance level.
@@ -28,7 +29,7 @@ production reliability or a particular performance level.
 | Conflicts | Concurrent updates are resolved automatically; application-level merge and preservation of every concurrent value are not provided. |
 | Placement | Replicas are not placed according to rack, zone, or region anti-affinity. |
 | Membership changes | Transfers are join-driven; graceful node removal and general steady-state rebalancing are not implemented. |
-| Repair | Read repair and explicit write repair exist; proactive replica-data anti-entropy outside the read path is not implemented. |
+| Repair | Read repair, explicit write repair and background data anti-entropy exist; there is no version GC yet, so storage only grows. |
 | Scale | 10,000 nodes is a design objective, not a benchmarked or supported deployment size. |
 
 The [Docker Compose example](../examples/docker/README.md) is a single-node

@@ -54,7 +54,8 @@ from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import PlacementStrategy, Preference
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports.storage import Storage
-from tourillon.core.storage.group import PartitionGroupHint, PartitionGroupStore
+from tourillon.core.storage.group import PartitionGroupHint
+from tourillon.core.storage.session import GroupSessionManager
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT, MAX_CLOCK_SKEW_MS, MAX_QUORUM
 from tourlib.envelope import build_envelope
 from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest, RepairRequest
@@ -278,8 +279,8 @@ class StoreService:
     async def exists(self, key: Key) -> bool:
         group = self._partitioner.group_for(key.pid.value)
         provider = await self._storage.session_provider_for(group)
-        store = PartitionGroupStore(provider)
-        return await store.exists(key)
+        async with GroupSessionManager(provider).session() as session:
+            return await session.exists(key)
 
     async def write(self, record: Record) -> Record:
         with self._operation("replication.write"):
@@ -296,7 +297,7 @@ class StoreService:
         hint = Hint(record=record, intent=intent, hlc=self._clock.tick())
         group = self._partitioner.group_for(record.key.pid.value)
         provider = await self._storage.session_provider_for(group)
-        hints = PartitionGroupHint(provider)
+        hints = PartitionGroupHint(GroupSessionManager(provider))
         await hints.put(hint)
         self._stats.hints_recorded += 1
 
@@ -895,22 +896,22 @@ class StoreService:
     async def _local_read(self, addr: PartitionAddress) -> Record | None:
         group = self._partitioner.group_for(addr.pid.value)
         session_provider = await self._storage.session_provider_for(group)
-        store = PartitionGroupStore(session_provider)
-        return await store.get(addr)
+        async with GroupSessionManager(session_provider).session() as session:
+            return await session.get(addr)
 
     async def _local_read_at(self, key: Key) -> Record | None:
         group = self._partitioner.group_for(key.pid.value)
         session_provider = await self._storage.session_provider_for(group)
-        store = PartitionGroupStore(session_provider)
-        return await store.get_at(key)
+        async with GroupSessionManager(session_provider).session() as session:
+            return await session.read(key)
 
     async def _local_write(self, record: Record) -> Record:
         if record.tag.kind is TagKind.HINT:
             raise ValueError("HINT records must use the hint operation")
         group = self._partitioner.group_for(record.key.pid.value)
         session_provider = await self._storage.session_provider_for(group)
-        store = PartitionGroupStore(session_provider)
-        await store.put(record)
+        async with GroupSessionManager(session_provider).session(write=True) as session:
+            await session.put(record)
         return record
 
     @staticmethod

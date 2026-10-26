@@ -16,162 +16,24 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 
 from tourillon.core.log import logger as _logger
 from tourillon.core.models.storageschema import (
-    PID_SIZE,
     Hint,
     HintKey,
-    HintPrefix,
     HintReference,
     Key,
     Keyspace,
-    KVPair,
-    KVRef,
-    PartitionAddress,
+    KeyTag,
     Pid,
     Record,
     Tag,
     TagKind,
-    Value,
 )
 from tourillon.core.partition.partitioner import Partitioner
-from tourillon.core.ports.storage import Session, SessionProvider
+from tourillon.core.storage.session import GroupSessionManager
 
 logger = _logger.storage()
 
 SCAN_BATCH_SIZE = 128
 COMMIT_BATCH_SIZE = 256
-
-
-def _decode_tag_kv(
-    kv: KVPair, kinds: frozenset[TagKind] | None
-) -> tuple[Key, Tag] | None:
-    """Decode a TAGS entry and drop it unless its kind is wanted.
-
-    Filtering here, on the tag alone, is what keeps a scan proportional to the
-    number of matching entries: the LOGS payload is only fetched for survivors.
-    """
-    try:
-        tag = Tag.from_bytes(kv.value)
-        if kinds is not None and tag.kind not in kinds:
-            return None
-        return Key.from_bytes(kv.key, Keyspace.TAGS), tag
-    except ValueError as exc:
-        logger.warning("Skipping unreadable tag entry %s: %s", kv.key.hex(), exc)
-        return None
-
-
-def _build_record(key: Key, tag: Tag, kv_log: KVPair | None) -> Record | None:
-    if kv_log is None:
-        logger.warning(
-            "Skipping tag entry without value: pid=%d key=%s", key.pid.value, key
-        )
-        return None
-    try:
-        value = Value.from_bytes(kv_log.value)
-    except (ValueError, OverflowError) as exc:
-        logger.warning(
-            "Skipping unreadable value: pid=%d key=%s: %s", key.pid.value, key, exc
-        )
-        return None
-    return Record(key=key, tag=tag, value=value)
-
-
-async def _load_records(
-    session: Session, selected: Sequence[tuple[Key, Tag]]
-) -> list[Record]:
-    """Batch-load the LOGS payloads of already-selected tags."""
-    if not selected:
-        return []
-
-    async with session.batch() as batch:
-        for key, _ in selected:
-            batch.get(KVRef(key=key.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS))
-    logs = await batch.result()
-
-    records: list[Record] = []
-    for (key, tag), kv_log in zip(selected, logs, strict=True):
-        record = _build_record(key, tag, kv_log)
-        if record is not None:
-            records.append(record)
-    return records
-
-
-class PartitionGroupStore:
-    def __init__(self, session_provider: SessionProvider) -> None:
-        self._session_provider = session_provider
-
-    async def exists(self, key: Key) -> bool:
-        """Check exact owned-version presence without loading its value."""
-        async with self._session_provider.session(write=False) as session:
-            kv = await session.get(KVRef(key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
-            if kv is None:
-                return False
-            tag = Tag.from_bytes(kv.value)
-            if tag.kind not in {TagKind.LIVE, TagKind.TOMBSTONE}:
-                return False
-            return await session.exists(
-                KVRef(key.to_bytes(Keyspace.LOGS), Keyspace.LOGS)
-            )
-
-    async def put(self, record: Record) -> None:
-        async with self._session_provider.session(write=True) as session:
-            kv_tag = KVPair(
-                key=record.key.to_bytes(Keyspace.TAGS),
-                value=record.tag.to_bytes(),
-                keyspace=Keyspace.TAGS,
-            )
-            kv_log = KVPair(
-                key=record.key.to_bytes(Keyspace.LOGS),
-                value=record.value.to_bytes(),
-                keyspace=Keyspace.LOGS,
-            )
-            await session.put(kv_tag)
-            await session.put(kv_log)
-
-    async def get(self, addr: PartitionAddress) -> Record | None:
-        async with self._session_provider.session(write=False) as session:
-            kv_log = await session.last(
-                keyspace=Keyspace.LOGS,
-                prefix=addr,
-            )
-            if kv_log is None:
-                return None
-
-            key = Key.from_bytes(kv_log.key, Keyspace.LOGS)
-            kv_tag = await session.get(
-                KVRef(key=key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS)
-            )
-            if kv_tag is None:
-                return None
-
-            tag = Tag.from_bytes(kv_tag.value)
-            value = Value.from_bytes(kv_log.value)
-            return Record(key=key, tag=tag, value=value)
-
-    async def get_at(self, key: Key) -> Record | None:
-        """Read the version stored at one exact timestamp.
-
-        `get` answers "what is current for this address"; repair needs "do you
-        hold this particular version". The physical key already spells out
-        `pid|address|ts`, so the lookup is a point read, not a scan.
-        """
-        async with self._session_provider.session(write=False) as session:
-            kv_log = await session.get(
-                KVRef(key=key.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)
-            )
-            if kv_log is None:
-                return None
-
-            kv_tag = await session.get(
-                KVRef(key=key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS)
-            )
-            if kv_tag is None:
-                return None
-
-            return Record(
-                key=key,
-                tag=Tag.from_bytes(kv_tag.value),
-                value=Value.from_bytes(kv_log.value),
-            )
 
 
 class PartitionGroupStaging:
@@ -190,12 +52,12 @@ class PartitionGroupStaging:
     def __init__(
         self,
         source: str,
-        session_provider: SessionProvider,
+        session_manager: GroupSessionManager,
         partitioner: Partitioner,
         segment: tuple[int, int] | None = None,
     ) -> None:
         self._source = source
-        self._session_provider = session_provider
+        self._session_manager = session_manager
         self._partitioner = partitioner
         self._start, self._end = self._pid_bounds(segment)
 
@@ -236,35 +98,14 @@ class PartitionGroupStaging:
         if not records:
             return 0
 
-        async with self._session_provider.session(write=True) as session:
-            existing = await self._existing_tags(session, records)
-            pending = [
-                record
-                for record, kv_tag in zip(records, existing, strict=True)
-                if self._needs_staging(kv_tag)
-            ]
-            await self._put_staged(session, pending)
-        return len(pending)
+        async with self._session_manager.session(write=True) as session:
+            return await session.stage_many(records, self._source)
 
     async def last_keys(self) -> Mapping[int, Key]:
         """Return, for every pid, the greatest key staged from the source."""
-        results: dict[int, Key] = {}
-
-        async with self._session_provider.session(write=False) as session:
-            async with session.batch() as batch:
-                for pid in range(self._start, self._end + 1):
-                    batch.last(
-                        keyspace=Keyspace.TAGS,
-                        prefix=Pid(pid),
-                        predicate=self._is_owner,
-                    )
-
-            for kv in await batch.result():
-                if kv is not None:
-                    last_key = Key.from_bytes(kv.key, Keyspace.TAGS)
-                    results[last_key.pid.value] = last_key
-
-        return results
+        async with self._session_manager.session(write=False) as session:
+            pids = [Pid(pid) for pid in range(self._start, self._end + 1)]
+            return await session.last_staged_keys(pids, self._source)
 
     async def commit(self, batch_size: int = COMMIT_BATCH_SIZE) -> int:
         """Activate the records staged from the source and return how many were.
@@ -279,10 +120,8 @@ class PartitionGroupStaging:
         activated = 0
         position: bytes | None = Pid(self._start).to_bytes()
         while position is not None:
-            unstaged, position = await self._commit_page(position, batch_size)
-            if unstaged:
-                await self._flush_tags(unstaged)
-                activated += len(unstaged)
+            count, position = await self._commit_page(position, batch_size)
+            activated += count
         return activated
 
     async def _scan_page(
@@ -292,138 +131,84 @@ class PartitionGroupStaging:
         kinds: frozenset[TagKind] | None,
         limit: int,
     ) -> tuple[list[Record], bytes | None]:
-        async with self._session_provider.session(write=False) as session:
-            kvs = await self._list_tags(session, position, limit)
-            selected, next_position = self._select_page(kvs, jumps, kinds, limit)
-            records = await _load_records(session, selected)
+        async with self._session_manager.session(write=False) as session:
+            entries, cursor = await session.tag_page(position, limit)
+            selected, next_position = self._select_page(entries, jumps, kinds, cursor)
+            records = await session.load_records(selected)
         return records, next_position
 
     def _select_page(
         self,
-        kvs: Sequence[KVPair],
+        entries: Sequence[KeyTag],
         jumps: Mapping[int, bytes],
         kinds: frozenset[TagKind] | None,
-        limit: int,
-    ) -> tuple[list[tuple[Key, Tag]], bytes | None]:
+        cursor: bytes | None,
+    ) -> tuple[list[KeyTag], bytes | None]:
         """Pick the records of a page and return where the next page starts.
 
         The next position is None once the segment or the keyspace is
         exhausted. Reaching a pid whose resume key is ahead of the current
         key jumps straight to that resume key.
         """
-        selected: list[tuple[Key, Tag]] = []
-        for kv in kvs:
-            pid = self._pid_of(kv.key)
+        selected: list[KeyTag] = []
+        for entry in entries:
+            pid = entry.key.pid.value
             if pid > self._end:
                 return selected, None
             jump = jumps.get(pid)
-            if jump is not None and kv.key <= jump:
+            if jump is not None and entry.key.to_bytes(Keyspace.TAGS) <= jump:
                 return selected, jump
-            item = _decode_tag_kv(kv, kinds)
-            if item is not None:
-                selected.append(item)
+            if kinds is None or entry.tag.kind in kinds:
+                selected.append(entry)
 
-        if len(kvs) < limit:
-            return selected, None
-        return selected, kvs[-1].key
+        return selected, cursor
 
     async def _commit_page(
         self,
         position: bytes,
         limit: int,
-    ) -> tuple[list[KVPair], bytes | None]:
-        async with self._session_provider.session(write=False) as session:
-            kvs = await self._list_tags(session, position, limit)
+    ) -> tuple[int, bytes | None]:
+        async with self._session_manager.session(write=True) as session:
+            entries, cursor = await session.tag_page(position, limit)
+            unstaged, next_position = self._activation_page(entries, cursor)
+            if unstaged:
+                await session.update_tags(unstaged)
 
-        unstaged: list[KVPair] = []
-        for kv in kvs:
-            if self._pid_of(kv.key) > self._end:
+        return len(unstaged), next_position
+
+    def _activation_page(
+        self, entries: Sequence[KeyTag], cursor: bytes | None
+    ) -> tuple[list[KeyTag], bytes | None]:
+        unstaged: list[KeyTag] = []
+        for entry in entries:
+            if entry.key.pid.value > self._end:
                 return unstaged, None
-            item = self._unstage_owned_kv(kv)
+            item = self._unstage_owned_tag(entry)
             if item is not None:
                 unstaged.append(item)
 
-        next_position = kvs[-1].key if len(kvs) == limit else None
-        return unstaged, next_position
+        return unstaged, cursor
 
-    async def _flush_tags(self, kv_tags: Sequence[KVPair]) -> None:
-        async with self._session_provider.session(write=True) as session:
-            async with session.batch() as batch:
-                for kv in kv_tags:
-                    batch.put(kv)
-            await batch.result()
-
-    @staticmethod
-    async def _existing_tags(
-        session: Session, records: Sequence[Record]
-    ) -> list[KVPair | None]:
-        async with session.batch() as batch:
-            for record in records:
-                batch.get(
-                    KVRef(
-                        key=record.key.to_bytes(Keyspace.TAGS), keyspace=Keyspace.TAGS
-                    )
-                )
-        return await batch.result()
-
-    async def _put_staged(self, session: Session, records: Sequence[Record]) -> None:
-        if not records:
-            return
-
-        async with session.batch() as batch:
-            for record in records:
-                batch.put(
-                    KVPair(
-                        key=record.key.to_bytes(Keyspace.TAGS),
-                        value=Tag.staging(record.tag, self._source).to_bytes(),
-                        keyspace=Keyspace.TAGS,
-                    )
-                )
-                batch.put(
-                    KVPair(
-                        key=record.key.to_bytes(Keyspace.LOGS),
-                        value=record.value.to_bytes(),
-                        keyspace=Keyspace.LOGS,
-                    )
-                )
-        await batch.result()
-
-    @staticmethod
-    async def _list_tags(session: Session, start: bytes, limit: int) -> list[KVPair]:
-        async with session.batch() as batch:
-            batch.list(keyspace=Keyspace.TAGS, start=start, limit=limit)
-        (kvs,) = await batch.result()
-        return kvs
-
-    @staticmethod
-    def _needs_staging(kv_tag: KVPair | None) -> bool:
-        if kv_tag is None:
-            return True
-        try:
-            return Tag.from_bytes(kv_tag.value).kind == TagKind.STAGING
-        except ValueError:
-            return True
-
-    def _unstage_owned_kv(self, kv: KVPair) -> KVPair | None:
-        if not self._is_owner(kv):
+    def _unstage_owned_tag(self, entry: KeyTag) -> KeyTag | None:
+        if not self._is_owner(entry.tag):
             return None
 
         try:
-            unstaged = Tag.unstaging(Tag.from_bytes(kv.value), self._source)
+            unstaged = Tag.unstaging(entry.tag, self._source)
         except ValueError as exc:
-            logger.warning("Cannot activate staged entry %s: %s", kv.key.hex(), exc)
+            logger.warning("Cannot activate staged entry %s: %s", entry.key, exc)
             return None
-        return KVPair(key=kv.key, value=unstaged.to_bytes(), keyspace=Keyspace.TAGS)
+        return KeyTag(key=entry.key, tag=unstaged)
 
-    def _is_owner(self, item: KVPair) -> bool:
+    def _is_owner(self, tag: Tag) -> bool:
         try:
-            tag = Tag.from_bytes(item.value)
             if tag.kind != TagKind.STAGING:
                 return False
 
             src, _ = tag.payload.extract_source_prefix()
             return src == self._source
-        except ValueError:
+        except ValueError as exc:
+            logger.warning("Cannot identify staging source: %s", exc)
             return False
 
     def _resume_jumps(self, resumes: Mapping[int, Key]) -> dict[int, bytes]:
@@ -444,17 +229,13 @@ class PartitionGroupStaging:
             return origin
         return max(origin, after.to_bytes(Keyspace.TAGS))
 
-    @staticmethod
-    def _pid_of(key: bytes) -> int:
-        return int.from_bytes(key[:PID_SIZE], "big")
-
     def _pid_bounds(self, segment: tuple[int, int] | None) -> tuple[int, int]:
         """Return the inclusive pid bounds handled: the group, clipped to the segment.
 
         Raise ValueError when the segment is malformed or does not intersect
         the group of the session provider.
         """
-        group = self._session_provider.group_id
+        group = self._session_manager.group_id
         group_start, group_end = self._partitioner.group_bounds(group)
         if segment is None:
             return group_start, group_end
@@ -469,8 +250,8 @@ class PartitionGroupStaging:
 
 
 class PartitionGroupHint:
-    def __init__(self, session_provider: SessionProvider) -> None:
-        self._session_provider = session_provider
+    def __init__(self, session_manager: GroupSessionManager) -> None:
+        self._session_manager = session_manager
 
     async def promote(
         self, records: Sequence[Record], *, writable: bool = True
@@ -487,102 +268,33 @@ class PartitionGroupHint:
             for record in records
         ):
             raise ValueError("promotion requires LIVE or TOMBSTONE records")
-        async with self._session_provider.session(write=writable) as session:
-            owned = await self._owned_versions(session, records)
+        async with self._session_manager.session(write=writable) as session:
+            owned = await session.exists_many([record.key for record in records])
             pending = [
                 record
                 for record, present in zip(records, owned, strict=True)
                 if writable and not present
             ]
-            await self._promote_records(session, pending)
+            await session.put_many(pending)
         return [present or writable for present in owned], len(pending)
-
-    async def _owned_versions(
-        self, session: Session, records: Sequence[Record]
-    ) -> list[bool]:
-        async with session.batch() as batch:
-            for record in records:
-                batch.get(KVRef(record.key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
-                batch.exists(KVRef(record.key.to_bytes(Keyspace.LOGS), Keyspace.LOGS))
-        results = await batch.result()
-        return [
-            self._owned_tag(results[index * 2]) and results[index * 2 + 1]
-            for index in range(len(records))
-        ]
-
-    @staticmethod
-    def _owned_tag(kv: KVPair | None) -> bool:
-        if kv is None:
-            return False
-        tag = Tag.from_bytes(kv.value)
-        return tag.kind in {TagKind.LIVE, TagKind.TOMBSTONE}
-
-    @staticmethod
-    async def _promote_records(session: Session, records: Sequence[Record]) -> None:
-        if not records:
-            return
-        async with session.batch() as batch:
-            for record in records:
-                batch.put(
-                    KVPair(
-                        record.key.to_bytes(Keyspace.TAGS),
-                        record.tag.to_bytes(),
-                        Keyspace.TAGS,
-                    )
-                )
-                batch.put(
-                    KVPair(
-                        record.key.to_bytes(Keyspace.LOGS),
-                        record.value.to_bytes(),
-                        Keyspace.LOGS,
-                    )
-                )
-        await batch.result()
 
     async def put(self, hint: Hint) -> HintKey:
         """Persist an obligation without downgrading an existing owned version."""
         record = hint.record
         hint_key = HintKey(intent=hint.intent, hlc=hint.hlc)
         reference = HintReference(record.key)
-        async with self._session_provider.session(write=True) as session:
-            kv_tag = await session.get(
-                KVRef(record.key.to_bytes(Keyspace.TAGS), Keyspace.TAGS)
-            )
-            owned = False
-            if kv_tag is not None:
-                tag = Tag.from_bytes(kv_tag.value)
-                owned = tag.kind in {TagKind.LIVE, TagKind.TOMBSTONE}
-            async with session.batch() as batch:
-                if not owned:
-                    batch.put(
-                        KVPair(
-                            record.key.to_bytes(Keyspace.TAGS),
-                            record.tag.to_bytes(),
-                            Keyspace.TAGS,
-                        )
-                    )
-                    batch.put(
-                        KVPair(
-                            record.key.to_bytes(Keyspace.LOGS),
-                            record.value.to_bytes(),
-                            Keyspace.LOGS,
-                        )
-                    )
-                batch.put(
-                    KVPair(
-                        hint_key.to_bytes(),
-                        reference.to_bytes(),
-                        Keyspace.META,
-                    )
-                )
-            await batch.result()
+        async with self._session_manager.session(write=True) as session:
+            (tag,) = await session.tags([record.key])
+            if tag is None or tag.kind not in {TagKind.LIVE, TagKind.TOMBSTONE}:
+                await session.put(record)
+
+            await session.put_hint_obligation(hint_key, reference)
         return hint_key
 
     async def pending(self) -> bool:
         """Return whether a persisted delivery obligation remains."""
-        async with self._session_provider.session(write=False) as session:
-            latest = session.last(Keyspace.META, prefix=HintPrefix())
-            return await latest is not None
+        async with self._session_manager.session(write=False) as session:
+            return await session.has_hints()
 
     async def iter(self, batch_size: int = SCAN_BATCH_SIZE) -> AsyncIterator[Hint]:
         """Read bounded META pages without holding a transaction across delivery."""
@@ -590,94 +302,18 @@ class PartitionGroupHint:
             raise ValueError("batch_size must be >= 1")
         position: bytes | None = None
         while True:
-            async with self._session_provider.session(write=False) as session:
-                async with session.batch() as batch:
-                    batch.list(
-                        Keyspace.META,
-                        prefix=HintPrefix(),
-                        start=position,
-                        limit=batch_size,
-                    )
-                (page,) = await batch.result()
-                hints = await self._load_hints(session, page)
-            if not page:
+            async with self._session_manager.session(write=False) as session:
+                hints, position = await session.hint_page(position, batch_size)
+            if position is None:
                 return
-            position = page[-1].key
             for hint in hints:
-                if hint is not None:
-                    yield hint
-
-    async def _load_hints(
-        self, session: Session, page: Sequence[KVPair]
-    ) -> list[Hint | None]:
-        selected: list[tuple[KVPair, Key]] = []
-        for kv in page:
-            try:
-                HintKey.from_bytes(kv.key)
-                reference = HintReference.from_bytes(kv.value)
-                selected.append((kv, reference.key))
-            except (ValueError, OverflowError) as exc:
-                self._invalid_hint(kv, exc)
-        if not selected:
-            return []
-        async with session.batch() as batch:
-            for _, key in selected:
-                batch.get(KVRef(key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
-                batch.get(KVRef(key.to_bytes(Keyspace.LOGS), Keyspace.LOGS))
-        results = await batch.result()
-        return [
-            self._load_hint(kv, results[index * 2], results[index * 2 + 1])
-            for index, (kv, _) in enumerate(selected)
-        ]
-
-    @staticmethod
-    def _invalid_hint(kv: KVPair, exc: Exception) -> None:
-        logger.warning(
-            "Cannot decode hint obligation: meta_key=%s error=%s",
-            kv.key.hex(),
-            exc,
-        )
-
-    def _load_hint(
-        self, kv: KVPair, kv_tag: KVPair | None, kv_log: KVPair | None
-    ) -> Hint | None:
-        try:
-            return self._decode_hint(kv, kv_tag, kv_log)
-        except (ValueError, OverflowError) as exc:
-            self._invalid_hint(kv, exc)
-            return None
-
-    @staticmethod
-    def _decode_hint(
-        kv: KVPair, kv_tag: KVPair | None, kv_log: KVPair | None
-    ) -> Hint | None:
-        obligation = HintKey.from_bytes(kv.key)
-        reference = HintReference.from_bytes(kv.value)
-        key = reference.key
-        if kv_tag is None or kv_log is None:
-            logger.warning(
-                "Hint obligation references a missing version: intent=%s hlc=%s key=%s",
-                obligation.intent,
-                obligation.hlc,
-                key,
-            )
-            return None
-        tag = Tag.from_bytes(kv_tag.value)
-        original = Tag.unhint(tag) if tag.kind is TagKind.HINT else tag
-        record = Record(
-            key=key,
-            value=Value.from_bytes(kv_log.value),
-            tag=Tag.hint(original),
-        )
-        return Hint(record=record, intent=obligation.intent, hlc=obligation.hlc)
+                yield hint
 
     async def satisfy(self, hints: Sequence[Hint]) -> None:
         """Idempotently delete exact delivered obligations, leaving versions intact."""
         if not hints:
             return
-        async with self._session_provider.session(write=True) as session:
-            async with session.batch() as batch:
-                for hint in hints:
-                    key = HintKey(hint.intent, hint.hlc)
-                    batch.delete(KVRef(key.to_bytes(), Keyspace.META))
-            await batch.result()
+        async with self._session_manager.session(write=True) as session:
+            await session.remove_hint_obligations(
+                [HintKey(hint.intent, hint.hlc) for hint in hints]
+            )

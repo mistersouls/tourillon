@@ -4,6 +4,7 @@ requires-python = ">=3.14"
 
 [manifest]
 members = [
+    "tourclient",
     "tourctl",
     "tourillon",
     "tourlib",
@@ -975,15 +976,30 @@ wheels = [
 ]
 
 [[package]]
-name = "tourctl"
-version = "0.1.0.dev3"
-source = { editable = "tourctl" }
+name = "tourclient"
+version = "0.0.0"
+source = { editable = "tourclient" }
 dependencies = [
     { name = "tourlib" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "tourlib", virtual = "tourlib" }]
+requires-dist = [{ name = "tourlib", editable = "tourlib" }]
+
+[[package]]
+name = "tourctl"
+version = "0.1.0.dev3"
+source = { editable = "tourctl" }
+dependencies = [
+    { name = "tourclient" },
+    { name = "tourlib" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "tourclient", editable = "tourclient" },
+    { name = "tourlib", editable = "tourlib" },
+]
 
 [[package]]
 name = "tourillon"
@@ -1003,13 +1019,13 @@ requires-dist = [
     { name = "opentelemetry-api", specifier = ">=1.36" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.36" },
     { name = "opentelemetry-sdk", specifier = ">=1.36" },
-    { name = "tourlib", virtual = "tourlib" },
+    { name = "tourlib", editable = "tourlib" },
 ]
 
 [[package]]
 name = "tourlib"
 version = "0.0.0"
-source = { virtual = "tourlib" }
+source = { editable = "tourlib" }
 dependencies = [
     { name = "cryptography" },
     { name = "cyclopts" },

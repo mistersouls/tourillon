@@ -29,6 +29,7 @@ from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports import Telemetry, TelemetryProvider
 from tourillon.core.ports.storage import StorageProvider
 from tourillon.core.probe.detector import FailureDetectorProvider
+from tourillon.core.services.antientropy import AntiEntropyService
 from tourillon.core.services.gossip import GossipService
 from tourillon.core.services.inspector import NodeInspector
 from tourillon.core.services.lifecycle import NodeLifecycle
@@ -123,6 +124,7 @@ class Manager:
         self._gossip = GossipService(
             node_id=self._config.node.id,
             topologymgr=self._topologymgr,
+            relay=self._lifecycle.gossiper.relay,
         )
         self._transfer = TransferService(
             topologymgr=self._topologymgr,
@@ -166,6 +168,11 @@ class Manager:
     def store(self) -> StoreService:
         """Get the store service."""
         return self._store
+
+    @property
+    def antientropy(self) -> AntiEntropyService:
+        """Get the data anti-entropy service."""
+        return self._lifecycle.antientropy
 
     async def start(self, seeds: list[str] | None = None) -> None:
         """Start the Tourillon daemon.

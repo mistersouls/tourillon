@@ -30,6 +30,23 @@ Never add `__all__` outside `__init__.py`.
   Use `@classmethod` with `cls` when it needs class access but not instance
   access. Use an instance method when it needs `self`.
 
+## Readability inside functions
+
+Do not pack a function body into one solid block. Separate its logical steps
+with a single blank line, the way the surrounding code does:
+
+- before and after every block statement (`if`, `for`, `while`, `try`, `with`,
+  `async for`, `async with`, `match`);
+- around a statement that spans several lines (a multi-line call or literal is
+  a step of its own);
+- before the final `return` / `raise` of a body of three or more statements;
+- a comment belongs to the statement below it: put the blank line above the
+  comment, not between them.
+
+Keep tightly coupled one-liners together (`x = ...; y = f(x)`), never put a
+blank line right after a docstring or a block opener, and do not add more than
+one blank line in a row. Bodies of one or two statements stay compact.
+
 ## Docstrings
 
 Follow the style already present in the file you are editing. The codebase uses both Sphinx-style (`:param x:`) and Google-style (`Args:` / `Returns:` / `Raises:`) — match the neighbours, do not convert existing ones.

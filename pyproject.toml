@@ -37,7 +37,7 @@ dev = [
 workspace = ["tourillon", "tourctl"]
 
 [tool.uv.workspace]
-members = ["tourillon", "tourctl", "tourlib"]
+members = ["tourillon", "tourctl", "tourlib", "tourclient"]
 
 [tool.uv]
 default-groups = ["workspace"]
@@ -47,6 +47,7 @@ package = false
 tourillon = { workspace = true }
 tourctl = { workspace = true }
 tourlib = { workspace = true }
+tourclient = { workspace = true }
 
 # ---------------------------------------------------------------------------
 # Black

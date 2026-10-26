@@ -28,6 +28,7 @@ from tourillon.core.partition.placement import PlacementStrategy, Preference
 from tourillon.core.peer import PeerPool
 from tourillon.core.ports.storage import SessionProvider, Storage
 from tourillon.core.storage.group import PartitionGroupHint
+from tourillon.core.storage.session import GroupSessionManager
 from tourlib import Serializer
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT
 from tourlib.envelope import Envelope, build_envelope
@@ -163,7 +164,7 @@ class HintReplayer:
 
     async def _pending_hints(self) -> bool:
         for provider in await self._session_providers():
-            hints = PartitionGroupHint(provider)
+            hints = PartitionGroupHint(GroupSessionManager(provider))
             if await hints.pending():
                 return True
         return False
@@ -201,7 +202,7 @@ class HintReplayer:
 
     async def _replay_once(self) -> None:
         for session_provider in await self._session_providers():
-            hints = PartitionGroupHint(session_provider)
+            hints = PartitionGroupHint(GroupSessionManager(session_provider))
             await self._replay_group(hints)
 
     async def _replay_group(self, hint_group: PartitionGroupHint) -> None:

@@ -25,9 +25,8 @@ package = true
 tourlib = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
-only-include = []
+include = ["**/*.py"]
 dev-mode-dirs = [".."]
 
-[tool.hatch.build.targets.wheel.force-include]
-"." = "tourillon"
-"../tourlib" = "tourlib"
+[tool.hatch.build.targets.wheel.sources]
+"" = "tourillon"
