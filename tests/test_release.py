@@ -42,6 +42,8 @@ def make_release_repo(tmp_path):
     repo.mkdir()
     git(tmp_path, "init", "--bare", str(origin))
     git(repo, "init", "--initial-branch=main")
+    git(repo, "config", "--local", "commit.gpgsign", "false")
+    git(repo, "config", "--local", "tag.gpgsign", "false")
     git(repo, "config", "user.name", "Release Test")
     git(repo, "config", "user.email", "release@example.invalid")
     (repo / "sentinel.txt").write_text("release commit\n", encoding="utf-8")
@@ -50,6 +52,28 @@ def make_release_repo(tmp_path):
     git(repo, "remote", "add", "origin", str(origin))
     git(repo, "push", "--set-upstream", "origin", "main")
     return repo
+
+
+@pytest.mark.parametrize("signing", ["true", "false"])
+def test_release_repo_disables_signing_without_changing_global_config(
+    tmp_path, monkeypatch, signing: str
+) -> None:
+    config = tmp_path / "gitconfig"
+    config.write_text(
+        f"[commit]\n\tgpgsign = {signing}\n"
+        f"[tag]\n\tgpgsign = {signing}\n"
+        "[gpg]\n\tprogram = nonexistent-test-signing-program\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+
+    repo = make_release_repo(tmp_path)
+    git(repo, "tag", "-a", "test-release", "-m", "release")
+
+    assert git(repo, "config", "--local", "--get", "commit.gpgsign") == "false"
+    assert git(repo, "config", "--local", "--get", "tag.gpgsign") == "false"
+    assert git(repo, "config", "--global", "--get", "commit.gpgsign") == signing
+    assert git(repo, "config", "--global", "--get", "tag.gpgsign") == signing
 
 
 @pytest.mark.parametrize(
