@@ -18,7 +18,6 @@ import signal
 import ssl
 from collections.abc import AsyncIterator
 
-from tourillon.core.antientropy.service import AntiEntropyService
 from tourillon.core.config import TourillonConfig
 from tourillon.core.gossip.gossiper import GossipStats
 from tourillon.core.gossip.topology import TopologyManager
@@ -30,6 +29,7 @@ from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports import Telemetry, TelemetryProvider
 from tourillon.core.ports.storage import StorageProvider
 from tourillon.core.probe.detector import FailureDetectorProvider
+from tourillon.core.services.antientropy import AntiEntropyService
 from tourillon.core.services.gossip import GossipService
 from tourillon.core.services.inspector import NodeInspector
 from tourillon.core.services.lifecycle import NodeLifecycle

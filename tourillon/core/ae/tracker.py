@@ -24,7 +24,7 @@ partitions whose replicas may just have moved. The map is rebuilt only after
 import asyncio
 import contextlib
 
-from tourillon.core.antientropy.view import ReplicaView, build_view
+from tourillon.core.ae.view import ReplicaView, build_view
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.log import logger
 from tourillon.core.partition.partitioner import Partitioner

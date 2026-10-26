@@ -23,7 +23,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from tourillon.bootstrap.deps import get_manager, peer_dispatcher
-from tourillon.core.antientropy.responder import AntiEntropyResponder
+from tourillon.core.ae.responder import AntiEntropyResponder
 from tourillon.core.exceptions import AntiEntropyRejectError
 from tourillon.core.models.antientropy import (
     BucketsRequest,

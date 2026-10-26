@@ -373,7 +373,8 @@ Writes, hinted handoff and transfers each leave narrow gaps where a replica
 can miss a version for good: a write landing behind a transfer cursor, a hint
 delivered while the ring moves, a node applying a topology update late and
 accepting a write for a partition it no longer replicates. Read repair only
-heals what is read. `AntiEntropyService` (`tourillon/core/antientropy/`)
+heals what is read. `AntiEntropyService` (`tourillon/core/services/antientropy.py`,
+with its implementation components in `tourillon/core/ae/`)
 closes these gaps proactively by comparing digests between replicas, whatever
 caused the divergence.
 
@@ -397,7 +398,7 @@ of keys* is enough: a value never needs comparing.
 ### The descent
 
 One session compares a slice of partitions with one peer
-(`core/antientropy/sync.py`, `PeerSync`):
+(`core/ae/sync.py`, `PeerSync`):
 
 1. `antientropy.roots` — the initiator sends its root cell for up to
    `pids_per_cycle` pids; the responder answers only those that differ.

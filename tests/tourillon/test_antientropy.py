@@ -30,20 +30,13 @@ from typing import Any
 import pytest
 
 from tourillon.bootstrap.handlers import antientropy as handlers
-from tourillon.core.antientropy.service import (
-    AntiEntropyService,
-    PeerBackoff,
-    Unit,
-    initiates,
-    plan,
-)
-from tourillon.core.antientropy.sync import (
+from tourillon.core.ae.sync import (
     BudgetSpentError,
     PeerSync,
     SessionLimits,
     ViewChangedError,
 )
-from tourillon.core.antientropy.view import ReplicaView, build_view
+from tourillon.core.ae.view import ReplicaView, build_view
 from tourillon.core.exceptions import AntiEntropyRejectError
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.models.antientropy import Scope
@@ -60,6 +53,13 @@ from tourillon.core.models.storageschema import (
     Value,
 )
 from tourillon.core.partition.partitioner import Partitioner
+from tourillon.core.services.antientropy import (
+    AntiEntropyService,
+    PeerBackoff,
+    Unit,
+    initiates,
+    plan,
+)
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.storage.session import DigestCell, GroupSessionManager
 from tourillon.infra.storage.lmdb_session import LmdbConfig, LmdbSessionProvider

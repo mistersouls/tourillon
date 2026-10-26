@@ -50,8 +50,8 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from tourillon.core.antientropy.local import LocalStore
-from tourillon.core.antientropy.view import ReplicaView
+from tourillon.core.ae.local import LocalStore
+from tourillon.core.ae.view import ReplicaView
 from tourillon.core.models.antientropy import (
     MAX_BATCH_BYTES,
     MAX_PAGE_LIMIT,

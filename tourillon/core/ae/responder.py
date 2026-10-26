@@ -33,8 +33,8 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 
-from tourillon.core.antientropy.local import LocalStore
-from tourillon.core.antientropy.tracker import ViewTracker
+from tourillon.core.ae.local import LocalStore
+from tourillon.core.ae.tracker import ViewTracker
 from tourillon.core.exceptions import AntiEntropyRejectError
 from tourillon.core.models.antientropy import (
     BucketsRequest,

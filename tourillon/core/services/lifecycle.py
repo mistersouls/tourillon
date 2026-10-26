@@ -18,7 +18,6 @@ import ssl
 from collections.abc import Iterable
 from pathlib import Path
 
-from tourillon.core.antientropy.service import AntiEntropyService
 from tourillon.core.config import TourillonConfig
 from tourillon.core.exceptions import (
     BootstrapError,
@@ -38,6 +37,7 @@ from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports import Telemetry
 from tourillon.core.ports.storage import Storage
 from tourillon.core.replay.hint import HintReplayer
+from tourillon.core.services.antientropy import AntiEntropyService
 from tourillon.core.services.store import StoreService
 from tourillon.core.spaces.ring import Ring
 from tourillon.core.transfer.runner import TransferRunner

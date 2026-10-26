@@ -68,9 +68,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from tourillon.core.antientropy.local import LocalStore
-from tourillon.core.antientropy.responder import AntiEntropyResponder
-from tourillon.core.antientropy.sync import (
+from tourillon.core.ae.local import LocalStore
+from tourillon.core.ae.responder import AntiEntropyResponder
+from tourillon.core.ae.sync import (
     BudgetSpentError,
     Call,
     PeerSync,
@@ -78,8 +78,8 @@ from tourillon.core.antientropy.sync import (
     SessionTally,
     ViewChangedError,
 )
-from tourillon.core.antientropy.tracker import ViewTracker
-from tourillon.core.antientropy.view import ReplicaView
+from tourillon.core.ae.tracker import ViewTracker
+from tourillon.core.ae.view import ReplicaView
 from tourillon.core.exceptions import AntiEntropyRejectError
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.log import logger
