@@ -988,7 +988,7 @@ requires-dist = [{ name = "tourlib", editable = "tourlib" }]
 
 [[package]]
 name = "tourctl"
-version = "0.1.0.dev3"
+version = "0.1.0.dev4"
 source = { editable = "tourctl" }
 dependencies = [
     { name = "tourclient" },
@@ -1003,7 +1003,7 @@ requires-dist = [
 
 [[package]]
 name = "tourillon"
-version = "0.1.0.dev3"
+version = "0.1.0.dev4"
 source = { editable = "tourillon" }
 dependencies = [
     { name = "lmdb" },
@@ -1043,7 +1043,7 @@ requires-dist = [
 
 [[package]]
 name = "tourproject"
-version = "0.1.0.dev3"
+version = "0.1.0.dev4"
 source = { virtual = "." }
 
 [package.optional-dependencies]

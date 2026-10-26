@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tourproject"
-version = "0.1.0.dev3"
+version = "0.1.0.dev4"
 description = "Leaderless peer-to-peer distributed key-value database."
 readme = "README.md"
 license = { text = "Apache-2.0" }
