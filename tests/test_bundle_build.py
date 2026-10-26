@@ -259,7 +259,8 @@ def test_workspace_products_inherit_shared_runtime_dependencies():
         "tomli-w>=1.2",
     }
     assert "tourlib" in dependencies("tourillon/pyproject.toml")
-    assert dependencies("tourctl/pyproject.toml") == ["tourlib"]
+    assert dependencies("tourctl/pyproject.toml") == ["tourclient", "tourlib"]
+    assert dependencies("tourclient/pyproject.toml") == ["tourlib"]
     assert dependencies("pyproject.toml") == []
 
     with (project_root / "tourillon" / "pyproject.toml").open("rb") as project_file:
@@ -274,6 +275,25 @@ def test_workspace_products_inherit_shared_runtime_dependencies():
     assert tourctl_project["tool"]["uv"]["package"] is True
     assert "tourillon" in tourillon_project["project"]["scripts"]
     assert "tourctl" in tourctl_project["project"]["scripts"]
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("product", ["tourillon", "tourctl"])
+def test_bundle_requirements_exclude_workspace_sources(product):
+    requirements = bundle.export_locked_requirements(bundle.Path.cwd(), product)
+
+    try:
+        content = requirements.read_text(encoding="utf-8")
+        assert "cryptography==" in content
+        assert ("lmdb==" in content) == (product == "tourillon")
+        assert "-e " not in content
+        assert "file://" not in content
+        assert not any(
+            line.startswith(("tourillon", "tourctl", "tourlib", "tourclient"))
+            for line in content.splitlines()
+        )
+    finally:
+        requirements.unlink(missing_ok=True)
 
 
 @pytest.mark.parametrize(

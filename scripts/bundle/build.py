@@ -612,7 +612,7 @@ def export_locked_requirements(project_root: Path, product: str) -> Path:
         ]
         arguments.extend(
             [
-                "--no-emit-project",
+                "--no-emit-workspace",
                 "--no-annotate",
                 "--no-header",
                 "--format",

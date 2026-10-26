@@ -9,7 +9,7 @@ applyTo: ".github/workflows/**,scripts/**,**/pyproject.toml,.pre-commit-config.y
 - `uv` is the only supported workflow. Add dependencies to the owning package's `pyproject.toml`, then run `uv sync --extra dev` to refresh `uv.lock`.
 - **Never hand-edit `uv.lock`.** It is committed deliberately so builds and bundles are reproducible.
 - Keep the runtime dependency surface minimal — the node ships as a self-contained native bundle, and every dependency has to be vendored and licensed.
-- `tourillon` depends on `tourlib`; `tourctl` depends on `tourlib` and force-includes `tourclient`. Do not create a dependency from `tourlib` onto `tourillon` or `tourctl`.
+- Each workspace member builds its own wheel and is installed editably during development. `tourillon` depends on `tourlib`; `tourctl` depends on `tourclient` and `tourlib`; `tourclient` depends on `tourlib`. Do not force-include package sources or create dependencies from `tourlib` onto its consumers.
 
 ## Workflows
 

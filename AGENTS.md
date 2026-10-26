@@ -41,14 +41,16 @@ Design pillars actually implemented today:
 | `tourillon/infra/` | Concrete adapters: LMDB storage, OpenTelemetry telemetry. |
 | `tourillon/bootstrap/` | Composition root: `deps.py` wiring, `main.py` CLI, `usecases/` commands, `handlers/` envelope handlers. |
 | `tourlib/` | Shared library: envelope framing, transport, wire models, ports (`Serializer`, `Persistence`, `MtlsCrypto`) and their adapters. Used by **all** other packages. |
-| `tourclient/` | Async client library with a service registry. Shipped inside the `tourctl` distribution. |
+| `tourclient/` | Async client library with a service registry. Installable dependency of `tourctl`. |
 | `tourctl/` | Operator / user CLI built on `tourclient`. Ships the `tourctl` CLI. |
 | `tests/` | Mirrors the package layout; `tests/e2e/` drives real processes. |
 | `scripts/` | License-header check and the native bundle builder / installers. |
 | `docs/` | `architecture.md` (deep reference) and `backlog.md` (known gaps and bugs). |
 
-uv workspace members are `tourillon`, `tourctl`, `tourlib`.
-`tourclient` has no `pyproject.toml` of its own — it is force-included into the `tourctl` wheel (`tourctl/pyproject.toml`).
+uv workspace members are `tourillon`, `tourctl`, `tourlib`, `tourclient`.
+Each member builds its own wheel and is installed editably during development.
+`tourillon` depends on `tourlib`; `tourctl` depends on `tourclient` and `tourlib`.
+Do not force-include package sources: copied files shadow editable imports.
 
 ---
 

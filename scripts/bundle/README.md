@@ -12,8 +12,21 @@ dependencies, including Cyclopts, are declared once in
 `tourlib/pyproject.toml` and inherited by both products. The root project is
 non-installable and includes both products in its workspace dependency group.
 One `uv sync --extra dev` installs the development tools and both product
-packages in the same environment. `tourclient` remains source-only and is
-included in the Tourctl distribution without a separate project manifest.
+packages in the same environment. `tourlib` and `tourclient` are installable
+workspace libraries, each with its own manifest and wheel. Each wheel contains
+only its own package; `tourctl` depends on `tourclient` and `tourlib`.
+
+Workspace packages are installed editably: Python code changes are visible
+immediately, without reinstalling. When upgrading from the old forced-source
+inclusion, run this once to remove the installed copies:
+
+```powershell
+uv sync --extra dev --reinstall-package tourillon --reinstall-package tourctl
+```
+
+Afterward, use `uv sync --extra dev` only when dependencies or manifests change.
+The bundle builder exports third-party dependencies with
+`--no-emit-workspace`, then copies each product's application packages explicitly.
 
 Each product has its own native bundle and release lifecycle. `tourillon`
 ships `tourillon` and `tourlib`; `tourctl` ships `tourctl`, `tourclient`, and

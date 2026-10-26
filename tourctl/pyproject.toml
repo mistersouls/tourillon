@@ -7,7 +7,7 @@ name = "tourctl"
 version = "0.1.0.dev3"
 description = "Command-line client and operator tools for Tourillon."
 requires-python = ">=3.14"
-dependencies = ["tourlib"]
+dependencies = ["tourclient", "tourlib"]
 
 [project.scripts]
 tourctl = "tourctl.bootstrap.main:app"
@@ -16,13 +16,12 @@ tourctl = "tourctl.bootstrap.main:app"
 package = true
 
 [tool.uv.sources]
+tourclient = { workspace = true }
 tourlib = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
-only-include = []
+include = ["**/*.py"]
 dev-mode-dirs = [".."]
 
-[tool.hatch.build.targets.wheel.force-include]
-"." = "tourctl"
-"../tourclient" = "tourclient"
-"../tourlib" = "tourlib"
+[tool.hatch.build.targets.wheel.sources]
+"" = "tourctl"
