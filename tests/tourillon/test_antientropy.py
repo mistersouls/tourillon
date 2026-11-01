@@ -292,7 +292,17 @@ class _Cluster:
             clock=lambda: NOW,
             backoff=BackoffRetry(initial_delay=0.0, max_delay=0.0, jitter=0.0),
             telemetry=None if telemetry is None else telemetry.as_port(),
-            notify=GarbageCollector(storage, PARTITIONER, policy).submit,
+            notify=GarbageCollector(
+                storage,
+                PARTITIONER,
+                policy,
+                node_id=node_id,
+                telemetry=(
+                    RecordingTelemetry().as_port()
+                    if telemetry is None
+                    else telemetry.as_port()
+                ),
+            ).submit,
         )
 
         self.network.nodes[node_id] = service

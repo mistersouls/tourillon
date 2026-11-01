@@ -631,9 +631,22 @@ hotqueue_size = 4096
 
 Bounds: `versions` 1..64, `interval` 0.01..86400 seconds, `batch_size` 1..1024 and `hotqueue_size` 1..65536. **The default retains two versions**; replicas must be configured together. Increasing X cannot recover already collected history.
 
-`manager.gc.request(dry_run=True)` queues a non-mutating estimate; `request()` queues collection. Both use the same protection checks. `manager.gc.status.to_dict()` exposes job ID, queued/running/completed/failed/cancelled state, scanned/collectible counts, serialized value bytes, start time and errors. Estimates are local snapshots, not reservations or predicted filesystem savings; hot work is not processed by the estimating pass. There is deliberately no new `tourctl` command or admin wire endpoint yet.
+`manager.gc.request(dry_run=True)` queues a non-mutating estimate; `request()` queues collection. Both use the same protection checks. `manager.gc.status.to_dict()` exposes job ID, queued/running/completed/failed/cancelled state, scanned/collectible counts, logical LOGS/TAGS record bytes, start time and errors. Estimates are local snapshots, not reservations or predicted filesystem savings; hot work is not processed by the estimating pass. There is deliberately no new `tourctl` command or admin wire endpoint yet.
 
 The contract preserves current state under the replication requested at write time; it does not retain history indefinitely. Free backend pages can be reused, but file size need not decrease after GC.
+
+GC logs `gc.started`/`gc.stopped` at INFO, including the node and configured
+retention/scan interval at startup. The first periodic scan runs after that
+interval; subsequent scans wait the interval after the previous pass finishes.
+Completed passes log mode (`periodic`, `requested` or `estimate`), scanned
+versions, `collected` (or `collectible` for estimates), logical LOGS/TAGS record
+bytes and duration. Job IDs remain in the internal status and failure logs,
+not successful pass summaries. Transaction failures include
+node, group and source; successful hot transactions do not emit INFO per key.
+The internal pass status describes the scan only, not interleaved hot work.
+Metrics cover both paths and count removal work only after successful commit.
+An estimate records `collectible`, not `collected`, and never increments removed
+bytes. Queue size tracks pending addresses, not total collectible history.
 
 ---
 
@@ -664,9 +677,15 @@ All names carry the `tourillon_` prefix. Labels are low-cardinality on purpose: 
 | Peer pool | `pool_connections_total`, `pool_evictions_total`, `pool_promotions_total`, `pool_acquire_errors_total` (`reason`: `timeout`/`connect`), `pool_size_permanent`, `pool_size_overflow` |
 | Store | `kv_requests_total`, `kv_request_duration_seconds` (`op`, `outcome`: `ok` or the error code), `replication_failures_total` (`op`), `read_repairs_total` (`outcome`), `obligations_total` (`event`: `recorded`/`delivered`/`deferred`/`dropped`) |
 | Anti-entropy | `ae_sessions_total` (`goal`, `outcome`), `ae_versions_total`, `ae_bytes_total` (`direction`: `pull`/`push`), `ae_sweeps_total` (`outcome`: `complete`/`interrupted`) |
+| GC | `gc_passes_total`, `gc_pass_duration_seconds` (`source`: `periodic`/`requested`, `mode`: `collect`/`estimate`, `outcome`: `completed`/`failed`/`cancelled`); `gc_versions_total` (`source`: `scan`/`hot`, `mode`, `event`: `scanned`/`collected`/`collectible`); `gc_record_bytes_removed_total`, `gc_errors_total` (`source`: `scan`/`hot`); `gc_transaction_duration_seconds` (`source`, `mode`, `outcome`); `gc_hot_queue_size` |
 | Gossip | `gossip_push_attempt_total`, `gossip_push_error_total`, `gossip_ae_cycle_total`, `gossip_ae_diverged`, `gossip_failed_announcements_total`, `gossip_hot_queue_size`, `gossip_last_ae_at` |
 
 ### Traces
+
+GC emits logs and metrics only, with no GC spans. Its duration histograms include
+transaction acquisition and commit. Removed bytes include both LOGS/TAGS keys, the value and tag, excluding digest changes,
+not physical disk reclamation. GC metric labels contain no keys, job IDs or
+partition IDs.
 
 Write traces add `peer.request` around peer acquisition and request/response round-trips, and `storage.write` around local record persistence, including obligation persistence on handoff. Its children split transaction lifetime (`storage.transaction`), version insertion (`storage.record.put`) and handoff obligations (`storage.obligations.put`). The transaction span includes begin, digest updates and commit, so its uncovered time after accounting for child spans helps identify their combined overhead. Span attributes identify the peer, storage group and request kind, never the key or value.
 

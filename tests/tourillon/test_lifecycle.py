@@ -199,7 +199,13 @@ def _build_lifecycle(
         gossip_stats=GossipStats(),
         telemetry=build_noop_telemetry(),
         store=store,
-        gc=GarbageCollector(storage, partitioner, config.placement.retention),
+        gc=GarbageCollector(
+            storage,
+            partitioner,
+            config.placement.retention,
+            node_id=config.node.id,
+            telemetry=build_noop_telemetry(),
+        ),
     )
 
 

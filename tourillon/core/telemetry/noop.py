@@ -216,6 +216,34 @@ class NoopTelemetry(Telemetry):
     def ae_sweeps_total(self) -> CounterMetric:
         return _NoopCounterMetric()
 
+    @property
+    def gc_passes_total(self) -> CounterMetric:
+        return _NoopCounterMetric()
+
+    @property
+    def gc_versions_total(self) -> CounterMetric:
+        return _NoopCounterMetric()
+
+    @property
+    def gc_record_bytes_removed_total(self) -> CounterMetric:
+        return _NoopCounterMetric()
+
+    @property
+    def gc_errors_total(self) -> CounterMetric:
+        return _NoopCounterMetric()
+
+    @property
+    def gc_pass_duration_seconds(self) -> HistogramMetric:
+        return _NoopHistogramMetric()
+
+    @property
+    def gc_transaction_duration_seconds(self) -> HistogramMetric:
+        return _NoopHistogramMetric()
+
+    @property
+    def gc_hot_queue_size(self) -> GaugeMetric:
+        return _NoopGaugeMetric()
+
     def start_span(
         self,
         name: str,

@@ -221,6 +221,8 @@ class GroupSession:
         """Remove owned records and their digest contributions atomically.
 
         The caller is responsible for deciding which records may be removed.
+        Returned bytes include LOGS/TAGS keys and values, not backend overhead
+        or digest changes.
         """
         candidates: list[Key] = []
         size = 0
@@ -229,7 +231,9 @@ class GroupSession:
             record = await self.read(key)
             if record is not None and record.tag.kind in OWNED_KINDS:
                 candidates.append(key)
-                size += len(record.value.to_bytes())
+                size += len(record.to_bytes(Keyspace.TAGS)) + len(
+                    record.key.to_bytes(Keyspace.LOGS)
+                )
 
         if not dry_run:
             await self._remove_records(candidates)

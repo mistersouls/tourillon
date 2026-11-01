@@ -92,7 +92,11 @@ class Manager:
         )
         self._obligations = ObligationQueue(config.placement.anti_entropy.hotqueue_size)
         self._gc = GarbageCollector(
-            self._storage, self._partitioner, config.placement.retention
+            self._storage,
+            self._partitioner,
+            config.placement.retention,
+            node_id=config.node.id,
+            telemetry=self._telemetry,
         )
         self._store = StoreService(
             node_id=config.node.id,

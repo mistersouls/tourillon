@@ -166,6 +166,34 @@ class Telemetry(Protocol):
     def ae_sweeps_total(self) -> CounterMetric:
         """Sweeps, labelled ``outcome`` (complete, interrupted)."""
 
+    @property
+    def gc_passes_total(self) -> CounterMetric:
+        """GC passes, labelled ``source``, ``mode`` and ``outcome``."""
+
+    @property
+    def gc_versions_total(self) -> CounterMetric:
+        """Committed GC work, labelled ``source``, ``mode`` and ``event``."""
+
+    @property
+    def gc_record_bytes_removed_total(self) -> CounterMetric:
+        """Logical LOGS/TAGS key and value bytes actually removed, by source."""
+
+    @property
+    def gc_errors_total(self) -> CounterMetric:
+        """Failed GC transactions, labelled ``source``."""
+
+    @property
+    def gc_pass_duration_seconds(self) -> HistogramMetric:
+        """Pass duration, labelled ``source``, ``mode`` and ``outcome``."""
+
+    @property
+    def gc_transaction_duration_seconds(self) -> HistogramMetric:
+        """Transaction lifetime including commit, by source, mode and outcome."""
+
+    @property
+    def gc_hot_queue_size(self) -> GaugeMetric:
+        """Pending distinct addresses; not a measure of remaining history."""
+
     def start_span(
         self,
         name: str,
