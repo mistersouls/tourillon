@@ -19,6 +19,7 @@ from typing import Any
 from tourclient.core.transport import Transport
 from tourlib import Serializer
 from tourlib.exceptions import ResponseError
+from tourlib.models.gc import GcInfo
 from tourlib.models.inspect import (
     MemberInspect,
     NodeInfo,
@@ -92,7 +93,12 @@ def _node_info_from_document(data: Mapping[str, Any]) -> NodeInfo:
     if not isinstance(gossip_stats, dict):
         raise ResponseError("invalid node.inspect response gossip_stats")
 
+    try:
+        gc_info = GcInfo.from_document(data.get("gc"))
+    except (TypeError, ValueError) as exc:
+        raise ResponseError("invalid node.inspect response gc") from exc
     return NodeInfo(
+        gc=gc_info,
         node_id=_require_str(data, "node_id"),
         snapshot_at=_require_str(data, "snapshot_at"),
         chunk_index=_require_int(data, "chunk_index"),

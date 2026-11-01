@@ -18,10 +18,55 @@ from typing import Any
 from tourillon.bootstrap.deps import get_manager, peer_dispatcher
 from tourillon.core.exceptions import DrainError
 from tourlib.envelope import Envelope, replay_envelope
+from tourlib.exceptions import ValidationError
+from tourlib.models.gc import GcRequest, GcResponse, GcStatusRequest
 from tourlib.models.inspect import NodeInspectRequest
 from tourlib.models.node import DrainRequest, JoinRequest
 
 dispatcher = peer_dispatcher()
+
+
+@dispatcher.on("node.gc")
+async def gc(request: Envelope) -> AsyncIterator[Envelope]:
+    manager = get_manager()
+    serializer = manager.serializer
+    try:
+        model = GcRequest.from_document(serializer.decode(request.payload))
+        manager.gc.request(dry_run=model.dry_run, partition=model.partition)
+    except (ValidationError, ValueError) as exc:
+        yield replay_envelope(
+            kind="node.gc.reject",
+            request=request,
+            payload=serializer.encode({"message": str(exc)}),
+        )
+        return
+    result = GcResponse(manager.node_id, manager.gc.inspect().status)
+    yield replay_envelope(
+        kind="node.gc.accept",
+        request=request,
+        payload=serializer.encode(result.to_dict()),
+    )
+
+
+@dispatcher.on("node.gc.status")
+async def gc_status(request: Envelope) -> AsyncIterator[Envelope]:
+    manager = get_manager()
+    serializer = manager.serializer
+    try:
+        model = GcStatusRequest.from_document(serializer.decode(request.payload))
+        result = GcResponse(manager.node_id, manager.gc.result(model.job_id))
+    except (ValidationError, ValueError) as exc:
+        yield replay_envelope(
+            kind="node.gc.status.reject",
+            request=request,
+            payload=serializer.encode({"message": str(exc)}),
+        )
+        return
+    yield replay_envelope(
+        kind="node.gc.status.accept",
+        request=request,
+        payload=serializer.encode(result.to_dict()),
+    )
 
 
 @dispatcher.on("node.inspect")

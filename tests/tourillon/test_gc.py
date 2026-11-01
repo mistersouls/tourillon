@@ -213,6 +213,56 @@ async def test_periodic_gc_and_cancelled_request(
     assert gc.status.state == "cancelled"
 
 
+async def test_partition_gc_is_bounded_and_keeps_previous_job_results(
+    gc: GarbageCollector,
+) -> None:
+    manager = await _seed(gc)
+    other = Record(
+        key=Key(Pid(1), _record(1).key.address, _record(1).key.ts),
+        value=_record(1).value,
+        tag=_record(1).tag,
+    )
+    async with manager.session(write=True) as session:
+        await session.put(other)
+    await gc.start()
+    first = gc.request(dry_run=True, partition=0)
+    await _completed(gc)
+    assert gc.result(first.job_id).scanned == 4
+    assert gc.result(first.job_id).collected == 3
+    second = gc.request(partition=0)
+    await _completed(gc)
+    assert gc.result(first.job_id).dry_run
+    assert gc.result(second.job_id).collected == 3
+    assert gc.inspect().status.partition == 0
+    assert gc.inspect().status.finished_at is not None
+    async with manager.session() as session:
+        assert await session.read(other.key) == other
+        assert await session.read(_record(4).key) == _record(4)
+    with pytest.raises(ValueError, match="Unknown or expired"):
+        gc.result("missing")
+
+
+@pytest.mark.parametrize("partition", [-1, 2, True])
+async def test_invalid_gc_partition_is_rejected_without_queuing(gc, partition):
+    await gc.start()
+    with pytest.raises(ValueError, match="Partition"):
+        gc.request(partition=partition)
+    assert gc.status.state == "idle"
+
+
+async def test_gc_results_expire_explicitly_after_bounded_history(
+    gc: GarbageCollector,
+) -> None:
+    await gc.start()
+    first = gc.request()
+    await _completed(gc)
+    for _ in range(64):
+        gc.request()
+        await _completed(gc)
+    with pytest.raises(ValueError, match="expired"):
+        gc.result(first.job_id)
+
+
 async def test_gc_failure_is_visible_and_can_be_retried(
     gc: GarbageCollector,
     monkeypatch: pytest.MonkeyPatch,

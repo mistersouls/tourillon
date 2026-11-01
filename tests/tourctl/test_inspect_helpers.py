@@ -25,6 +25,7 @@ from tourctl.core.inspect import (
     _render_text,
 )
 from tourlib.exceptions import ProtocolError, ResponseError, ValidationError
+from tourlib.models.gc import GcInfo, GcStatus
 from tourlib.models.inspect import (
     MemberInspect,
     NodeInfo,
@@ -35,6 +36,7 @@ from tourlib.models.inspect import (
 
 def _node_info(*, members: tuple[MemberInspect, ...]) -> NodeInfo:
     return NodeInfo(
+        gc=GcInfo(True, 2, 600, 0, GcStatus()),
         node_id="node-1",
         snapshot_at="2026-09-01T00:00:00Z",
         chunk_index=0,

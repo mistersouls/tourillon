@@ -26,6 +26,7 @@ from tourillon.core.services.inspector import NodeInspector
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.telemetry import build_noop_telemetry
 from tourlib.adapter import MsgPackSerializer
+from tourlib.models.gc import GcInfo, GcStatus
 from tourlib.models.inspect import NodeInspectRequest
 
 
@@ -39,6 +40,7 @@ def _build_inspector(node_id: str = "node-1") -> tuple[NodeInspector, TopologyMa
         telemetry=build_noop_telemetry(),
     )
     inspector = NodeInspector(
+        gc_snapshot=lambda: GcInfo(True, 2, 600, 0, GcStatus()),
         node_id=node_id,
         stats=GossipStats(known_members=3, ae_cycles_total=12),
         peer_pool=peer_pool,

@@ -32,6 +32,7 @@ from tourillon.core.ports.storage import Storage
 from tourillon.core.ports.telemetry import Telemetry
 from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.storage.session import GroupSession, GroupSessionManager
+from tourlib.models.gc import GcInfo, GcStatus
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,9 @@ class CollectionStatus:
     bytes_removed: int = 0
     started_at: str | None = None
     error: str | None = None
+    partition: int | None = None
+    current_group: int | None = None
+    finished_at: str | None = None
 
     def updated(self, **changes: Any) -> "CollectionStatus":
         return replace(self, **changes)
@@ -73,6 +77,7 @@ class GarbageCollector:
         self._task: asyncio.Task[None] | None = None
         self._pending = False
         self._status = CollectionStatus()
+        self._results: OrderedDict[str, CollectionStatus] = OrderedDict()
         self.overflowed = 0
 
     @property
@@ -90,19 +95,67 @@ class GarbageCollector:
         self._telemetry.gc_hot_queue_size.set(len(self._hot))
         self._wake.set()
 
-    def request(self, *, dry_run: bool = False) -> CollectionStatus:
+    def inspect(self) -> GcInfo:
+        return GcInfo(
+            running=self._task is not None and not self._task.done(),
+            versions=self._retention.versions,
+            interval=self.config.interval,
+            hot_queue_size=len(self._hot),
+            status=self._wire_status(self._status),
+        )
+
+    @staticmethod
+    def _wire_status(status: CollectionStatus) -> GcStatus:
+        document = status.to_dict()
+        document["record_bytes"] = document.pop("bytes_removed")
+        return GcStatus.from_document(document)
+
+    def result(self, job_id: str) -> GcStatus:
+        if job_id == self._status.job_id:
+            return self._wire_status(self._status)
+        if job_id not in self._results:
+            raise ValueError(
+                "Unknown or expired GC job; inspect the node for its latest pass"
+            )
+        return self._wire_status(self._results[job_id])
+
+    def _finish(self, state: str, error: str | None = None) -> None:
+        self._status = self._status.updated(
+            state=state, error=error, finished_at=datetime.now(UTC).isoformat()
+        )
+        self._results[self._status.job_id] = self._status
+        if len(self._results) > 64:
+            self._results.popitem(last=False)
+
+    def request(
+        self, *, dry_run: bool = False, partition: int | None = None
+    ) -> CollectionStatus:
+        self._validate_partition(partition)
         if self._task is None or self._task.done():
             raise ValueError("GC worker is not running")
         if self._pending or self._status.state == "running":
             raise ValueError("GC pass already queued or running; inspect its progress")
 
         self._status = CollectionStatus(
-            job_id=str(uuid4()), state="queued", dry_run=dry_run
+            job_id=str(uuid4()),
+            state="queued",
+            dry_run=dry_run,
+            partition=partition,
         )
         self._pending = True
         self._wake.set()
 
         return self._status
+
+    def _validate_partition(self, partition: int | None) -> None:
+        if partition is not None and (
+            isinstance(partition, bool)
+            or not isinstance(partition, int)
+            or not 0 <= partition < self._partitioner.total_partitions
+        ):
+            raise ValueError(
+                f"Partition must be in 0..{self._partitioner.total_partitions - 1}"
+            )
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -124,7 +177,7 @@ class GarbageCollector:
             self._task = None
             if self._status.state in ("queued", "running"):
                 self._pending = False
-                self._status = self._status.updated(state="cancelled")
+                self._finish("cancelled")
             logger.info("gc.stopped node=%s", self._node_id)
 
     async def _run(self) -> None:
@@ -157,7 +210,7 @@ class GarbageCollector:
         try:
             await self._scan()
         except asyncio.CancelledError:
-            self._status = self._status.updated(state="cancelled")
+            self._finish("cancelled")
             raise
         except Exception as exc:
             logger.exception(
@@ -166,9 +219,7 @@ class GarbageCollector:
                 self._status.job_id,
                 source,
             )
-            self._status = self._status.updated(
-                state="failed", error=f"{type(exc).__name__}: {exc}"
-            )
+            self._finish("failed", f"{type(exc).__name__}: {exc}")
             return
         finally:
             outcome = (
@@ -184,7 +235,7 @@ class GarbageCollector:
                 monotonic() - started, attributes=labels
             )
 
-        self._status = self._status.updated(state="completed")
+        self._finish("completed")
         if self._hot:
             self._wake.set()
         logger.info(
@@ -200,14 +251,23 @@ class GarbageCollector:
         )
 
     async def _scan(self) -> None:
-        for group in range(self._partitioner.total_groups):
+        partition = self._status.partition
+        groups = (
+            range(self._partitioner.total_groups)
+            if partition is None
+            else (self._partitioner.group_for(partition),)
+        )
+        for group in groups:
+            self._status = self._status.updated(current_group=group)
             after: bytes | None = None
 
             while True:
                 async with self._session(
                     group, "scan", self._status.dry_run
                 ) as session:
-                    keys = await session.log_page(after, self.config.batch_size)
+                    keys = await session.log_page(
+                        after, self.config.batch_size, partition
+                    )
                     count, size = await self._retention.collect(
                         session, keys, dry_run=self._status.dry_run
                     )
@@ -224,7 +284,7 @@ class GarbageCollector:
                     break
 
                 after = keys[-1].to_bytes(Keyspace.TAGS)
-                if not self._status.dry_run:
+                if not self._status.dry_run and partition is None:
                     await self._hot_step()
                 await asyncio.sleep(0)
 

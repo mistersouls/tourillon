@@ -77,6 +77,14 @@ NODE_DRAIN_ERROR_PROFILE = ErrorProfile(
     invalid_response="Tourillon node returned an invalid drain response",
 )
 
+NODE_GC_ERROR_PROFILE = ErrorProfile(
+    action_failed="Node GC failed",
+    tls_failed="TLS setup or handshake failed during node GC",
+    refused="Tourillon node refused the GC connection",
+    unreachable="Unable to reach the Tourillon node for GC",
+    invalid_response="Tourillon node returned an invalid GC response",
+)
+
 
 def _config_error_message(exc: Exception, context_name: str | None) -> str | None:
     if isinstance(exc, FileNotFoundError):

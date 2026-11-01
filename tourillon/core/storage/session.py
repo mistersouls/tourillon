@@ -40,6 +40,7 @@ from tourillon.core.models.storageschema import (
     ObligationKey,
     ObligationPrefix,
     PartitionAddress,
+    Pid,
     Record,
     Tag,
     TagKind,
@@ -201,9 +202,16 @@ class GroupSession:
 
         return identities
 
-    async def log_page(self, after: bytes | None, limit: int) -> list[Key]:
+    async def log_page(
+        self, after: bytes | None, limit: int, pid: int | None = None
+    ) -> list[Key]:
         async with self._session.batch() as batch:
-            batch.list(Keyspace.TAGS, start=after, limit=limit)
+            batch.list(
+                Keyspace.TAGS,
+                prefix=None if pid is None else Pid(pid),
+                start=after,
+                limit=limit,
+            )
 
         (page,) = await batch.result()
         return [Key.from_bytes(kv.key, Keyspace.TAGS) for kv in page]

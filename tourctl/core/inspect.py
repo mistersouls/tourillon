@@ -20,6 +20,7 @@ from typing import NoReturn
 from tourclient import InspectService, client
 from tourclient.exception import UnknownServiceError
 from tourctl.core.error import INSPECT_ERROR_PROFILE, handle_error
+from tourctl.core.nodegc import render_status
 from tourlib.models.inspect import MemberInspect, NodeInfo, NodeInspectRequest
 
 
@@ -161,6 +162,12 @@ def _render_text(address: str, chunks: list[NodeInfo]) -> str:
             f"    Last hot failure:   {_display(gossip.get('last_hot_failure'))}",
             f"    Last ae failure:    {_display(gossip.get('last_ae_failure'))}",
             f"    Last stop failure:  {_display(gossip.get('last_stop_failure'))}",
+            "",
+            "  Historical GC (local worker)",
+            f"    Worker: {'running' if first.gc.running else 'stopped'}  "
+            f"retention={first.gc.versions}  interval={first.gc.interval:g}s  "
+            f"hot_queue={first.gc.hot_queue_size}",
+            *[f"    {line}" for line in render_status(first.gc.status)],
             "",
             "  Notes",
             f"    - View is local to {node_id} and may lag briefly behind cluster-wide state.",

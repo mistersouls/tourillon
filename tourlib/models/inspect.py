@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from tourlib.exceptions import ValidationError
+from tourlib.models.gc import GcInfo
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,7 @@ class NodeInfo:
     next_cursor: str | None
     ring_position: RingPositionInspect
     self_member: MemberInspect
+    gc: GcInfo
     members: tuple[MemberInspect, ...] = ()
     gossip_stats: dict[str, Any] = field(default_factory=dict)
 

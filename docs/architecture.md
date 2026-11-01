@@ -545,12 +545,12 @@ Handlers are async generators registered once per kind on the peer or client dis
 | --- | --- | --- |
 | `probe` | client, peer | `probe.ping` → `probe.pong` |
 | `kv` | client, peer | `kv.put` / `kv.get` / `kv.delete` / `kv.repair` |
-| `node` | peer | `node.join` / `node.drain` |
+| `node` | peer | `node.join` / `node.drain` / `node.gc` / `node.gc.status` |
 | `inspect` | peer | `node.inspect` → paginated `node.info` |
 
 `gossip.*`, `replication.*` and `antientropy.*` are internal to the cluster and deliberately have no client service.
 
-`tourctl` builds on those services with cyclopts commands (`probe ping`, `node inspect`, `node join`, `node drain`, `put`, `get`, `delete`, `repair`). Commands stay thin; rendering and error mapping live in `tourctl/core/`, which translates configuration, TLS/connectivity and protocol failures into actionable `SystemExit` messages instead of tracebacks.
+`tourctl` builds on those services with cyclopts commands (`probe ping`, `node inspect`, `node join`, `node drain`, `node gc`, `put`, `get`, `delete`, `repair`). Commands stay thin; rendering and error mapping live in `tourctl/core/`, which translates configuration, TLS/connectivity and protocol failures into actionable `SystemExit` messages instead of tracebacks.
 
 `tourillon config ca | client | node` generates the mTLS material and the TOML configuration files that both sides consume.
 
@@ -631,7 +631,25 @@ hotqueue_size = 4096
 
 Bounds: `versions` 1..64, `interval` 0.01..86400 seconds, `batch_size` 1..1024 and `hotqueue_size` 1..65536. **The default retains two versions**; replicas must be configured together. Increasing X cannot recover already collected history.
 
-`manager.gc.request(dry_run=True)` queues a non-mutating estimate; `request()` queues collection. Both use the same protection checks. `manager.gc.status.to_dict()` exposes job ID, queued/running/completed/failed/cancelled state, scanned/collectible counts, logical LOGS/TAGS record bytes, start time and errors. Estimates are local snapshots, not reservations or predicted filesystem savings; hot work is not processed by the estimating pass. There is deliberately no new `tourctl` command or admin wire endpoint yet.
+`manager.gc.request(dry_run=True)` queues a non-mutating estimate; `request()`
+queues collection. An optional `partition` restricts the scan to that pid,
+including storage-page bounds, with no interleaved hot work. Both use the same
+retention checks. Status exposes job ID, state, scope, current group, counts,
+logical record bytes, start/finish timestamps and errors. Estimates are local
+snapshots, not reservations or predicted filesystem savings.
+
+`tourctl node gc ADDRESS [--partition PID] [--dry-run] [--wait] [--timeout 60]
+[--json]` targets the peer endpoint. `node.gc` acknowledges submission only;
+`--wait` polls `node.gc.status` for that exact job, with a bounded wait that
+never cancels server work. Already queued/running requests are rejected.
+Failures and cancellation produce nonzero CLI exits; JSON failure output is
+structured on stderr. `node inspect` includes the worker and latest pass in
+text and JSON, without a separate CLI status command. The worker retains at
+most 64 completed job results in memory; expired or unknown IDs are rejected
+explicitly. The status describes scan progress, not a precomputed percentage
+or interleaved hot work. Human output uses binary byte units; JSON keeps exact
+integers. There is no force, compaction, policy mutation or cluster-wide
+collection option.
 
 The contract preserves current state under the replication requested at write time; it does not retain history indefinitely. Free backend pages can be reused, but file size need not decrease after GC.
 

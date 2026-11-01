@@ -13,13 +13,14 @@
 # limitations under the License.
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 
 from tourillon.core.gossip.gossiper import GossipStats
 from tourillon.core.gossip.registry import MemberRegistry
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer.pool import PeerPool
+from tourlib.models.gc import GcInfo
 from tourlib.models.inspect import (
     MemberInspect,
     NodeInfo,
@@ -39,12 +40,14 @@ class NodeInspector:
         peer_pool: PeerPool,
         partitioner: Partitioner,
         topologymgr: TopologyManager,
+        gc_snapshot: Callable[[], GcInfo],
     ) -> None:
         self._node_id = node_id
         self._stats = stats
         self._peer_pool = peer_pool
         self._partitioner = partitioner
         self._topologymgr = topologymgr
+        self._gc_snapshot = gc_snapshot
 
     async def inspect(self, request: NodeInspectRequest) -> AsyncIterator[NodeInfo]:
         topology = await self._topologymgr.snapshot()
@@ -61,6 +64,7 @@ class NodeInspector:
         node_ids = self._collect_node_ids(member_by_id, request)
         chunk_size = min(self.INSPECT_CHUNK_SIZE, request.limit)
         gossip_stats = self._stats.to_dict()
+        gc_info = self._gc_snapshot()
 
         if not node_ids:
             yield self._build_chunk(
@@ -73,6 +77,7 @@ class NodeInspector:
                 gossip_stats=gossip_stats,
                 ring_position=ring_position,
                 self_member=self_member,
+                gc_info=gc_info,
             )
             return
 
@@ -89,6 +94,7 @@ class NodeInspector:
                 gossip_stats=gossip_stats,
                 ring_position=ring_position,
                 self_member=self_member,
+                gc_info=gc_info,
             )
             # yield loop
             await asyncio.sleep(0)
@@ -220,12 +226,14 @@ class NodeInspector:
         gossip_stats: dict[str, int | str | None],
         ring_position: RingPositionInspect,
         self_member: MemberInspect,
+        gc_info: GcInfo,
     ) -> NodeInfo:
         end = (chunk_index + 1) * chunk_size
         has_more = end < total_nodes
         next_cursor = chunk_ids[-1] if has_more else None
         return NodeInfo(
             node_id=self._node_id,
+            gc=gc_info,
             snapshot_at=snapshot_at,
             chunk_index=chunk_index,
             has_more=has_more,

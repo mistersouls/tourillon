@@ -17,9 +17,44 @@ from cyclopts import App
 from tourctl.bootstrap.usecases.common import GlobalOptions
 from tourctl.core import inspect_node
 from tourctl.core.nodedrain import drain
+from tourctl.core.nodegc import collect
 from tourctl.core.nodejoin import join
 
 node_app = App(name="node", help="Node lifecycle and inspection commands.")
+
+
+@node_app.command(name="gc")
+async def node_gc(
+    address: str,
+    *,
+    dry_run: bool = False,
+    partition: int | None = None,
+    wait: bool = False,
+    timeout: float = 60.0,
+    json: bool = False,
+    opts: GlobalOptions | None = None,
+) -> str:
+    """Submit local historical GC; never purge current state or compact files.
+
+    :param address: Target node's peer endpoint.
+    :param dry_run: Estimate without modifying storage.
+    :param partition: Restrict the pass to this partition; default is all local partitions.
+    :param wait: Wait for this job's completion, without cancelling on timeout.
+    :param timeout: Maximum wait in seconds when --wait is used.
+    :param json: Return exact structured counts instead of human-readable units.
+    :param opts: Client configuration and context options.
+    """
+    opts = opts or GlobalOptions()
+    return await collect(
+        address,
+        dry_run=dry_run,
+        partition=partition,
+        wait=wait,
+        timeout=timeout,
+        as_json=json,
+        tourconf=opts.tourconf,
+        context_name=opts.context,
+    )
 
 
 @node_app.command(name="inspect")

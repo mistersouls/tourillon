@@ -14,6 +14,7 @@
 
 import ssl
 from collections.abc import AsyncIterator
+from dataclasses import asdict
 
 import pytest
 
@@ -22,6 +23,7 @@ from tourclient.core import InspectService, Transport
 from tourlib.adapter import MsgPackSerializer
 from tourlib.envelope import Envelope, replay_envelope
 from tourlib.exceptions import ResponseError
+from tourlib.models.gc import GcInfo, GcStatus
 from tourlib.models.inspect import NodeInspectRequest
 
 
@@ -35,6 +37,7 @@ def _node_info_document(
     self_member: dict[str, object] | None = None,
 ) -> dict[str, object]:
     payload = {
+        "gc": asdict(GcInfo(True, 2, 600, 0, GcStatus())),
         "node_id": "node-3",
         "snapshot_at": "2026-08-16T09:15:20Z",
         "chunk_index": chunk_index,
@@ -63,6 +66,22 @@ def _node_info_document(
         "epoch": 3,
     }
     return payload
+
+
+@pytest.mark.parametrize("gc", [None, {}, {"running": True}])
+def test_inspection_rejects_missing_or_invalid_gc_status(gc) -> None:
+    from tourclient.core.services.inspect import _node_info_from_document
+
+    payload = _node_info_document(
+        chunk_index=0,
+        has_more=False,
+        next_cursor=None,
+        members=[],
+        gossip_stats={},
+    )
+    payload["gc"] = gc
+    with pytest.raises(ResponseError, match="response gc"):
+        _node_info_from_document(payload)
 
 
 @pytest.mark.asyncio

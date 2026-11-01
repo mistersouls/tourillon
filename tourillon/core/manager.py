@@ -132,6 +132,7 @@ class Manager:
             gc=self._gc,
         )
         self._inspector = NodeInspector(
+            gc_snapshot=self._gc.inspect,
             node_id=self._config.node.id,
             stats=self._gossip_stats,
             partitioner=self._partitioner,

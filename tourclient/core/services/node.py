@@ -19,6 +19,7 @@ from tourclient.core import Transport
 from tourclient.exception import RequestRejectedError
 from tourlib import Serializer
 from tourlib.exceptions import ResponseError
+from tourlib.models.gc import GcRequest, GcResponse, GcStatusRequest
 from tourlib.models.node import DrainRequest, DrainResponse, JoinRequest, JoinResponse
 
 
@@ -30,6 +31,34 @@ class NodeService:
     ) -> None:
         self._transport = transport
         self._serializer = serializer
+
+    async def gc(self, request: GcRequest) -> GcResponse:
+        """Submit a local pass without waiting for its completion."""
+        return await self._gc_request("node.gc", request)
+
+    async def gc_status(self, job_id: str) -> GcResponse:
+        """Read an exact job, even if a newer pass has since started."""
+        return await self._gc_request("node.gc.status", GcStatusRequest(job_id))
+
+    async def _gc_request(
+        self, kind: str, request: GcRequest | GcStatusRequest
+    ) -> GcResponse:
+        response = await self._transport.request(kind=kind, document=request)
+        if response.kind not in {f"{kind}.accept", f"{kind}.reject"}:
+            raise ResponseError(f"Unexpected GC response kind: {response.kind}")
+        document = self._serializer.decode(response.payload)
+        if response.kind == f"{kind}.reject":
+            if (
+                not isinstance(document, Mapping)
+                or not isinstance(document.get("message"), str)
+                or not document["message"]
+            ):
+                raise ResponseError("Invalid GC rejection payload")
+            raise RequestRejectedError(kind, dict(document))
+        try:
+            return GcResponse.from_document(document)
+        except (TypeError, ValueError) as exc:
+            raise ResponseError("Invalid GC response payload") from exc
 
     async def join(self, req: JoinRequest) -> JoinResponse:
         req = req or JoinRequest()
