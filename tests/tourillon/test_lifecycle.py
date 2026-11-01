@@ -159,6 +159,7 @@ def _build_lifecycle(
         min_size=pool_opts.min_size,
         max_size=pool_opts.max_size,
         max_overflow=pool_opts.max_overflow,
+        priority_size=pool_opts.priority_size,
         idle_ttl=pool_opts.idle_ttl,
     )
     partitioner = Partitioner(hashspace=HashSpace(bits=128), pshift=17, gshift=5)
@@ -266,7 +267,11 @@ async def test_lifecycle_configures_peer_pool_from_transport_pool_options(
         server_peer=PeerServerConfig(bind="127.0.0.1:7001", advertise="127.0.0.1:7001"),
         transport=TransportConfig(
             pool=TransportPoolConfig(
-                min_size=2, max_size=7, max_overflow=3, idle_ttl=9.5
+                min_size=2,
+                max_size=7,
+                max_overflow=3,
+                priority_size=1,
+                idle_ttl=9.5,
             )
         ),
     )
@@ -275,6 +280,7 @@ async def test_lifecycle_configures_peer_pool_from_transport_pool_options(
     assert lifecycle._peer_pool._min_size == 2
     assert lifecycle._peer_pool._max_size == 7
     assert lifecycle._peer_pool._max_overflow == 3
+    assert lifecycle._peer_pool._priority_size == 1
     assert lifecycle._peer_pool._idle_ttl == 9.5
 
 

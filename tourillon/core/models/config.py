@@ -431,6 +431,7 @@ class TransportPoolConfig:
     min_size: int = 32
     max_size: int = 256
     max_overflow: int = 8
+    priority_size: int = 2
     idle_ttl: float = 60 * 10
 
     def to_document(self) -> dict[str, Any]:
@@ -438,6 +439,7 @@ class TransportPoolConfig:
             "min_size": self.min_size,
             "max_size": self.max_size,
             "max_overflow": self.max_overflow,
+            "priority_size": self.priority_size,
             "idle_ttl": self.idle_ttl,
         }
 
@@ -460,6 +462,12 @@ class TransportPoolConfig:
         if not isinstance(max_overflow, int) or max_overflow < 0:
             raise ValidationError("transport.pool.max_overflow must be an integer >= 0")
 
+        priority_size = document.get("priority_size", 2)
+        if not isinstance(priority_size, int) or priority_size < 0:
+            raise ValidationError(
+                "transport.pool.priority_size must be an integer >= 0"
+            )
+
         idle_ttl = document.get("idle_ttl", 60 * 10)
         if not isinstance(idle_ttl, int | float) or idle_ttl <= 0:
             raise ValidationError("transport.pool.idle_ttl must be a number > 0")
@@ -468,6 +476,7 @@ class TransportPoolConfig:
             min_size=min_size,
             max_size=max_size,
             max_overflow=max_overflow,
+            priority_size=priority_size,
             idle_ttl=float(idle_ttl),
         )
 

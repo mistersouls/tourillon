@@ -392,7 +392,8 @@ async def test_pool_telemetry_records_lru_eviction(
         telemetry=telemetry,
     )
 
-    await pool.acquire("peer-a")
+    peer_a = await pool.acquire("peer-a")
+    await pool.release("peer-a", peer_a)
     await pool.acquire("peer-b")
 
     evict_key = _label_key({"reason": "lru_evict"})
@@ -417,8 +418,8 @@ async def test_pool_telemetry_records_overflow_release_eviction(
     )
 
     await pool.acquire("peer-a")
-    await pool.acquire("peer-b")
-    await pool.release("peer-b")
+    peer_b = await pool.acquire("peer-b")
+    await pool.release("peer-b", peer_b)
 
     evict_key = _label_key({"reason": "overflow_release"})
     assert telemetry._pool_evictions_total.values[evict_key] == 1
@@ -442,8 +443,8 @@ async def test_pool_telemetry_records_idle_expired_eviction(
         telemetry=telemetry,
     )
 
-    await pool.acquire("peer-a")
-    await pool.release("peer-a")
+    peer_a = await pool.acquire("peer-a")
+    await pool.release("peer-a", peer_a)
     await asyncio.sleep(0.02)
     await pool._remove_expired()
 
@@ -472,13 +473,13 @@ async def test_pool_telemetry_records_promotion(
     )
 
     # fill permanents
-    await pool.acquire("peer-a")
+    peer_a = await pool.acquire("peer-a")
     await pool.acquire("peer-b")
     # add overflow
     await pool.acquire("peer-c")
 
     # release peer-a and let it expire so a permanent slot opens up
-    await pool.release("peer-a")
+    await pool.release("peer-a", peer_a)
     await asyncio.sleep(0.02)
     await pool._remove_expired()
     await pool._try_promote_overflow()
@@ -541,9 +542,10 @@ async def test_pool_telemetry_records_refresh_eviction_and_new_connection(
         telemetry=telemetry,
     )
 
-    await pool.acquire("peer-a")
+    peer_a = await pool.acquire("peer-a")
     topologymgr.binds["peer-a"] = "127.0.0.1:5000"
     await pool.acquire("peer-a")
+    await pool.release("peer-a", peer_a)
 
     evict_key = _label_key({"reason": "refresh"})
     conn_key = _label_key({"type": "permanent"})

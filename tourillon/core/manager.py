@@ -79,6 +79,7 @@ class Manager:
             min_size=config.transport.pool.min_size,
             max_size=config.transport.pool.max_size,
             max_overflow=config.transport.pool.max_overflow,
+            priority_size=config.transport.pool.priority_size,
             idle_ttl=config.transport.pool.idle_ttl,
         )
         self._placement_strategy = SimplePlacementStrategy(

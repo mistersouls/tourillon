@@ -412,7 +412,9 @@ class Gossiper:
                 }
                 envelope = self._build_envelope("gossip.push", payload)
 
-                async with self._peer_pool.lease(target.node_id) as client:
+                async with self._peer_pool.lease(
+                    target.node_id, priority=True
+                ) as client:
                     resp = await client.request(envelope)
 
                 if resp.kind == "gossip.error":
@@ -451,7 +453,6 @@ class Gossiper:
                 target.node_id,
                 error_msg,
             )
-            code = data.get("code", "")
         except Exception as exc:
             logger.warning(
                 "gossip.push rejected by peer node_id=%s target=%s cid=%.8s "
@@ -460,17 +461,6 @@ class Gossiper:
                 target.node_id,
                 envelope.correlation_id,
                 exc,
-            )
-            code = ""
-
-        if code == "todo: critical error should trigger stopping program":
-            # not implemented yet
-            logger.critical(
-                "gossip.push critical error received; stopping "
-                "node_id=%s target=%s cid=%.8s",
-                self._node_id,
-                target.node_id,
-                envelope.correlation_id,
             )
 
     async def _run_ae_cycle(self) -> None:
@@ -493,7 +483,7 @@ class Gossiper:
             attributes={"peer": peer.node_id},
         ) as span:
             try:
-                async with self._peer_pool.lease(peer.node_id) as client:
+                async with self._peer_pool.lease(peer.node_id, priority=True) as client:
                     await self._ae_exchange(peer, client)
             except _PEER_ERRORS as exc:
                 span.record_exception(exc)

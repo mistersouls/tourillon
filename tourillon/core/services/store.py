@@ -955,7 +955,7 @@ class StoreService:
                 )
                 response = await client.request(envelope)
             finally:
-                await self._peer_pool.release(node_id)
+                await self._peer_pool.release(node_id, client)
 
             expected = f"{kind}.accept"
             if response.kind != expected:

@@ -189,6 +189,15 @@ def test_envelope_client_pool_requires_positive_max_size(
             telemetry=telemetry,
         )
 
+    with pytest.raises(ValueError, match="priority_size must be >= 0"):
+        PeerPool(
+            tls_ctx=tls_ctx,
+            topologymgr=_as_topologymgr(topologymgr),
+            fd_provider=fd_provider,
+            priority_size=-1,
+            telemetry=telemetry,
+        )
+
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
@@ -274,8 +283,41 @@ async def test_acquire_recreates_client_when_bind_changes(
     new_client = await _acquire_fake_client(pool, "peer-a")
 
     assert new_client is not old_client
+    assert _close_calls(old_client) == 0
+    await pool.release("peer-a", old_client)
     assert _close_calls(old_client) == 1
     assert new_client.bind == "127.0.0.1:5000"
+    await pool.release("peer-a", new_client)
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_refresh_keeps_old_client_open_until_all_leases_release(
+    tls_ctx: ssl.SSLContext,
+    telemetry: Telemetry,
+    fd_provider: FailureDetectorProvider,
+) -> None:
+    topologymgr = _TopologyManagerStub()
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        telemetry=telemetry,
+    )
+
+    old_client = await _acquire_fake_client(pool, "peer-a")
+    assert await pool.acquire("peer-a") is old_client
+    topologymgr.binds["peer-a"] = "127.0.0.1:5000"
+    new_client = await _acquire_fake_client(pool, "peer-a")
+
+    await pool.release("peer-a", old_client)
+    assert _close_calls(old_client) == 0
+    assert pool._permanents["peer-a"].refcount == 1
+
+    await pool.release("peer-a", old_client)
+    assert _close_calls(old_client) == 1
+    await pool.release("peer-a", new_client)
+    assert pool._permanents["peer-a"].refcount == 0
 
 
 @pytest.mark.tourillon
@@ -295,11 +337,13 @@ async def test_acquire_evicts_lru_when_max_size_is_reached(
     )
 
     old_client = await _acquire_fake_client(pool, "peer-a")
+    await pool.release("peer-a", old_client)
     new_client = await _acquire_fake_client(pool, "peer-b")
 
     assert new_client.bind == "127.0.0.1:5000"
     assert _close_calls(old_client) == 1
 
+    await pool.release("peer-b", new_client)
     again = await pool.acquire("peer-a")
     assert again.bind == "127.0.0.1:4000"
 
@@ -330,7 +374,7 @@ async def test_acquire_uses_ephemeral_client_when_pool_is_full_and_all_clients_a
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_acquire_fails_when_pool_is_full_and_busy_without_fallback(
+async def test_acquire_does_not_evict_a_busy_peer_when_pool_is_saturated(
     tls_ctx: ssl.SSLContext,
     telemetry: Telemetry,
     fd_provider: FailureDetectorProvider,
@@ -343,13 +387,87 @@ async def test_acquire_fails_when_pool_is_full_and_busy_without_fallback(
         max_overflow=0,
         telemetry=telemetry,
     )
-    await pool.acquire("peer-a")
     old_client = await _acquire_fake_client(pool, "peer-a")
+    assert await pool.acquire("peer-a") is old_client
 
-    new_client = await _acquire_fake_client(pool, "peer-b")
+    with pytest.raises(TimeoutError, match="pool is saturated"):
+        await pool.acquire("peer-b")
 
-    assert _close_calls(old_client) == 1
-    assert new_client is not old_client
+    assert _close_calls(old_client) == 0
+    assert pool._permanents["peer-a"].refcount == 2
+    await pool.release("peer-a", old_client)
+    await pool.release("peer-a", old_client)
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_priority_acquire_bypasses_saturated_pool_without_evicting_active_peer(
+    tls_ctx: ssl.SSLContext,
+    telemetry: Telemetry,
+    fd_provider: FailureDetectorProvider,
+) -> None:
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(_TopologyManagerStub()),
+        fd_provider=fd_provider,
+        max_size=1,
+        max_overflow=0,
+        priority_size=1,
+        telemetry=telemetry,
+    )
+    busy_client = await _acquire_fake_client(pool, "peer-a")
+
+    priority_client = await pool.acquire("peer-b", priority=True)
+
+    assert priority_client is not busy_client
+    assert _close_calls(busy_client) == 0
+    assert "peer-b" in pool._priority_reserve
+
+    with pytest.raises(TimeoutError, match="pool is saturated"):
+        await pool.acquire("peer-c")
+
+    with pytest.raises(TimeoutError, match="priority reserve is full"):
+        await pool.acquire("peer-c", priority=True)
+
+    assert len(pool._priority_reserve) == 1
+    await pool.release("peer-b", priority_client)
+    assert _close_calls(priority_client) == 1
+    assert _close_calls(busy_client) == 0
+    await pool.release("peer-a", busy_client)
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_refresh_connection_failure_keeps_old_client_and_lease(
+    tls_ctx: ssl.SSLContext,
+    telemetry: Telemetry,
+    fd_provider: FailureDetectorProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topologymgr = _TopologyManagerStub()
+    pool = PeerPool(
+        tls_ctx=tls_ctx,
+        topologymgr=_as_topologymgr(topologymgr),
+        fd_provider=fd_provider,
+        telemetry=telemetry,
+    )
+    old_client = await _acquire_fake_client(pool, "peer-a")
+    topologymgr.binds["peer-a"] = "127.0.0.1:5000"
+
+    class _RefusingClient(_FakeEnvelopeClient):
+        async def connect(self) -> None:
+            raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr("tourillon.core.peer.pool.PeerClient", _RefusingClient)
+
+    with pytest.raises(ConnectionRefusedError, match="refused"):
+        await pool.acquire("peer-a")
+
+    assert pool._permanents["peer-a"].client is old_client
+    assert pool._permanents["peer-a"].refcount == 1
+    assert _close_calls(old_client) == 0
+    assert _close_calls(_FakeEnvelopeClient.created[-1]) == 1
+    await pool.release("peer-a", old_client)
 
 
 @pytest.mark.tourillon
@@ -369,7 +487,7 @@ async def test_acquire_refreshes_expired_idle_client(
     )
 
     old_client = await _acquire_fake_client(pool, "peer-a")
-    await pool.release("peer-a")
+    await pool.release("peer-a", old_client)
     await asyncio.sleep(0.02)
     await pool._remove_expired()
     new_client = await _acquire_fake_client(pool, "peer-a")
@@ -434,8 +552,8 @@ async def test_release_and_close_all_close_clients(
     second = await _acquire_fake_client(pool, "peer-b")
 
     # overflow is closed on release when no user keeps a reference.
-    await pool.release("peer-a")
-    await pool.release("peer-b")
+    await pool.release("peer-a", first)
+    await pool.release("peer-b", second)
     assert _close_calls(first) == 0
     assert _close_calls(second) == 1
 
@@ -526,11 +644,11 @@ async def test_release_stops_detector_when_overflow_peer_is_removed(
     )
 
     await _acquire_fake_client(pool, "peer-a")
-    await _acquire_fake_client(pool, "peer-b")
+    overflow_client = await _acquire_fake_client(pool, "peer-b")
     overflow_fd = pool.failure_detector("peer-b")
     assert overflow_fd is not None
 
-    await pool.release("peer-b")
+    await pool.release("peer-b", overflow_client)
 
     assert isinstance(overflow_fd, _FakeDetector)
     assert overflow_fd.stop_calls == 1

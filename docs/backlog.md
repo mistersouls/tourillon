@@ -38,9 +38,6 @@ Use [`.github/prompts/fix-bug.prompt.md`](../.github/prompts/fix-bug.prompt.md) 
 
 | # | Item | Evidence |
 | --- | --- | --- |
-| C2 | **A leaked refcount makes a pooled connection unreclaimable, and the pool then evicts connections that are in use.** `_remove_expired` only reaps entries whose `refcount == 0`, and an overflow connection is only closed when a `release()` brings it to zero — neither can happen for a peer that gossip has talked to. Once `max_size` and `max_overflow` are both saturated, every new acquisition takes the LRU branch, which closes a permanent connection **without checking its refcount**, aborting any request in flight on it. | `tourillon/core/peer/pool.py:273`, `tourillon/core/peer/pool.py:279`, `tourillon/core/peer/pool.py:183` (`refcount == 0` conditions), `tourillon/core/peer/pool.py:154-156` (LRU eviction ignores refcount) |
-| C3 | **A peer that changes its bind address resets the refcount of concurrent holders.** `_may_refresh_peer` reconnects and sets `peer.refcount = 1`, discarding the count of callers already holding the old client. Their `release()` calls then drive the counter negative, so `refcount == 0` never holds again and the entry is pinned for the life of the process. The same reconnection also closes the old client under those in-flight requests. | `tourillon/core/peer/pool.py:245-251` |
-| C5 | **Dead placeholder branch on the gossip error path.** `_handle_push_error` compares the peer's error code against the literal string `"todo: critical error should trigger stopping program"`, which no handler ever emits, and the branch only logs. There is no protocol-level way for a peer to signal a fatal condition, and no other handler emits a fatal code either. | `tourillon/core/gossip/gossiper.py:399-407` |
 
 ---
 

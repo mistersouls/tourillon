@@ -341,7 +341,7 @@ class _PeerPoolStub:
         self.acquire_calls.append(peer_id)
         return self._client
 
-    async def release(self, peer_id: str) -> None:
+    async def release(self, peer_id: str, client: object | None = None) -> None:
         self.release_calls.append(peer_id)
 
 

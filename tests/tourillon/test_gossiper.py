@@ -255,6 +255,7 @@ class _FakePool:
         self._error = error
         self.calls: list[str] = []
         self.released: list[str] = []
+        self.priority_requests: list[bool] = []
 
     async def acquire(self, node_id: str) -> _FakeClient:
         self.calls.append(node_id)
@@ -264,7 +265,10 @@ class _FakePool:
         return self._client
 
     @contextlib.asynccontextmanager
-    async def lease(self, node_id: str) -> AsyncIterator[_FakeClient]:
+    async def lease(
+        self, node_id: str, *, priority: bool = False
+    ) -> AsyncIterator[_FakeClient]:
+        self.priority_requests.append(priority)
         client = await self.acquire(node_id)
         try:
             yield client
@@ -529,6 +533,8 @@ async def test_gossiper_push_member_and_send_push_paths_cover_success_and_errors
     assert telemetry.gossip_push_attempt_total.total >= 4
     assert telemetry.gossip_push_error_total.total >= 3
     assert "cid=" in caplog.text
+    assert pool.priority_requests
+    assert all(pool.priority_requests)
 
 
 @pytest.mark.tourillon

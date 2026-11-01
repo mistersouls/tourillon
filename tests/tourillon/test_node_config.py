@@ -815,6 +815,7 @@ def test_tourillon_config_from_document_with_gossip_and_transport_pool() -> None
                 "min_size": 4,
                 "max_size": 64,
                 "max_overflow": 16,
+                "priority_size": 3,
                 "idle_ttl": 42,
             }
         },
@@ -842,6 +843,7 @@ def test_tourillon_config_from_document_with_gossip_and_transport_pool() -> None
         min_size=4,
         max_size=64,
         max_overflow=16,
+        priority_size=3,
         idle_ttl=42.0,
     )
     assert config.placement == PlacementConfig(replication_factor=5)
@@ -887,6 +889,21 @@ def test_tourillon_config_rejects_invalid_gossip_and_transport_pool_values() -> 
                     "pool": {
                         "min_size": 10,
                         "max_size": 1,
+                    }
+                },
+            }
+        )
+
+    with pytest.raises(
+        ValidationError,
+        match="transport.pool.priority_size must be an integer >= 0",
+    ):
+        TourillonConfig.from_document(
+            {
+                **base_doc,
+                "transport": {
+                    "pool": {
+                        "priority_size": -1,
                     }
                 },
             }
