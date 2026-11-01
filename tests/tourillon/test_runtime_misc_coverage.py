@@ -245,12 +245,45 @@ async def test_gossip_bootstrapper_exchange_and_attempt_seed(
         lambda address, tls_ctx, logger: clients[address],
     )
 
-    results = [False, False]
+    results: list[str | None] = ["no response", "no response"]
     await bootstrapper._attempt_seed("ok:9000", results, 0)  # noqa: SLF001
     await bootstrapper._attempt_seed("bad:9000", results, 1)  # noqa: SLF001
-    assert results == [True, False]
+    assert results == [None, "OSError: down"]
     assert clients["ok:9000"].closed is True
     assert clients["bad:9000"].closed is True
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_gossip_bootstrapper_attempt_reports_every_seed_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tourillon.core.exceptions import BootstrapAttemptError
+
+    bootstrapper = GossipBootstrapper(
+        node_id="node-a",
+        serializer=MsgPackSerializer(),
+        topologymgr=TopologyManager(),
+        backoff=SimpleNamespace(
+            initial_delay=0.01, max_retries=1, jitter=0.0, factor=2.0, max_delay=1.0
+        ),
+        tls_client=ssl.create_default_context(),
+    )
+    clients = {
+        "a:9000": _BootstrapClient(connect_error=OSError("refused")),
+        "b:9000": _BootstrapClient(connect_error=TimeoutError()),
+    }
+    monkeypatch.setattr(
+        "tourillon.core.gossip.bootstrapper.EnvelopeClient",
+        lambda address, tls_ctx, logger: clients[address],
+    )
+
+    with pytest.raises(BootstrapAttemptError) as raised:
+        await bootstrapper._attempt(("a:9000", "b:9000"))  # noqa: SLF001
+
+    assert str(raised.value) == (
+        "no seed responded: a:9000 (OSError: refused); b:9000 (TimeoutError)"
+    )
 
 
 @pytest.mark.tourillon
@@ -350,7 +383,6 @@ async def test_manager_start_stop_inspect_join_and_serve_forever(
     assert manager.seeds is None
     assert manager.serializer is not None
     assert manager.gossip is manager._gossip  # noqa: SLF001
-    assert manager.transfer is manager._transfer  # noqa: SLF001
     assert manager.telemetry is manager._telemetry  # noqa: SLF001
     assert manager.store is manager._store  # noqa: SLF001
 

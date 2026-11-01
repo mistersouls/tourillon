@@ -235,7 +235,7 @@ def then_command_reports_node_startup(node_start_context: dict[str, object]) -> 
     assert isinstance(stderr, str)
     assert isinstance(node_id, str)
     assert isinstance(returncode, int)
-    assert f"Manager started for node '{node_id}'" in stderr
+    assert f"Node '{node_id}' started; serving until stopped" in stderr
 
 
 @then("the node process is terminated after startup")

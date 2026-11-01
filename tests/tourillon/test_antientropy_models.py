@@ -206,12 +206,14 @@ def test_anti_entropy_config_round_trips_through_placement() -> None:
         jitter=0.0,
         grace=30.0,
         settle_delay=1.0,
+        settle_quiet=0.25,
         concurrency=2,
         pids_per_cycle=1 << 17,
         keys_per_request=1 << 20,
         max_batch_bytes=1 << 30,
         max_repairs_per_cycle=5,
         max_keys_per_cycle=7,
+        hotqueue_size=3,
     )
 
     placement = PlacementConfig(anti_entropy=config)
@@ -227,9 +229,11 @@ def test_anti_entropy_config_round_trips_through_placement() -> None:
         {"sweep_period": "fast"},
         {"jitter": 1.5},
         {"grace": -1},
+        {"settle_quiet": -0.5},
         {"concurrency": 0},
         {"keys_per_request": True},
         {"max_keys_per_cycle": 0},
+        {"hotqueue_size": 0},
     ],
 )
 def test_anti_entropy_config_rejects_invalid_values(document: dict[str, Any]) -> None:

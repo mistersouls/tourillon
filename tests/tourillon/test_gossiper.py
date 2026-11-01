@@ -181,7 +181,6 @@ class _TelemetryRecorder:
         self._gossip_ae_cycle_total = _Counter()
         self._gossip_hot_queue_size = _Gauge()
         self._gossip_ae_diverged = _Counter()
-        self._gossip_last_ae_peer = _Gauge()
         self._gossip_last_ae_at = _Gauge()
         self._gossip_failed_announcements_total = _Counter()
         self.spans: list[tuple[str, dict[str, AttributeValue], _SpanRecorder]] = []
@@ -205,10 +204,6 @@ class _TelemetryRecorder:
     @property
     def gossip_ae_diverged(self) -> _Counter:
         return self._gossip_ae_diverged
-
-    @property
-    def gossip_last_ae_peer(self) -> _Gauge:
-        return self._gossip_last_ae_peer
 
     @property
     def gossip_last_ae_at(self) -> _Gauge:
@@ -260,6 +255,7 @@ class _FakePool:
         self._error = error
         self.calls: list[str] = []
         self.released: list[str] = []
+        self.priority_requests: list[bool] = []
 
     async def acquire(self, node_id: str) -> _FakeClient:
         self.calls.append(node_id)
@@ -269,7 +265,10 @@ class _FakePool:
         return self._client
 
     @contextlib.asynccontextmanager
-    async def lease(self, node_id: str) -> AsyncIterator[_FakeClient]:
+    async def lease(
+        self, node_id: str, *, priority: bool = False
+    ) -> AsyncIterator[_FakeClient]:
+        self.priority_requests.append(priority)
         client = await self.acquire(node_id)
         try:
             yield client
@@ -534,6 +533,8 @@ async def test_gossiper_push_member_and_send_push_paths_cover_success_and_errors
     assert telemetry.gossip_push_attempt_total.total >= 4
     assert telemetry.gossip_push_error_total.total >= 3
     assert "cid=" in caplog.text
+    assert pool.priority_requests
+    assert all(pool.priority_requests)
 
 
 @pytest.mark.tourillon
@@ -579,7 +580,6 @@ async def test_gossiper_ae_cycle_ping_pong_and_digest_delta_paths(
     assert snapshot.registry.get("node-c") is not None
     assert telemetry.gossip_ae_cycle_total.total == 1
     assert telemetry.gossip_ae_diverged.total == 1
-    assert telemetry.gossip_last_ae_peer.value > 0
     assert telemetry.gossip_last_ae_at.value > 0
 
     ae_error = Envelope(
@@ -818,3 +818,57 @@ async def test_gossiper_relay_drops_spent_budget_idle_engine_and_overflow() -> N
     engine._is_running = lambda: False  # type: ignore[method-assign]
     engine.relay([member], 3, "node-b")
     assert not engine._relay_tasks and pool.calls == []
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "rendered"),
+    [
+        (ConnectionRefusedError("refused"), "ConnectionRefusedError: refused"),
+        (TimeoutError(), "TimeoutError"),
+    ],
+)
+async def test_gossiper_send_push_reports_unreachable_peer(
+    caplog: pytest.LogCaptureFixture, error: Exception, rendered: str
+) -> None:
+    telemetry = _TelemetryRecorder()
+    topology = TopologyManager()
+    await topology.merge_registry((_member("node-a"), _member("node-b")))
+    engine = Gossiper(
+        node_id="node-a",
+        config=GossipConfig(),
+        stats=GossipStats(),
+        topologymgr=topology,
+        peer_pool=cast(PeerPool, cast(object, _FakePool(error=error))),
+        serializer=_MapSerializer(),
+        telemetry=cast(Telemetry, cast(object, telemetry)),
+    )
+
+    with caplog.at_level("WARNING"):
+        await engine._send_push(_member("node-x", epoch=1), _member("node-b"))
+
+    assert telemetry.gossip_push_error_total.total == 1
+    assert (
+        f"gossip.push failed node_id=node-a target=node-b error={rendered}"
+        in caplog.messages
+    )
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_gossiper_send_push_lets_programming_errors_escape() -> None:
+    topology = TopologyManager()
+    await topology.merge_registry((_member("node-a"), _member("node-b")))
+    engine = Gossiper(
+        node_id="node-a",
+        config=GossipConfig(),
+        stats=GossipStats(),
+        topologymgr=topology,
+        peer_pool=cast(PeerPool, cast(object, _FakePool(error=RuntimeError("bug")))),
+        serializer=_MapSerializer(),
+        telemetry=cast(Telemetry, cast(object, _TelemetryRecorder())),
+    )
+
+    with pytest.raises(RuntimeError, match="bug"):
+        await engine._send_push(_member("node-x", epoch=1), _member("node-b"))

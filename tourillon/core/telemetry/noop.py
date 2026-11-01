@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 
 from tourillon.core.models.config import TelemetryConfig
 from tourillon.core.ports.telemetry import (
@@ -22,6 +22,7 @@ from tourillon.core.ports.telemetry import (
     BoundGauge,
     CounterMetric,
     GaugeMetric,
+    HistogramMetric,
     Span,
     Telemetry,
     TelemetryProvider,
@@ -66,6 +67,17 @@ class _NoopGaugeMetric(GaugeMetric):
     def labels(self, **labels: AttributeValue) -> BoundGauge:
         _ = labels
         return _NoopBoundGauge()
+
+
+class _NoopHistogramMetric(HistogramMetric):
+    def record(
+        self,
+        value: int | float,
+        *,
+        attributes: Attributes | None = None,
+    ) -> None:
+        _ = value
+        _ = attributes
 
 
 class _NoopSpan(Span):
@@ -161,15 +173,47 @@ class NoopTelemetry(Telemetry):
         return _NoopCounterMetric()
 
     @property
-    def gossip_last_ae_peer(self) -> GaugeMetric:
-        return _NoopGaugeMetric()
-
-    @property
     def gossip_last_ae_at(self) -> GaugeMetric:
         return _NoopGaugeMetric()
 
     @property
     def gossip_failed_announcements_total(self) -> CounterMetric:
+        return _NoopCounterMetric()
+
+    @property
+    def kv_requests_total(self) -> CounterMetric:
+        return _NoopCounterMetric()
+
+    @property
+    def kv_request_duration_seconds(self) -> HistogramMetric:
+        return _NoopHistogramMetric()
+
+    @property
+    def replication_failures_total(self) -> CounterMetric:
+        return _NoopCounterMetric()
+
+    @property
+    def read_repairs_total(self) -> CounterMetric:
+        return _NoopCounterMetric()
+
+    @property
+    def obligations_total(self) -> CounterMetric:
+        return _NoopCounterMetric()
+
+    @property
+    def ae_sessions_total(self) -> CounterMetric:
+        return _NoopCounterMetric()
+
+    @property
+    def ae_versions_total(self) -> CounterMetric:
+        return _NoopCounterMetric()
+
+    @property
+    def ae_bytes_total(self) -> CounterMetric:
+        return _NoopCounterMetric()
+
+    @property
+    def ae_sweeps_total(self) -> CounterMetric:
         return _NoopCounterMetric()
 
     def start_span(
@@ -181,6 +225,13 @@ class NoopTelemetry(Telemetry):
         _ = name
         _ = attributes
         return _NoopSpanContext()
+
+    def inject_context(self) -> bytes:
+        return b""
+
+    def extract_context(self, data: bytes) -> AbstractContextManager[None]:
+        _ = data
+        return nullcontext()
 
     async def close(self) -> None:
         return None

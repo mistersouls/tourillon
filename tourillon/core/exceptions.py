@@ -248,13 +248,6 @@ class ProcessError(Exception):
     """
 
 
-class TransferError(Exception):
-    """
-    Raised when there is an error during
-    the transfer process of the node.
-    """
-
-
 class DataStorageError(Exception):
     """
     Raised when there is an error during

@@ -24,9 +24,12 @@ client traffic:
   transaction each, so the single writer of a group is held for one batch at
   a time and client writes interleave between batches.
 
-``put_many`` is idempotent, never downgrades an owned version and promotes a
-local HINT or STAGING copy of the same version, so applying a version that
-is already present, or applying it twice, changes nothing.
+``put_many`` is idempotent and never overwrites a stored version, so
+applying a version that is already present, or applying it twice, changes
+nothing.
+
+Replication obligations (META) are read and removed here too: they are the
+durable work list of the delivery worker.
 """
 
 import asyncio
@@ -35,7 +38,7 @@ from itertools import groupby
 
 from tourillon.core.log import logger
 from tourillon.core.models.antientropy import record_size
-from tourillon.core.models.storageschema import Key, Keyspace, Record
+from tourillon.core.models.storageschema import Key, Keyspace, ObligationKey, Record
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.ports.storage import Storage
 from tourillon.core.storage.session import (
@@ -214,6 +217,57 @@ class LocalStore:
 
         return applied
 
+    async def records(self, keys: Sequence[Key]) -> dict[Key, Record]:
+        """Read the owned versions of ``keys``, any group; absent ones are omitted."""
+        found: dict[Key, Record] = {}
+
+        for group, members in groupby(
+            sorted(keys, key=_pid_of),
+            key=lambda k: self._partitioner.group_for(_pid_of(k)),
+        ):
+            batch = list(members)
+            manager = await self._manager(group)
+
+            async with manager.session() as session:
+                values = await session.get_many(batch)
+
+            for key, record in zip(batch, values, strict=True):
+                if record is not None and record.tag.kind in OWNED_KINDS:
+                    found[key] = record
+
+        return found
+
+    async def obligation_page(
+        self, group: int, after: bytes | None, limit: int
+    ) -> tuple[list[ObligationKey], bytes | None]:
+        """One page of the obligations persisted in ``group``."""
+        manager = await self._manager(group)
+
+        async with manager.session() as session:
+            return await session.obligation_page(after, limit)
+
+    async def remove_obligations(self, obligations: Sequence[ObligationKey]) -> None:
+        """Delete obligations, one write transaction per group."""
+        for group, members in groupby(
+            sorted(obligations, key=lambda ob: _pid_of(ob.key)),
+            key=lambda ob: self._partitioner.group_for(_pid_of(ob.key)),
+        ):
+            manager = await self._manager(group)
+
+            async with manager.session(write=True) as session:
+                await session.remove_obligations(list(members))
+
+    async def has_obligations(self) -> bool:
+        """Whether any group still persists a replication obligation."""
+        for group in range(self._partitioner.total_groups):
+            manager = await self._manager(group)
+
+            async with manager.session() as session:
+                if await session.has_obligations():
+                    return True
+
+        return False
+
     def foreign(self, record: Record) -> bool:
         """Whether a record is filed under a pid its address does not hash to."""
         expected = self._partitioner.pid_for_hash(
@@ -224,7 +278,7 @@ class LocalStore:
             return False
 
         logger.warning(
-            "antientropy.foreign version: pid=%s expected=%s key=%s",
+            "ae.foreign version: pid=%s expected=%s key=%s",
             record.key.pid.value,
             expected,
             record.key.to_bytes(Keyspace.TAGS).hex(),
@@ -243,6 +297,10 @@ class LocalStore:
             manager = self._managers[group] = GroupSessionManager(provider)
 
         return manager
+
+
+def _pid_of(key: Key) -> int:
+    return key.pid.value
 
 
 def _batches(records: Sequence[Record]) -> list[list[Record]]:

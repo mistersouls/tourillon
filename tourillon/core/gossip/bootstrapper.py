@@ -23,7 +23,7 @@ from tourillon.core.exceptions import (
     BootstrapPartitionShiftError,
 )
 from tourillon.core.gossip.topology import TopologyManager
-from tourillon.core.log import logger
+from tourillon.core.log import describe, logger
 from tourillon.core.models.member import Member
 from tourillon.core.models.retry import BackoffRetry
 from tourlib import Serializer
@@ -87,17 +87,18 @@ class GossipBootstrapper:
                     1 + random.uniform(-self._backoff.jitter, self._backoff.jitter)
                 )
                 logger.warning(
-                    "Gossip bootstrap attempt %d/%s failed: %s, retrying in %.1fs.",
+                    "Gossip bootstrap attempt %d/%s failed, retrying in %.1fs: %s",
                     attempt,
                     max_retries or "∞",
-                    str(exc),
                     jittered,
+                    str(exc),
                 )
                 await asyncio.sleep(jittered)
                 delay = min(delay * self._backoff.factor, self._backoff.max_delay)
 
     async def _attempt(self, seeds: tuple[str, ...]) -> int:
-        results: list[bool] = [False] * len(seeds)
+        # One entry per seed: None once it answered, else why it did not.
+        results: list[str | None] = ["no response"] * len(seeds)
 
         async with asyncio.TaskGroup() as tg:
             for idx, seed in enumerate(seeds):
@@ -106,13 +107,17 @@ class GossipBootstrapper:
                     name=f"gossip-bootstrap-seed-{seed}",
                 )
 
-        seeds_ok = sum(1 for result in results if result)
+        seeds_ok = results.count(None)
         if seeds_ok == 0:
-            raise BootstrapAttemptError("No seed responded successfully")
+            reasons = "; ".join(
+                f"{seed} ({reason})"
+                for seed, reason in zip(seeds, results, strict=True)
+            )
+            raise BootstrapAttemptError(f"no seed responded: {reasons}")
         return seeds_ok
 
     async def _attempt_seed(
-        self, seed_address: str, results: list[bool], idx: int
+        self, seed_address: str, results: list[str | None], idx: int
     ) -> None:
         client = EnvelopeClient(
             seed_address, tls_ctx=self._tls_client, logger=logger.transport()
@@ -124,11 +129,13 @@ class GossipBootstrapper:
 
             members = await self._exchange_digest(client, seed_address)
             await self._topologymgr.merge_registry(members)
-            results[idx] = True
+            results[idx] = None
         except BootstrapPartitionShiftError:
             raise
         except (OSError, TimeoutError, ConnectionError, ResponseTimeoutError) as exc:
-            logger.warning("Seed %s is unreachable: %s", seed_address, str(exc))
+            # Reported once per attempt by the caller, with every seed's reason.
+            results[idx] = describe(exc)
+            logger.debug("Seed %s is unreachable: %s", seed_address, describe(exc))
         finally:
             await client.close()
 

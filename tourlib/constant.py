@@ -35,6 +35,9 @@ PROTOCOL_VERSION = 1
 # Max UTF-8 byte length of an envelope kind string.
 MAX_KIND_LEN = 255
 
+# Max byte length of the opaque per-envelope context (e.g. a trace context).
+MAX_ENVELOPE_CONTEXT = 32
+
 # Max UTF-8 byte length for node identifiers.
 MAX_NODE_ID_LEN_BYTES = 63
 

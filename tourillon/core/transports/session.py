@@ -14,6 +14,7 @@
 
 import asyncio
 
+from tourillon.core.log import describe
 from tourillon.core.log import logger as _logger
 from tourillon.core.ports import Telemetry
 from tourillon.core.transports.dispatcher import Dispatcher
@@ -101,62 +102,64 @@ class EnvelopeSession:
         semaphore: asyncio.Semaphore,
     ) -> None:
         try:
-            with self._telemetry.start_span(
-                "transport.envelope",
-                attributes={
-                    "endpoint": self._endpoint,
-                    "kind": envelope.kind,
-                    "mode": envelope.mode,
-                },
-            ):
-                logger.info(
-                    "Received envelope kind=%s mode=%s cid=%.8s",
-                    envelope.kind,
-                    envelope.mode,
-                    envelope.correlation_id.hex,
-                )
-                handler = self._dispatcher.lookup(envelope.kind)
-                if handler is None:
-                    self._telemetry.unknown_kind_total.labels(
-                        endpoint=self._endpoint
-                    ).inc()
-                    logger.warning("No handler registered for kind '%s'", envelope.kind)
-                    await self._send_unknown_kind_error(envelope)
-                    return
-
-                responses = handler(envelope)
-                self._telemetry.dispatched_total.labels(endpoint=self._endpoint).inc()
-                if envelope.mode == Envelope.MODE_FNF:
-                    async for _ in responses:
-                        # FNF forbids responses; drain to execute handler side effects.
-                        continue
-                    logger.debug("Processed FNF envelope kind=%s", envelope.kind)
-                    return
-
-                async for response in responses:
-                    await self._write_envelope(response)
-        except Exception as exc:
-            self._telemetry.protocol_errors_total.labels(endpoint=self._endpoint).inc()
-            logger.exception(
-                "Handler failure for kind '%s' (mode=%s)",
-                envelope.kind,
-                envelope.mode,
-            )
-            with self._telemetry.start_span(
-                "transport.envelope.error",
-                attributes={
-                    "endpoint": self._endpoint,
-                    "kind": envelope.kind,
-                    "mode": envelope.mode,
-                },
-            ) as span:
-                span.record_exception(exc)
-                span.set_status_error(str(exc))
-            if envelope.mode == Envelope.MODE_RPC:
-                await self._send_internal_error(envelope, str(exc))
+            with self._telemetry.extract_context(envelope.context):
+                await self._traced_dispatch(envelope)
         finally:
             self._update_in_flight(-1)
             semaphore.release()
+
+    async def _traced_dispatch(self, envelope: Envelope) -> None:
+        with self._telemetry.start_span(
+            "transport.envelope",
+            attributes={
+                "endpoint": self._endpoint,
+                "kind": envelope.kind,
+                "mode": envelope.mode,
+            },
+        ) as span:
+            try:
+                await self._dispatch(envelope)
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status_error(describe(exc))
+                await self._handler_failed(envelope, exc)
+
+    async def _dispatch(self, envelope: Envelope) -> None:
+        logger.debug(
+            "Received envelope kind=%s mode=%s cid=%.8s",
+            envelope.kind,
+            envelope.mode,
+            envelope.correlation_id.hex,
+        )
+        handler = self._dispatcher.lookup(envelope.kind)
+        if handler is None:
+            self._telemetry.unknown_kind_total.labels(endpoint=self._endpoint).inc()
+            logger.warning("No handler registered for kind '%s'", envelope.kind)
+            await self._send_unknown_kind_error(envelope)
+            return
+
+        responses = handler(envelope)
+        self._telemetry.dispatched_total.labels(endpoint=self._endpoint).inc()
+        if envelope.mode == Envelope.MODE_FNF:
+            async for _ in responses:
+                # FNF forbids responses; drain to execute handler side effects.
+                continue
+            logger.debug("Processed FNF envelope kind=%s", envelope.kind)
+            return
+
+        async for response in responses:
+            await self._write_envelope(response)
+
+    async def _handler_failed(self, envelope: Envelope, exc: Exception) -> None:
+        self._telemetry.protocol_errors_total.labels(endpoint=self._endpoint).inc()
+        logger.exception(
+            "Handler failure for kind '%s' (mode=%s cid=%.8s)",
+            envelope.kind,
+            envelope.mode,
+            envelope.correlation_id.hex,
+        )
+        if envelope.mode == Envelope.MODE_RPC:
+            await self._send_internal_error(envelope, str(exc))
 
     async def _send_unknown_kind_error(self, envelope: Envelope) -> None:
         if envelope.mode == Envelope.MODE_FNF:

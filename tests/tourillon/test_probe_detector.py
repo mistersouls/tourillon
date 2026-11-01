@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import logging
 import types
 from typing import cast
 
@@ -117,3 +118,39 @@ async def test_failure_detector_probe_records_success_and_exits() -> None:
 
     assert detector._client.requests >= 1
     assert detector._active is False
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_failure_detector_warns_once_per_failure_streak(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    detector = PeerFailureDetector(peer_id="peer-a", serializer=MsgPackSerializer())
+    client = _ClientStub(fail=True)
+    caplog.set_level(logging.DEBUG, logger="tourillon.global")
+
+    failures = 0
+    for _ in range(3):
+        failures = await detector._probe_once(cast(EnvelopeClient, client), failures)
+
+    assert failures == 3
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    debugs = [r for r in caplog.records if r.levelno == logging.DEBUG]
+    assert [r.getMessage() for r in warnings] == [
+        "probe peer peer-a failed (attempt 1): RuntimeError: boom"
+    ]
+    assert len(debugs) == 2
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_failure_detector_reports_recovery_after_failures(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    detector = PeerFailureDetector(peer_id="peer-a", serializer=MsgPackSerializer())
+    caplog.set_level(logging.INFO, logger="tourillon.global")
+
+    failures = await detector._probe_once(cast(EnvelopeClient, _ClientStub()), 2)
+
+    assert failures == 0
+    assert "probe peer peer-a answered after 2 failed attempt(s)" in caplog.messages

@@ -484,3 +484,54 @@ async def test_send_rejects_when_client_is_closing() -> None:
 
     with pytest.raises(ConnectionError, match="closing"):
         await client._send(_rpc_envelope())
+
+
+def _context_client(context: bytes) -> tuple[EnvelopeClient, _FakeWriter]:
+    client = EnvelopeClient(
+        bind="127.0.0.1:4000",
+        tls_ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+        context=lambda: context,
+    )
+    writer = _FakeWriter()
+    client._writer = cast(asyncio.StreamWriter, writer)
+    return client, writer
+
+
+@pytest.mark.tourlib
+@pytest.mark.asyncio
+async def test_send_attaches_the_context_provider_bytes() -> None:
+    client, writer = _context_client(b"\x01trace")
+
+    await client._send(_fnf_envelope())
+
+    assert Envelope.from_bytes(writer.writes[0]).context == b"\x01trace"
+
+
+@pytest.mark.tourlib
+@pytest.mark.asyncio
+async def test_send_keeps_an_explicit_envelope_context() -> None:
+    client, writer = _context_client(b"\x01trace")
+    envelope = Envelope(
+        proto_version=PROTOCOL_VERSION,
+        schema_id=RAW_SCHEMA_ID,
+        mode=Envelope.MODE_FNF,
+        correlation_id=uuid.uuid4(),
+        kind="kv.put",
+        payload=b"ok",
+        context=b"\x01explicit",
+    )
+
+    await client._send(envelope)
+
+    assert Envelope.from_bytes(writer.writes[0]).context == b"\x01explicit"
+
+
+@pytest.mark.tourlib
+@pytest.mark.asyncio
+async def test_send_without_context_keeps_the_frame_unchanged() -> None:
+    client, writer = _context_client(b"")
+    envelope = _fnf_envelope()
+
+    await client._send(envelope)
+
+    assert writer.writes == [envelope.to_bytes()]

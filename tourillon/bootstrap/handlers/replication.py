@@ -23,27 +23,6 @@ from tourlib.envelope import Envelope, replay_envelope
 dispatcher = peer_dispatcher()
 
 
-@dispatcher.on("replication.exists")
-async def exists(request: Envelope) -> AsyncIterator[Envelope]:
-    manager = get_manager()
-    serializer = manager.serializer
-    try:
-        data: dict[str, Any] = serializer.decode(request.payload)
-        key = Key.from_dict(data["key"])
-        owned = await manager.store.exists(key)
-        yield replay_envelope(
-            kind="replication.exists.accept",
-            request=request,
-            payload=serializer.encode({"owned": owned}),
-        )
-    except StoreOperationError as exc:
-        yield replay_envelope(
-            kind="replication.exists.reject",
-            request=request,
-            payload=serializer.encode(exc.to_dict()),
-        )
-
-
 @dispatcher.on("replication.read")
 async def read(request: Envelope) -> AsyncIterator[Envelope]:
     manager = get_manager()

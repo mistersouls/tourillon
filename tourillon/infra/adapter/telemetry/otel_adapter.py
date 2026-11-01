@@ -12,13 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractContextManager
+import struct
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 
-from opentelemetry.metrics import Counter, Meter, UpDownCounter
+from opentelemetry import context as otel_context
+from opentelemetry import trace as otel_trace
+from opentelemetry.metrics import Counter, Histogram, Meter, UpDownCounter
+from opentelemetry.trace import (
+    NonRecordingSpan,
+    SpanContext,
+    Status,
+    StatusCode,
+    TraceFlags,
+    Tracer,
+)
 from opentelemetry.trace import Span as _OtelSpan
-from opentelemetry.trace import Status, StatusCode, Tracer
 
 from tourillon.core.ports.telemetry import (
     Attributes,
@@ -27,6 +37,7 @@ from tourillon.core.ports.telemetry import (
     BoundGauge,
     CounterMetric,
     GaugeMetric,
+    HistogramMetric,
     Span,
     Telemetry,
 )
@@ -129,6 +140,23 @@ class _GaugeMetric(GaugeMetric):
 
 
 @dataclass(slots=True)
+class _HistogramMetric(HistogramMetric):
+    instrument: Histogram
+
+    def record(
+        self,
+        value: int | float,
+        *,
+        attributes: Attributes | None = None,
+    ) -> None:
+        instrument_attributes = _materialize_attributes(attributes)
+        if instrument_attributes is None:
+            self.instrument.record(value)
+            return
+        self.instrument.record(value, attributes=instrument_attributes)
+
+
+@dataclass(slots=True)
 class _Span(Span):
     span: _OtelSpan
 
@@ -159,6 +187,48 @@ class _SpanContext(AbstractContextManager[Span]):
         return self._span_cm.__exit__(exc_type, exc, tb)
 
 
+# Envelope context layout: one format byte, then the W3C trace context
+# fields in binary (trace id, parent span id, trace flags).
+_TRACE_CONTEXT_V1 = 0x01
+_TRACE_CONTEXT = struct.Struct(">B 16s 8s B")
+
+
+def encode_trace_context() -> bytes:
+    """Encode the current sampled span, or return ``b""``."""
+    span_context = otel_trace.get_current_span().get_span_context()
+    if not span_context.is_valid or not span_context.trace_flags.sampled:
+        return b""
+    return _TRACE_CONTEXT.pack(
+        _TRACE_CONTEXT_V1,
+        span_context.trace_id.to_bytes(16, "big"),
+        span_context.span_id.to_bytes(8, "big"),
+        int(span_context.trace_flags),
+    )
+
+
+def decode_trace_context(data: bytes) -> SpanContext | None:
+    """Decode a context written by :func:`encode_trace_context`."""
+    if len(data) != _TRACE_CONTEXT.size or data[0] != _TRACE_CONTEXT_V1:
+        return None
+    _, trace_id, span_id, flags = _TRACE_CONTEXT.unpack(data)
+    span_context = SpanContext(
+        trace_id=int.from_bytes(trace_id, "big"),
+        span_id=int.from_bytes(span_id, "big"),
+        is_remote=True,
+        trace_flags=TraceFlags(flags),
+    )
+    return span_context if span_context.is_valid else None
+
+
+@contextmanager
+def _parent(span: _OtelSpan) -> Iterator[None]:
+    token = otel_context.attach(otel_trace.set_span_in_context(span))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
+
+
 class OpenTelemetryTelemetry(Telemetry):
     def __init__(
         self,
@@ -172,7 +242,7 @@ class OpenTelemetryTelemetry(Telemetry):
         self._meter = meter
         self._tracer = tracer
         self._close_hook = close_hook
-        self._metrics: dict[str, _CounterMetric | _GaugeMetric] = {}
+        self._metrics: dict[str, _CounterMetric | _GaugeMetric | _HistogramMetric] = {}
         self._noop_telemetry = build_noop_telemetry()
 
     @property
@@ -295,13 +365,6 @@ class OpenTelemetryTelemetry(Telemetry):
         )
 
     @property
-    def gossip_last_ae_peer(self) -> GaugeMetric:
-        return self._gauge_metric(
-            name="gossip_last_ae_peer",
-            description="Deterministic numeric fingerprint of the last AE peer node id.",
-        )
-
-    @property
     def gossip_last_ae_at(self) -> GaugeMetric:
         return self._gauge_metric(
             name="gossip_last_ae_at",
@@ -315,6 +378,70 @@ class OpenTelemetryTelemetry(Telemetry):
             description="Total FAILED announcements emitted through gossip hot path.",
         )
 
+    @property
+    def kv_requests_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="kv_requests_total",
+            description="Client operations coordinated by this node, by op and outcome.",
+        )
+
+    @property
+    def kv_request_duration_seconds(self) -> HistogramMetric:
+        return self._histogram_metric(
+            name="kv_request_duration_seconds",
+            description="Coordinator latency of client operations, by op and outcome.",
+            unit="s",
+        )
+
+    @property
+    def replication_failures_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="replication_failures_total",
+            description="Replica requests that failed or timed out, by op.",
+        )
+
+    @property
+    def read_repairs_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="read_repairs_total",
+            description="Read repairs, by outcome.",
+        )
+
+    @property
+    def obligations_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="obligations_total",
+            description="Replication obligations recorded, delivered, dropped or deferred.",
+        )
+
+    @property
+    def ae_sessions_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="ae_sessions_total",
+            description="Anti-entropy sessions initiated by this node, by goal and outcome.",
+        )
+
+    @property
+    def ae_versions_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="ae_versions_total",
+            description="Versions copied by anti-entropy sessions, by direction.",
+        )
+
+    @property
+    def ae_bytes_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="ae_bytes_total",
+            description="Value bytes copied by anti-entropy sessions, by direction.",
+        )
+
+    @property
+    def ae_sweeps_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="ae_sweeps_total",
+            description="Anti-entropy sweeps, by outcome.",
+        )
+
     def start_span(
         self,
         name: str,
@@ -324,6 +451,21 @@ class OpenTelemetryTelemetry(Telemetry):
         if self._tracer is None:
             return self._noop_telemetry.start_span(name, attributes=attributes)
         return _SpanContext(self._tracer, name, attributes=attributes)
+
+    def inject_context(self) -> bytes:
+        if self._tracer is None:
+            return b""
+        return encode_trace_context()
+
+    def extract_context(self, data: bytes) -> AbstractContextManager[None]:
+        if self._tracer is None:
+            return nullcontext()
+        span_context = decode_trace_context(data)
+        if span_context is None:
+            # No remote parent: start a new trace rather than nesting under
+            # whatever span is current.
+            return _parent(otel_trace.INVALID_SPAN)
+        return _parent(NonRecordingSpan(span_context))
 
     async def close(self) -> None:
         if self._close_hook is not None:
@@ -361,4 +503,20 @@ class OpenTelemetryTelemetry(Telemetry):
             )
             self._metrics[metric_name] = metric
         assert isinstance(metric, _GaugeMetric)
+        return metric
+
+    def _histogram_metric(
+        self, name: str, description: str, unit: str
+    ) -> HistogramMetric:
+        if self._meter is None:
+            return self._noop_telemetry.kv_request_duration_seconds
+        metric_name = f"{self._prefix}_{name}"
+        metric = self._metrics.get(metric_name)
+        if metric is None:
+            instrument = self._meter.create_histogram(
+                name=metric_name, description=description, unit=unit
+            )
+            metric = _HistogramMetric(instrument=instrument)
+            self._metrics[metric_name] = metric
+        assert isinstance(metric, _HistogramMetric)
         return metric

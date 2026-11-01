@@ -25,7 +25,14 @@ from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.spaces.ring import Ring
 
 # Phases whose vnodes are part of the active ring: members that own data.
-RING_PHASES = frozenset({MemberPhase.READY, MemberPhase.PAUSED, MemberPhase.DRAINING})
+RING_PHASES = frozenset(
+    {
+        MemberPhase.JOINING,
+        MemberPhase.READY,
+        MemberPhase.PAUSED,
+        MemberPhase.DRAINING,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -33,8 +40,8 @@ class Topology:
     """Immutable point-in-time snapshot of the cluster topology.
 
     Safe to hold across await points. Obtained via TopologyManager.snapshot().
-    The active ring contains the vnodes of READY, PAUSED and DRAINING nodes
-    (see RING_PHASES). JOINING, IDLE and FAILED vnodes are absent from the ring.
+    The active ring contains the vnodes of JOINING, READY, PAUSED and DRAINING
+    nodes (see RING_PHASES). IDLE and FAILED vnodes are absent from the ring.
 
     registry holds a shallow copy of MemberRegistry produced at the time of
     the TopologyManager lock acquisition. It is safe to iterate and query
@@ -69,6 +76,9 @@ class TopologyManager:
         self._registry = MemberRegistry()
         self._ring = Ring.empty()
         self._ring_changed = asyncio.Condition()
+        # Bumped on every ring or ownership change; lets waiters detect a
+        # change that happened between their snapshot and their wait.
+        self._generation = 0
 
         # Fingerprint cache; None means the cache is dirty.
         self._fingerprint: str | None = None
@@ -91,8 +101,7 @@ class TopologyManager:
             changed = self._apply(member)
 
         if changed:
-            async with self._ring_changed:
-                self._ring_changed.notify_all()
+            await self._notify()
 
         return changed
 
@@ -112,8 +121,7 @@ class TopologyManager:
                     accepted += 1
 
         if accepted:
-            async with self._ring_changed:
-                self._ring_changed.notify_all()
+            await self._notify()
 
         return accepted
 
@@ -135,12 +143,22 @@ class TopologyManager:
                 self._fingerprint = self._compute_fingerprint()
             return self._fingerprint  # type: ignore[return-value]
 
-    async def wait_for_ring_change(self, serial: str) -> Ring:
+    @property
+    def generation(self) -> int:
+        """Counter of ring and ownership changes; read it before a snapshot."""
+        return self._generation
+
+    async def wait_for_change(self, generation: int) -> int:
+        """Wait until the ring or a ring member's phase changes after ``generation``."""
         async with self._ring_changed:
-            if serial != self._ring.serial():
-                return self._ring
-            await self._ring_changed.wait()
-        return self._ring
+            while self._generation == generation:
+                await self._ring_changed.wait()
+        return self._generation
+
+    async def _notify(self) -> None:
+        self._generation += 1
+        async with self._ring_changed:
+            self._ring_changed.notify_all()
 
     def _apply(self, member: Member) -> bool:
         """Apply member under the already-held lock; return True if modified."""
@@ -164,6 +182,10 @@ class TopologyManager:
         of each member; intermediate phases may never be observed. The member's
         vnodes are therefore always dropped, then added back when its phase owns
         data.
+
+        A phase change between two ring phases leaves the vnodes in place but
+        still changes ownership (a JOINING owner is filled, a DRAINING one is
+        replaced), so it counts as a change too.
         """
         old_phase = old.phase if old is not None else MemberPhase.IDLE
         previous_ring = self._ring
@@ -179,10 +201,10 @@ class TopologyManager:
         self._ring = ring
 
         if ring.serial() == previous_ring.serial():
-            return False
+            return old_phase is not new.phase and new.phase in RING_PHASES
 
         logger.info(
-            "topology.ring updated node_id=%s from=%s to=%s size=%s",
+            "topology.ring updated node_id=%s from=%s to=%s vnodes=%d",
             new.node_id,
             old_phase.value,
             new.phase.value,

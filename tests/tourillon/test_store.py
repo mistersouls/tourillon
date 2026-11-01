@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import logging
 import time
 from contextlib import asynccontextmanager
 from time import perf_counter
@@ -20,6 +21,8 @@ from typing import Any, cast
 
 import pytest
 
+from tests.helpers.telemetry import RecordingTelemetry
+from tourillon.core.ae.obligations import ObligationQueue
 from tourillon.core.exceptions import (
     InvalidQuorumError,
     InvalidRepairTokenError,
@@ -33,15 +36,14 @@ from tourillon.core.models.clock import HLCClock
 from tourillon.core.models.config import ReadRepairConfig
 from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.models.repair import RepairIssue, decode_token, encode_token
-from tourillon.core.models.req import HintRequest
 from tourillon.core.models.storageschema import (
-    HintKey,
-    HintPrefix,
-    HintReference,
     Key,
     Keyspace,
     KVPair,
     KVRef,
+    MetaKind,
+    ObligationKey,
+    ObligationPrefix,
     PartitionAddress,
     Pid,
     Record,
@@ -339,7 +341,7 @@ class _PeerPoolStub:
         self.acquire_calls.append(peer_id)
         return self._client
 
-    async def release(self, peer_id: str) -> None:
+    async def release(self, peer_id: str, client: object | None = None) -> None:
         self.release_calls.append(peer_id)
 
 
@@ -383,27 +385,6 @@ def _record(
     )
 
 
-def _hint_record(
-    addr: Address,
-    *,
-    pid: int = 7,
-    data: bytes = b"value",
-    tombstone: bool = False,
-    wall_ms: int = 3,
-    original_kind: TagKind = TagKind.LIVE,
-) -> Record:
-    original = Tag(kind=original_kind)
-    return Record(
-        key=Key(
-            pid=Pid(pid),
-            address=addr,
-            ts=HLCTimestamp(wall_ms=wall_ms, counter=0, node_id="node-a"),
-        ),
-        value=Value(data=data, quorum_write=1),
-        tag=Tag.hint(original),
-    )
-
-
 def _build_store(
     *,
     node_id: str,
@@ -415,6 +396,8 @@ def _build_store(
     response_delay: float = 0.05,
     partitioner_pid: int = 7,
     read_repair: ReadRepairConfig | None = None,
+    obligations: ObligationQueue | None = None,
+    telemetry: RecordingTelemetry | None = None,
 ) -> tuple[
     StoreService, _StorageStub, _PeerPoolStub, MsgPackSerializer, _PeerClientStub
 ]:
@@ -434,44 +417,10 @@ def _build_store(
         peer_pool=cast(PeerPool, cast(object, peer_pool)),
         response_delay=response_delay,
         read_repair=read_repair,
+        obligations=obligations,
+        telemetry=None if telemetry is None else telemetry.as_port(),
     )
     return service, storage, peer_pool, serializer, client
-
-
-@pytest.mark.tourillon
-@pytest.mark.parametrize(
-    "kind", [TagKind.LIVE, TagKind.TOMBSTONE, TagKind.HINT, TagKind.STAGING]
-)
-async def test_exists_reports_owned_exact_versions_even_while_draining(
-    kind: TagKind,
-) -> None:
-    addr = Address(namespace=b"ns", key=b"key")
-    original = _record(addr)
-    record = Record(key=original.key, value=original.value, tag=Tag(kind))
-    store, storage, _, _, client = _build_store(
-        node_id="node-a",
-        preferences=(),
-        members={},
-        local_store=_StoreStub(record),
-        remote_responses={},
-    )
-    store.pause()
-    assert await store.exists(record.key) is (kind in {TagKind.LIVE, TagKind.TOMBSTONE})
-    assert not await store.exists(_record(addr, wall_ms=4).key)
-    assert storage.open_calls == [7, 7]
-    assert client.requests == []
-
-
-@pytest.mark.tourillon
-def test_hint_request_roundtrip() -> None:
-    req = HintRequest(
-        target_node_id="node-b",
-        record=_record(Address(namespace=b"ns", key=b"key"), data=b"value"),
-    )
-
-    rebuilt = HintRequest.from_dict(req.to_dict())
-
-    assert rebuilt == req
 
 
 @pytest.mark.tourillon
@@ -610,7 +559,7 @@ async def test_put_coordinates_and_uses_handoff_target() -> None:
     addr = Address(namespace=b"ns", key=b"key")
     local = _record(addr, data=b"local")
     remote = _record(addr, data=b"remote")
-    hinted = _hint_record(addr, data=b"hinted")
+    hinted = _record(addr, data=b"hinted")
     store, storage, peer_pool, serializer, client = _build_store(
         node_id="node-a",
         preferences=(
@@ -643,11 +592,9 @@ async def test_put_coordinates_and_uses_handoff_target() -> None:
         "replication.hint",
     ]
     second_payload = serializer.decode(client.requests[1].payload)
-    assert second_payload["record"]["tag"]["kind"] == "HINT"
-    assert second_payload["record"]["tag"]["payload"]["sub"] == "LIVE"
-    hinted_tag = Tag.from_dict(second_payload["record"]["tag"])
-    assert Tag.unhint(hinted_tag) == Tag(kind=TagKind.LIVE)
-    assert hinted_tag.payload.payload == b""
+    sent = Record.from_dict(second_payload["record"])
+    assert sent.tag == Tag(kind=TagKind.LIVE)
+    assert sent.value.data == b"value"
     assert second_payload["intent"] == "node-c"
     assert "intent" not in serializer.decode(client.requests[0].payload)
     assert peer_pool.acquire_calls == ["node-b", "node-d"]
@@ -657,7 +604,7 @@ async def test_put_coordinates_and_uses_handoff_target() -> None:
 @pytest.mark.asyncio
 async def test_put_replicates_to_handoff_and_readable_targets() -> None:
     addr = Address(namespace=b"ns", key=b"key")
-    hinted = _hint_record(addr, data=b"hinted")
+    hinted = _record(addr, data=b"hinted")
     store, storage, peer_pool, _, client = _build_store(
         node_id="node-a",
         preferences=(
@@ -823,10 +770,6 @@ async def test_get_reads_both_owner_and_handoff_before_counting_preference(
         )
     )
     owner, handoff = ("node-a", "node-b") if local_is_owner else ("node-b", "node-a")
-    if not local_is_owner:
-        local = Record(key=local.key, value=local.value, tag=Tag.hint(local.tag))
-    if remote is not None and local_is_owner:
-        remote = Record(key=remote.key, value=remote.value, tag=Tag.hint(remote.tag))
     store, _, pool, _, _ = _build_store(
         node_id="node-a",
         preferences=(Preference(owner, True, handoff, writable=True),),
@@ -1046,27 +989,6 @@ async def test_get_hides_tombstone_record() -> None:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_get_returns_hint_record_as_visible_version() -> None:
-    addr = Address(namespace=b"ns", key=b"key")
-    hinted = _hint_record(addr, data=b"hinted")
-    store, _, peer_pool, _, _ = _build_store(
-        node_id="node-a",
-        preferences=(
-            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
-        ),
-        members={"node-b": _member("node-b", "127.0.0.1:9001")},
-        local_store=_StoreStub(),
-        remote_responses={"replication.read": hinted.to_dict()},
-    )
-
-    version = await store.get(GetRequest(namespace=b"ns", key=b"key"))
-
-    assert version == _version(addr, data=b"hinted")
-    assert peer_pool.acquire_calls == ["node-b"]
-
-
-@pytest.mark.tourillon
-@pytest.mark.asyncio
 async def test_get_forward_raises_when_peer_is_unknown() -> None:
     store, _, _, _, _ = _build_store(
         node_id="node-a",
@@ -1114,7 +1036,7 @@ async def test_get_raises_when_quorum_read_not_met() -> None:
 @pytest.mark.asyncio
 async def test_put_raises_when_quorum_write_not_met() -> None:
     addr = Address(namespace=b"ns", key=b"key")
-    hinted = _hint_record(addr, data=b"hinted")
+    hinted = _record(addr, data=b"hinted")
     store, _, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
@@ -1165,26 +1087,64 @@ async def test_get_majority_tombstone_hides_live_version() -> None:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_get_newer_hinted_tombstone_hides_older_live_version() -> None:
+async def test_get_newer_handed_off_tombstone_hides_older_live_version() -> None:
     addr = Address(namespace=b"ns", key=b"key")
     stale = _record(addr, data=b"stale", wall_ms=10)
-    hinted_delete = _hint_record(
-        addr, data=b"", wall_ms=20, original_kind=TagKind.TOMBSTONE
-    )
+    hinted_delete = _record(addr, data=b"", wall_ms=20, tombstone=True)
     store, _, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
             Preference(node_id="node-a", readable=True, handoff=None, writable=True),
-            Preference(node_id="node-b", readable=True, handoff=None, writable=True),
+            Preference(
+                node_id="node-c", readable=False, handoff="node-b", writable=False
+            ),
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(stale),
         remote_responses={"replication.read": hinted_delete.to_dict()},
+        read_repair=ReadRepairConfig(enabled=False),
     )
 
     version = await store.get(GetRequest(namespace=b"ns", key=b"key"))
 
     assert version is None
+
+
+@pytest.mark.tourillon
+async def test_get_returns_a_stand_in_copy_as_a_visible_version() -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    held = _record(addr, data=b"held")
+    store, _, peer_pool, _, _ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-c", False, "node-b", writable=False),),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(),
+        remote_responses={"replication.read": held.to_dict()},
+    )
+
+    version = await store.get(GetRequest(namespace=b"ns", key=b"key"))
+
+    assert version == _version(addr, data=b"held")
+    assert peer_pool.acquire_calls == ["node-b"]
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("kind", [TagKind.STALE, TagKind.PHANTOM, TagKind.RESERVED])
+async def test_get_ignores_versions_that_are_not_live_or_tombstone(
+    kind: TagKind,
+) -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    plain = _record(addr)
+    odd = Record(key=plain.key, value=plain.value, tag=Tag(kind=kind))
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, None, writable=True),),
+        members={},
+        local_store=_StoreStub(odd),
+        remote_responses={},
+    )
+
+    assert await store.get(GetRequest(namespace=b"ns", key=b"key")) is None
 
 
 @pytest.mark.tourillon
@@ -1349,13 +1309,13 @@ async def test_put_uses_writable_owner_independently_of_readability() -> None:
 @pytest.mark.tourillon
 async def test_put_uses_handoff_for_unwritable_owner() -> None:
     addr = Address(namespace=b"ns", key=b"key")
-    hinted = _hint_record(addr)
+    held = _record(addr)
     store, storage, pool, serializer, client = _build_store(
         node_id="node-a",
         preferences=(Preference("node-a", True, "node-b", writable=False),),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(),
-        remote_responses={"replication.hint": hinted.to_dict()},
+        remote_responses={"replication.hint": held.to_dict()},
     )
     version = await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
     assert version is not None
@@ -1363,9 +1323,27 @@ async def test_put_uses_handoff_for_unwritable_owner() -> None:
     assert pool.acquire_calls == ["node-b"]
     payload = serializer.decode(client.requests[0].payload)
     sent = Record.from_dict(payload["record"])
-    assert sent.tag.kind == TagKind.HINT
+    assert sent.tag == Tag(kind=TagKind.LIVE)
     assert payload["intent"] == "node-a"
     assert client.requests[0].kind == "replication.hint"
+
+
+@pytest.mark.tourillon
+async def test_delete_hands_off_a_plain_tombstone() -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    held = _record(addr, data=b"", tombstone=True)
+    store, _, _, serializer, client = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-c", False, "node-b", writable=False),),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(),
+        remote_responses={"replication.hint": held.to_dict()},
+    )
+    await store.delete(DeleteRequest(namespace=b"ns", key=b"key"))
+    payload = serializer.decode(client.requests[0].payload)
+    assert client.requests[0].kind == "replication.hint"
+    assert Record.from_dict(payload["record"]).tag == Tag(kind=TagKind.TOMBSTONE)
+    assert payload["intent"] == "node-c"
 
 
 @pytest.mark.tourillon
@@ -1400,7 +1378,7 @@ async def test_read_repair_retains_readable_owner_routing() -> None:
     addr = Address(namespace=b"ns", key=b"key")
     winner = _record(addr, wall_ms=20)
     stale = _record(addr, wall_ms=10)
-    store, _, _, _, client = _build_store(
+    store, storage, _, _, client = _build_store(
         node_id="node-a",
         preferences=(
             Preference("node-a", True, None, writable=True),
@@ -1408,25 +1386,20 @@ async def test_read_repair_retains_readable_owner_routing() -> None:
         ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(winner),
-        remote_responses={
-            "replication.read": stale.to_dict(),
-            "replication.write": winner.to_dict(),
-        },
+        remote_responses={"replication.read": stale.to_dict()},
     )
     version = await store.get(GetRequest(namespace=b"ns", key=b"key", quorum_read=2))
     await store.close()
     assert version is not None and version.meta.ts == winner.key.ts
-    assert [request.kind for request in client.requests] == [
-        "replication.read",
-        "replication.write",
-    ]
+    assert [request.kind for request in client.requests] == ["replication.read"]
+    assert _obligations(storage) == [ObligationKey("node-b", winner.key)]
+    assert store.stats.read_repairs_repaired == 1
 
 
 class _HintRejectingStore(_StoreStub):
     def on_put(self, kv: KVPair) -> None:
-        if (
-            kv.keyspace == Keyspace.TAGS
-            and Tag.from_bytes(kv.value).kind == TagKind.HINT
+        if kv.keyspace == Keyspace.META and kv.key.startswith(
+            MetaKind.OBLIGATION.value
         ):
             raise RuntimeError("no space left on device")
         super().on_put(kv)
@@ -1437,18 +1410,21 @@ class _FailingStore(_StoreStub):
         raise RuntimeError("no space left on device")
 
 
-def _hints(storage: _StorageStub) -> list[Tag]:
-    tags = [
-        Tag.from_bytes(kv.value)
+def _obligations(storage: _StorageStub) -> list[ObligationKey]:
+    prefix = ObligationPrefix().to_bytes()
+    return [
+        ObligationKey.from_bytes(kv.key)
         for kv in storage.store.written
-        if kv.keyspace == Keyspace.TAGS
+        if kv.keyspace == Keyspace.META and kv.key.startswith(prefix)
     ]
-    return [tag for tag in tags if tag.kind == TagKind.HINT]
 
 
 @pytest.mark.tourillon
-async def test_incoming_hint_generates_local_distinct_obligations() -> None:
-    record = _hint_record(Address(namespace=b"ns", key=b"key"))
+@pytest.mark.parametrize("tombstone", [False, True])
+async def test_incoming_hint_stores_plain_record_and_distinct_obligations(
+    tombstone: bool,
+) -> None:
+    record = _record(Address(namespace=b"ns", key=b"key"), tombstone=tombstone)
     store, storage, _, _, client = _build_store(
         node_id="keeper",
         preferences=(),
@@ -1458,15 +1434,18 @@ async def test_incoming_hint_generates_local_distinct_obligations() -> None:
     )
     assert await store.hint(record, "node-b") == record
     assert await store.hint(record, "node-c") == record
-    metas = [kv for kv in storage.store.written if kv.keyspace is Keyspace.META]
-    keys = [HintKey.from_bytes(kv.key) for kv in metas]
-    assert [key.intent for key in keys] == ["node-b", "node-c"]
-    assert all(key.hlc.node_id == "keeper" for key in keys)
-    assert keys[0].hlc < keys[1].hlc
-    references = [HintReference.from_bytes(kv.value) for kv in metas]
-    assert all(reference.key == record.key for reference in references)
+    assert _obligations(storage) == [
+        ObligationKey("node-b", record.key),
+        ObligationKey("node-c", record.key),
+    ]
+    metas = [
+        kv
+        for kv in storage.store.written
+        if kv.key.startswith(ObligationPrefix().to_bytes())
+    ]
+    assert all(kv.value == b"" for kv in metas)
     assert storage.store.record == record
-    assert store.stats.hints_recorded == 2
+    assert store.stats.obligations_recorded == 2
     assert client.requests == []
 
 
@@ -1483,9 +1462,9 @@ async def test_incoming_hint_rejects_invalid_intent_without_persisting(
         remote_responses={},
     )
     with pytest.raises(ValueError):
-        await store.hint(_hint_record(Address(namespace=b"ns", key=b"key")), intent)
+        await store.hint(_record(Address(namespace=b"ns", key=b"key")), intent)
     assert storage.store.written == []
-    assert store.stats.hints_recorded == 0
+    assert store.stats.obligations_recorded == 0
 
 
 @pytest.mark.tourillon
@@ -1499,14 +1478,18 @@ async def test_incoming_hint_is_refused_while_draining() -> None:
     )
     store.pause()
     with pytest.raises(NodeDrainingError) as exc:
-        await store.hint(_hint_record(Address(namespace=b"ns", key=b"key")), "owner")
+        await store.hint(_record(Address(namespace=b"ns", key=b"key")), "owner")
     assert exc.value.operation == "replication.hint"
     assert storage.store.written == []
 
 
 @pytest.mark.tourillon
-async def test_hint_and_plain_write_require_their_own_record_kinds() -> None:
-    addr = Address(namespace=b"ns", key=b"key")
+@pytest.mark.parametrize("kind", [TagKind.STALE, TagKind.PHANTOM, TagKind.META])
+async def test_hint_and_write_require_live_or_tombstone_records(
+    kind: TagKind,
+) -> None:
+    plain = _record(Address(namespace=b"ns", key=b"key"))
+    odd = Record(key=plain.key, value=plain.value, tag=Tag(kind=kind))
     store, storage, _, _, _ = _build_store(
         node_id="keeper",
         preferences=(),
@@ -1514,11 +1497,66 @@ async def test_hint_and_plain_write_require_their_own_record_kinds() -> None:
         local_store=_StoreStub(),
         remote_responses={},
     )
-    with pytest.raises(ValueError, match="HINT record"):
-        await store.hint(_record(addr), "owner")
-    with pytest.raises(ValueError, match="hint operation"):
-        await store.write(_hint_record(addr))
+    with pytest.raises(ValueError, match="LIVE or TOMBSTONE"):
+        await store.hint(odd, "owner")
+    with pytest.raises(ValueError, match="LIVE or TOMBSTONE"):
+        await store.write(odd)
     assert storage.store.written == []
+    assert store.stats.obligations_recorded == 0
+
+
+@pytest.mark.tourillon
+async def test_incoming_hint_submits_obligations_to_the_queue() -> None:
+    queue = ObligationQueue(8)
+    record = _record(Address(namespace=b"ns", key=b"key"))
+    store, storage, _, _, _ = _build_store(
+        node_id="keeper",
+        preferences=(),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+        obligations=queue,
+    )
+    await store.hint(record, "owner")
+    assert queue.to_dict()["queued"] == 1
+    assert queue.take(1) == [ObligationKey("owner", record.key)]
+    assert _obligations(storage) == [ObligationKey("owner", record.key)]
+
+
+@pytest.mark.tourillon
+async def test_hint_on_behalf_of_this_node_records_no_obligation() -> None:
+    queue = ObligationQueue(8)
+    record = _record(Address(namespace=b"ns", key=b"key"))
+    store, storage, _, _, _ = _build_store(
+        node_id="keeper",
+        preferences=(),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+        obligations=queue,
+    )
+    assert await store.hint(record, "keeper") == record
+    assert storage.store.record == record
+    assert _obligations(storage) == []
+    assert store.stats.obligations_recorded == 0
+    assert queue.to_dict()["queued"] == 0
+
+
+@pytest.mark.tourillon
+async def test_incoming_hint_storage_failure_records_nothing() -> None:
+    queue = ObligationQueue(8)
+    store, _, _, _, _ = _build_store(
+        node_id="keeper",
+        preferences=(),
+        members={},
+        local_store=_HintRejectingStore(),
+        remote_responses={},
+        obligations=queue,
+    )
+    with pytest.raises(RuntimeError, match="no space left"):
+        await store.hint(_record(Address(namespace=b"ns", key=b"key")), "owner")
+    assert store.stats.obligations_recorded == 0
+    assert queue.to_dict()["queued"] == 0
 
 
 @pytest.mark.tourillon
@@ -1531,25 +1569,25 @@ async def test_local_handoff_persists_obligation_without_network() -> None:
         remote_responses={},
     )
     await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
-    metas = [kv for kv in storage.store.written if kv.keyspace is Keyspace.META]
-    assert len(metas) == 1
-    hint_key = HintKey.from_bytes(metas[0].key)
-    intent = hint_key.intent
-    assert intent == "owner"
-    assert storage.store.record.tag.kind is TagKind.HINT
+    obligations = _obligations(storage)
+    assert [obligation.target for obligation in obligations] == ["owner"]
+    assert obligations[0].key == storage.store.record.key
+    assert storage.store.record.tag.kind is TagKind.LIVE
     assert client.requests == []
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_failed_replica_write_records_local_hint() -> None:
+async def test_failed_replica_write_records_local_obligation() -> None:
     """A replica believed healthy that misses a write must leave a trace.
 
     Placement only hands off for replicas already known to be down, so a write
     that fails against a supposedly healthy one is the case nothing else
-    catches: without a local hint the replica stays silently behind until the
-    next anti-entropy pass.
+    catches: without a local obligation the replica stays silently behind
+    until the next anti-entropy pass.
     """
+    queue = ObligationQueue(8)
+    telemetry = RecordingTelemetry()
     store, storage, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
@@ -1559,27 +1597,28 @@ async def test_failed_replica_write_records_local_hint() -> None:
         members={},
         local_store=_StoreStub(),
         remote_responses={},
+        obligations=queue,
+        telemetry=telemetry,
     )
 
     await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
 
-    hints = _hints(storage)
-    assert hints == []
     assert storage.store.record.tag.kind is TagKind.LIVE
-    obligations = [
-        HintKey.from_bytes(kv.key)
-        for kv in storage.store.written
-        if kv.keyspace == Keyspace.META and kv.key.startswith(HintPrefix().to_bytes())
-    ]
-    assert len(obligations) == 1
-    assert obligations[0].intent == "node-b"
-    assert obligations[0].hlc.node_id == "node-a"
+    assert _obligations(storage) == [ObligationKey("node-b", storage.store.record.key)]
+    assert store.stats.obligations_recorded == 1
+    assert queue.to_dict()["queued"] == 1
+    assert (
+        "storage.obligations.put",
+        {},
+    ) in telemetry.spans
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_local_write_failure_does_not_record_a_hint_for_this_node() -> None:
-    """A hint is a handoff: there is nobody to hand off to when we are the target."""
+async def test_local_write_failure_does_not_record_an_obligation_for_this_node() -> (
+    None
+):
+    """There is nobody to owe a copy to when this node is the failing target."""
     store, storage, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
@@ -1593,13 +1632,14 @@ async def test_local_write_failure_does_not_record_a_hint_for_this_node() -> Non
     with pytest.raises(StoreOperationError):
         await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
 
-    assert _hints(storage) == []
+    assert _obligations(storage) == []
+    assert store.stats.obligations_recorded == 0
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_hint_write_failure_does_not_mask_the_replication_error() -> None:
-    """The client must learn why replication failed, not why the hint did."""
+async def test_obligation_write_failure_does_not_mask_the_replication_error() -> None:
+    """The client must learn why replication failed, not why the obligation did."""
     store, storage, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
@@ -1619,7 +1659,8 @@ async def test_hint_write_failure_does_not_mask_the_replication_error() -> None:
     messages = [error["message"] for error in exc_info.value.to_dict()["errors"]]
     assert any("unknown peer: node-b" in message for message in messages)
     assert not any("no space left on device" in message for message in messages)
-    assert _hints(storage) == []
+    assert _obligations(storage) == []
+    assert store.stats.obligations_recorded == 0
 
 
 @pytest.mark.tourillon
@@ -1656,7 +1697,7 @@ async def test_slow_replica_write_is_detached_rather_than_cancelled() -> None:
     assert detached.cancelled() is False
     assert detached.exception() is None
     assert store._pending_writes == set()  # noqa: SLF001
-    assert _hints(storage) == []
+    assert _obligations(storage) == []
 
 
 @pytest.mark.tourillon
@@ -1856,17 +1897,64 @@ def _sent_record(envelope: Envelope) -> Any:
 @pytest.mark.tourillon
 @pytest.mark.asyncio
 async def test_read_repair_catches_up_a_stale_replica() -> None:
+    """The coordinator holds the winner: it owes the laggard a copy itself."""
     addr = Address(namespace=b"ns", key=b"key")
     fresh = _record(addr, data=b"v2", wall_ms=9)
     stale = _record(addr, data=b"v1", wall_ms=3)
-    store, _, _, _, client = _build_store(
+    store, storage, _, _, client = _build_store(
         node_id="node-a",
         preferences=_two_owners(),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(fresh),
+        remote_responses={"replication.read": stale.to_dict()},
+    )
+
+    version = await store.get(GetRequest(namespace=b"ns", key=b"key"))
+    await store.close()
+
+    assert version == _version(addr, data=b"v2", wall_ms=9)
+    assert [request.kind for request in client.requests] == ["replication.read"]
+    assert _obligations(storage) == [ObligationKey("node-b", fresh.key)]
+    assert store.stats.obligations_recorded == 1
+    assert store.stats.read_repairs_repaired == 1
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_read_repair_catches_up_a_replica_holding_nothing() -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    fresh = _record(addr, data=b"v2", wall_ms=9)
+    store, storage, _, _, client = _build_store(
+        node_id="node-a",
+        preferences=_two_owners(),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(fresh),
+        remote_responses={"replication.read": None},
+    )
+
+    await store.get(GetRequest(namespace=b"ns", key=b"key"))
+    await store.close()
+
+    assert [request.kind for request in client.requests] == ["replication.read"]
+    assert _obligations(storage) == [ObligationKey("node-b", fresh.key)]
+    assert store.stats.read_repairs_repaired == 1
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_read_repair_asks_the_remote_holder_to_owe_the_laggard() -> None:
+    """The coordinator lags: the replica holding the winner records the debt."""
+    addr = Address(namespace=b"ns", key=b"key")
+    fresh = _record(addr, data=b"v2", wall_ms=9)
+    stale = _record(addr, data=b"v1", wall_ms=3)
+    store, storage, _, serializer, client = _build_store(
+        node_id="node-a",
+        preferences=_two_owners(),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(stale),
         remote_responses={
-            "replication.read": stale.to_dict(),
-            "replication.write": fresh.to_dict(),
+            "replication.read": fresh.to_dict(),
+            "replication.hint": fresh.to_dict(),
         },
     )
 
@@ -1876,37 +1964,49 @@ async def test_read_repair_catches_up_a_stale_replica() -> None:
     assert version == _version(addr, data=b"v2", wall_ms=9)
     assert [request.kind for request in client.requests] == [
         "replication.read",
-        "replication.write",
+        "replication.hint",
     ]
-    repaired = _sent_record(client.requests[1])
-    assert repaired["key"]["ts"]["wall_ms"] == 9
+    payload = serializer.decode(client.requests[1].payload)
+    assert payload["intent"] == "node-a"
+    assert Record.from_dict(payload["record"]) == fresh
+    assert _obligations(storage) == []
+    assert storage.store.record == stale
     assert store.stats.read_repairs_repaired == 1
+    assert store.stats.read_repairs_failed == 0
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_read_repair_catches_up_a_replica_holding_nothing() -> None:
+async def test_read_repair_picks_the_first_remote_holder_in_order() -> None:
     addr = Address(namespace=b"ns", key=b"key")
     fresh = _record(addr, data=b"v2", wall_ms=9)
-    store, _, _, _, client = _build_store(
+    store, _, pool, serializer, client = _build_store(
         node_id="node-a",
-        preferences=_two_owners(),
-        members={"node-b": _member("node-b", "127.0.0.1:9001")},
-        local_store=_StoreStub(fresh),
+        preferences=(
+            Preference("node-a", True, None, writable=True),
+            Preference("node-c", True, None, writable=True),
+            Preference("node-b", True, None, writable=True),
+        ),
+        members={
+            "node-b": _member("node-b", "127.0.0.1:9001"),
+            "node-c": _member("node-c", "127.0.0.1:9002"),
+        },
+        local_store=_StoreStub(),
         remote_responses={
-            "replication.read": None,
-            "replication.write": fresh.to_dict(),
+            "replication.read": [fresh.to_dict(), fresh.to_dict()],
+            "replication.hint": fresh.to_dict(),
         },
     )
 
     await store.get(GetRequest(namespace=b"ns", key=b"key"))
     await store.close()
 
-    assert [request.kind for request in client.requests] == [
-        "replication.read",
-        "replication.write",
+    hints = [
+        request for request in client.requests if request.kind != "replication.read"
     ]
-    assert store.stats.read_repairs_repaired == 1
+    assert [request.kind for request in hints] == ["replication.hint"]
+    assert serializer.decode(hints[0].payload)["intent"] == "node-a"
+    assert pool.acquire_calls[-1] == "node-b"
 
 
 @pytest.mark.tourillon
@@ -1914,7 +2014,7 @@ async def test_read_repair_catches_up_a_replica_holding_nothing() -> None:
 async def test_read_repair_leaves_an_up_to_date_replica_alone() -> None:
     addr = Address(namespace=b"ns", key=b"key")
     fresh = _record(addr, data=b"v2", wall_ms=9)
-    store, _, _, _, client = _build_store(
+    store, storage, _, _, client = _build_store(
         node_id="node-a",
         preferences=_two_owners(),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
@@ -1926,6 +2026,7 @@ async def test_read_repair_leaves_an_up_to_date_replica_alone() -> None:
     await store.close()
 
     assert [request.kind for request in client.requests] == ["replication.read"]
+    assert _obligations(storage) == []
     assert store.stats.read_repairs_repaired == 0
 
 
@@ -1940,29 +2041,28 @@ async def test_read_repair_repairs_a_missed_delete() -> None:
     addr = Address(namespace=b"ns", key=b"key")
     tombstone = _record(addr, data=b"", tombstone=True, wall_ms=9)
     stale = _record(addr, data=b"v1", wall_ms=3)
-    store, _, _, _, client = _build_store(
+    store, storage, _, _, client = _build_store(
         node_id="node-a",
         preferences=_two_owners(),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
         local_store=_StoreStub(tombstone),
-        remote_responses={
-            "replication.read": stale.to_dict(),
-            "replication.write": tombstone.to_dict(),
-        },
+        remote_responses={"replication.read": stale.to_dict()},
     )
 
     version = await store.get(GetRequest(namespace=b"ns", key=b"key"))
     await store.close()
 
     assert version is None
-    assert _sent_record(client.requests[1])["tag"]["kind"] == "TOMBSTONE"
+    assert [request.kind for request in client.requests] == ["replication.read"]
+    assert _obligations(storage) == [ObligationKey("node-b", tombstone.key)]
+    assert storage.store.record.tag.kind is TagKind.TOMBSTONE
     assert store.stats.read_repairs_repaired == 1
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
 async def test_read_repair_skips_a_handoff_stand_in() -> None:
-    """A stand-in does not own the address; the hint replayer settles that debt."""
+    """A stand-in does not own the address; its obligation settles that debt."""
     addr = Address(namespace=b"ns", key=b"key")
     fresh = _record(addr, data=b"v2", wall_ms=9)
     store, _, _, _, client = _build_store(
@@ -2035,12 +2135,12 @@ async def test_read_repair_failure_is_counted_not_raised(draining: bool) -> None
     """The read already succeeded; a failed repair must not reach the client."""
     addr = Address(namespace=b"ns", key=b"key")
     fresh = _record(addr, data=b"v2", wall_ms=9)
-    store, _, _, _, _ = _build_store(
+    store, storage, _, _, client = _build_store(
         node_id="node-a",
         preferences=_two_owners(),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
-        local_store=_StoreStub(fresh),
-        remote_responses={"replication.read": None},
+        local_store=_StoreStub(),
+        remote_responses={"replication.read": fresh.to_dict()},
     )
     if draining:
         store.pause()
@@ -2049,8 +2149,34 @@ async def test_read_repair_failure_is_counted_not_raised(draining: bool) -> None
     await store.close()
 
     assert version == _version(addr, data=b"v2", wall_ms=9)
+    assert [request.kind for request in client.requests] == [
+        "replication.read",
+        "replication.hint",
+    ]
+    assert _obligations(storage) == []
     assert store.stats.read_repairs_failed == 1
     assert store.stats.read_repairs_repaired == 0
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_read_repair_local_obligation_failure_is_counted_not_raised() -> None:
+    addr = Address(namespace=b"ns", key=b"key")
+    fresh = _record(addr, data=b"v2", wall_ms=9)
+    store, _, _, _, _ = _build_store(
+        node_id="node-a",
+        preferences=_two_owners(),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_HintRejectingStore(fresh),
+        remote_responses={"replication.read": None},
+    )
+
+    version = await store.get(GetRequest(namespace=b"ns", key=b"key"))
+    await store.close()
+
+    assert version == _version(addr, data=b"v2", wall_ms=9)
+    assert store.stats.read_repairs_failed == 1
+    assert store.stats.obligations_recorded == 0
 
 
 @pytest.mark.tourillon
@@ -2061,20 +2187,23 @@ async def test_concurrent_reads_do_not_stack_repairs_for_the_same_key() -> None:
     store, _, _, _, client = _build_store(
         node_id="node-a",
         preferences=_two_owners(),
-        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        members={
+            "node-b": _member("node-b", "127.0.0.1:9001"),
+            "node-c": _member("node-c", "127.0.0.1:9002"),
+        },
         local_store=_StoreStub(fresh),
         remote_responses={
             "replication.read": None,
-            "replication.write": fresh.to_dict(),
+            "replication.hint": fresh.to_dict(),
         },
-        remote_delays={"replication.write": 0.05},
+        remote_delays={"replication.hint": 0.05},
     )
 
-    store._start_repair("node-b", fresh)
-    store._start_repair("node-b", fresh)
+    store._start_repair("node-b", fresh, "node-c")
+    store._start_repair("node-b", fresh, "node-c")
     await store.close()
 
-    assert [request.kind for request in client.requests] == ["replication.write"]
+    assert [request.kind for request in client.requests] == ["replication.hint"]
     assert store.stats.read_repairs_repaired == 1
 
 
@@ -2112,7 +2241,7 @@ class _BlockedRepairClient(_PeerClientStub):
             serializer,
             {
                 "replication.read": None,
-                "replication.write": fresh.to_dict(),
+                "replication.hint": fresh.to_dict(),
             },
         )
         self.read_started = asyncio.Event()
@@ -2155,13 +2284,16 @@ async def test_drain_keeps_reads_and_read_repairs_without_waiting_for_reads() ->
     store, _, pool, serializer, _ = _build_store(
         node_id="node-a",
         preferences=_two_owners(),
-        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        members={
+            "node-b": _member("node-b", "127.0.0.1:9001"),
+            "node-c": _member("node-c", "127.0.0.1:9002"),
+        },
         local_store=_StoreStub(fresh),
         remote_responses={},
     )
     client = _BlockedRepairClient(serializer, fresh)
     pool._client = client
-    store._start_repair("node-b", fresh)
+    store._start_repair("node-b", fresh, "node-c")
     await asyncio.wait_for(client.repair_started.wait(), 1)
     read = asyncio.create_task(
         store.get(GetRequest(namespace=b"ns", key=b"key", quorum_read=2))
@@ -2334,25 +2466,66 @@ async def test_repair_raises_when_no_replica_holds_the_version() -> None:
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_repair_promotes_a_version_that_only_survives_as_a_hint() -> None:
+async def test_repair_does_not_count_a_stand_in_copy_as_owner_durability() -> None:
+    """A copy held on the owner's behalf is a debt, not durability.
+
+    The version only survives on the stand-in: it is still a faithful source,
+    but both owners remain repair targets.
+    """
     addr = Address(namespace=b"ns", key=b"key")
-    hinted = _hint_record(addr, data=b"v1", wall_ms=9)
-    store, _, _, _, client = _build_store(
+    record = _record(addr, data=b"v1", wall_ms=9)
+    store, storage, _, serializer, client = _build_store(
         node_id="node-a",
-        preferences=_two_owners(),
+        preferences=(
+            Preference("node-a", True, None, writable=True),
+            Preference("node-c", False, "node-b", writable=False),
+        ),
         members={"node-b": _member("node-b", "127.0.0.1:9001")},
-        local_store=_StoreStub(hinted),
+        local_store=_StoreStub(None),
         remote_responses={
-            "replication.lookup": None,
-            "replication.write": _record(addr, data=b"v1", wall_ms=9).to_dict(),
+            "replication.lookup": record.to_dict(),
+            "replication.hint": record.to_dict(),
         },
     )
 
-    result = await store.repair(RepairRequest(token=_repair_token(hinted)))
+    result = await store.repair(
+        RepairRequest(token=_repair_token(record), quorum_write=2)
+    )
 
     assert result.issue is RepairIssue.REPAIRED
-    copied = _sent_record(client.requests[1])
-    assert copied["tag"]["kind"] == TagKind.LIVE.name
+    assert result.replicas == 2
+    assert [request.kind for request in client.requests] == [
+        "replication.lookup",
+        "replication.hint",
+    ]
+    payload = serializer.decode(client.requests[1].payload)
+    assert payload["intent"] == "node-c"
+    assert Record.from_dict(payload["record"]) == record
+    assert storage.store.record == record
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_repair_with_only_a_stand_in_copy_misses_quorum_when_rehint_fails() -> (
+    None
+):
+    addr = Address(namespace=b"ns", key=b"key")
+    record = _record(addr, data=b"v1", wall_ms=9)
+    store, _, _, _, _ = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference("node-a", True, None, writable=True),
+            Preference("node-c", False, "node-b", writable=False),
+        ),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(record),
+        remote_responses={"replication.lookup": record.to_dict()},
+    )
+
+    with pytest.raises(QuorumNotMetError) as exc_info:
+        await store.repair(RepairRequest(token=_repair_token(record), quorum_write=2))
+
+    assert exc_info.value.to_dict()["received"] == 1
 
 
 @pytest.mark.tourillon
@@ -2500,3 +2673,166 @@ async def test_put_quorum_failure_hands_back_a_resumable_token() -> None:
     key = decode_token(token)
     assert key.address == addr
     assert key.pid.value == 7
+
+
+@pytest.mark.tourillon
+async def test_store_measures_a_successful_operation() -> None:
+    telemetry = RecordingTelemetry()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, None, writable=True),),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+        telemetry=telemetry,
+    )
+
+    await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+
+    labels = {"op": "write", "outcome": "ok"}
+    assert telemetry.calls["kv_requests_total"] == [(1, labels)]
+    ((elapsed, duration_labels),) = telemetry.calls["kv_request_duration_seconds"]
+    assert elapsed >= 0 and duration_labels == labels
+    assert telemetry.calls["replication_failures_total"] == []
+
+
+@pytest.mark.tourillon
+async def test_put_traces_storage_and_peer_requests() -> None:
+    telemetry = RecordingTelemetry()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference("node-a", True, None, writable=True),
+            Preference("node-b", True, None, writable=True),
+        ),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(),
+        remote_responses={
+            "replication.write": _record(Address(namespace=b"ns", key=b"key")).to_dict()
+        },
+        telemetry=telemetry,
+    )
+
+    await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+
+    assert ("storage.write", {"group": 7}) in telemetry.spans
+    assert ("storage.transaction", {"group": 7}) in telemetry.spans
+    assert ("storage.record.put", {}) in telemetry.spans
+    assert (
+        "storage.operation",
+        {"group": 7, "kind": "kv.put"},
+    ) in telemetry.spans
+    assert (
+        "peer.request",
+        {"kind": "replication.write", "peer": "node-b"},
+    ) in telemetry.spans
+    assert all(
+        "key" not in attributes and "value" not in attributes
+        for _, attributes in telemetry.spans
+    )
+
+
+@pytest.mark.tourillon
+async def test_put_traces_storage_write_failure() -> None:
+    telemetry = RecordingTelemetry()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, None, writable=True),),
+        members={},
+        local_store=_FailingStore(),
+        remote_responses={},
+        telemetry=telemetry,
+    )
+
+    with pytest.raises(StoreOperationError):
+        await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+
+    assert ("storage.write", {"group": 7}) in telemetry.spans
+    assert ("storage.record.put", {}) in telemetry.spans
+
+
+@pytest.mark.tourillon
+async def test_get_delete_and_repair_trace_local_storage_cost() -> None:
+    record = _record(Address(namespace=b"ns", key=b"key"))
+    telemetry = RecordingTelemetry()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, None, writable=True),),
+        members={},
+        local_store=_StoreStub(record),
+        remote_responses={},
+        telemetry=telemetry,
+    )
+
+    await store.get(GetRequest(namespace=b"ns", key=b"key"))
+    await store.delete(DeleteRequest(namespace=b"ns", key=b"key"))
+    await store.repair(RepairRequest(token=_repair_token(record)))
+
+    kinds = [
+        attributes["kind"]
+        for name, attributes in telemetry.spans
+        if name == "storage.operation"
+    ]
+    assert kinds == ["kv.get", "kv.delete", "kv.repair"]
+
+
+@pytest.mark.tourillon
+async def test_store_measures_a_failed_quorum_and_the_failed_replica(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    telemetry = RecordingTelemetry()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference("node-a", True, None, writable=True),
+            Preference("node-c", True, None, writable=True),
+        ),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+        telemetry=telemetry,
+    )
+    caplog.set_level(logging.WARNING, logger="tourillon.global")
+
+    with pytest.raises(QuorumNotMetError):
+        await store.put(
+            PutRequest(namespace=b"ns", key=b"key", value=b"value", quorum_write=2)
+        )
+
+    assert telemetry.calls["kv_requests_total"] == [
+        (1, {"op": "write", "outcome": "quorum_not_met"})
+    ]
+    assert telemetry.total("replication_failures_total", op="write") == 1
+    assert telemetry.total("obligations_total", event="recorded") >= 1
+    assert (
+        "peer.request",
+        {"kind": "replication.write", "peer": "node-c"},
+    ) in telemetry.spans
+    messages = caplog.messages
+    assert any(m.startswith("replication.write failed node=node-a") for m in messages)
+    assert any(m.startswith("store.write failed node=node-a") for m in messages)
+
+
+@pytest.mark.tourillon
+async def test_store_counts_a_refusal_without_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    telemetry = RecordingTelemetry()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, None, writable=True),),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+        telemetry=telemetry,
+    )
+    store.pause()
+    caplog.set_level(logging.WARNING, logger="tourillon.global")
+
+    with pytest.raises(NodeDrainingError):
+        await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+
+    assert telemetry.calls["kv_requests_total"] == [
+        (1, {"op": "write", "outcome": "node_draining"})
+    ]
+    assert caplog.records == []

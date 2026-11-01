@@ -50,6 +50,7 @@ class _PeerPool:
         (MemberPhase.READY, True, True),
         (MemberPhase.DRAINING, True, False),
         (MemberPhase.PAUSED, False, False),
+        (MemberPhase.JOINING, False, False),
     ],
 )
 @pytest.mark.parametrize("owner_alive", [None, True, False])
@@ -142,3 +143,36 @@ def test_routing_and_segments_agree_on_partition_owner() -> None:
 
     # Routing (successor(partition.end)) is the reference rule.
     assert segments == routing, f"routing={routing} segments={segments}"
+
+
+@pytest.mark.tourillon
+async def test_joining_member_is_never_a_handoff_stand_in() -> None:
+    topology = TopologyManager()
+    for node_id, token, phase in (
+        ("owner", "0x4", MemberPhase.JOINING),
+        ("joiner", "0x8", MemberPhase.JOINING),
+        ("ready", "0xc", MemberPhase.READY),
+    ):
+        await topology.apply_member(
+            Member(
+                node_id=node_id,
+                peer_address=f"{node_id}:7000",
+                epoch=1,
+                phase=phase,
+                tokens=(token,),
+            )
+        )
+    partitioner = Partitioner(pshift=2, gshift=1, hashspace=HashSpace(bits=4))
+    strategy = SimplePlacementStrategy(
+        replication_factor=1,
+        topologymgr=topology,
+        partitioner=partitioner,
+        peer_pool=_PeerPool({}),  # type: ignore[arg-type]
+    )
+
+    preference_list = await strategy.preference_list(_address_in_pid(partitioner, 0))
+
+    (preference,) = preference_list.preferences
+    assert preference.node_id == "owner"
+    assert not preference.readable and not preference.writable
+    assert preference.handoff == "ready"

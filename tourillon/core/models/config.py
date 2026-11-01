@@ -431,6 +431,7 @@ class TransportPoolConfig:
     min_size: int = 32
     max_size: int = 256
     max_overflow: int = 8
+    priority_size: int = 2
     idle_ttl: float = 60 * 10
 
     def to_document(self) -> dict[str, Any]:
@@ -438,6 +439,7 @@ class TransportPoolConfig:
             "min_size": self.min_size,
             "max_size": self.max_size,
             "max_overflow": self.max_overflow,
+            "priority_size": self.priority_size,
             "idle_ttl": self.idle_ttl,
         }
 
@@ -460,6 +462,12 @@ class TransportPoolConfig:
         if not isinstance(max_overflow, int) or max_overflow < 0:
             raise ValidationError("transport.pool.max_overflow must be an integer >= 0")
 
+        priority_size = document.get("priority_size", 2)
+        if not isinstance(priority_size, int) or priority_size < 0:
+            raise ValidationError(
+                "transport.pool.priority_size must be an integer >= 0"
+            )
+
         idle_ttl = document.get("idle_ttl", 60 * 10)
         if not isinstance(idle_ttl, int | float) or idle_ttl <= 0:
             raise ValidationError("transport.pool.idle_ttl must be a number > 0")
@@ -468,6 +476,7 @@ class TransportPoolConfig:
             min_size=min_size,
             max_size=max_size,
             max_overflow=max_overflow,
+            priority_size=priority_size,
             idle_ttl=float(idle_ttl),
         )
 
@@ -603,6 +612,10 @@ def _ae_int(document: Mapping[str, Any], name: str, default: int, minimum: int) 
 class AntiEntropyConfig:
     """Data anti-entropy runtime options (``[placement.anti_entropy]``).
 
+    - ``enabled``: run the periodic background sweep. Obligation delivery and
+      the join/drain synchronisation goals always run: anti-entropy is the
+      only mechanism that copies versions between nodes.
+
     - ``sweep_period``: target time, in seconds, for this node to compare every
       partition it shares with every co-replica once. Cycles are spread evenly
       over it, so the per-node request rate stays flat whatever the cluster
@@ -612,9 +625,14 @@ class AntiEntropyConfig:
     - ``jitter``: relative random spread applied to every delay (0 to 1), so
       nodes never synchronise their cycles.
     - ``grace``: versions written less than this many seconds ago are ignored;
-      they are still in flight through the normal write path and hints.
-    - ``settle_delay``: wait after a ring change before resuming, so a burst of
-      membership updates triggers one replica-map rebuild, not many.
+      they are still in flight through the write path and its obligations.
+      Join and drain goals ignore it: they compare everything written so far.
+    - ``settle_quiet``: silence, in seconds, the replica map waits for after a
+      ring change before rebuilding; every further change restarts it, so a
+      burst of membership updates triggers one rebuild, not many. Clamped to
+      ``settle_delay``. It is also the retry hint of a refused session.
+    - ``settle_delay``: upper bound on that wait, so continuous membership
+      churn still gets a fresh replica map.
     - ``concurrency``: anti-entropy requests this node serves at once as
       responder; extra requests are refused with ``busy`` instead of
       queueing. The initiator side runs one session at a time.
@@ -631,6 +649,9 @@ class AntiEntropyConfig:
     - ``max_keys_per_cycle``: version keys one cycle may list while
       descending (local and remote), bounding the scan cost of a cycle even
       when nothing needs copying.
+    - ``hotqueue_size``: replication obligations scheduled in memory at
+      once. Obligations are durable in META before they are queued; the
+      ones that do not fit are reloaded from META once the queue drains.
     """
 
     enabled: bool = True
@@ -639,12 +660,14 @@ class AntiEntropyConfig:
     jitter: float = 0.2
     grace: float = 120.0
     settle_delay: float = 5.0
+    settle_quiet: float = 0.5
     concurrency: int = 4
     pids_per_cycle: int = 4096
     keys_per_request: int = 1024
     max_batch_bytes: int = 4 * 1024 * 1024
     max_repairs_per_cycle: int = 10_000
     max_keys_per_cycle: int = 1_000_000
+    hotqueue_size: int = 4096
 
     def to_document(self) -> dict[str, Any]:
         return {
@@ -654,12 +677,14 @@ class AntiEntropyConfig:
             "jitter": self.jitter,
             "grace": self.grace,
             "settle_delay": self.settle_delay,
+            "settle_quiet": self.settle_quiet,
             "concurrency": self.concurrency,
             "pids_per_cycle": self.pids_per_cycle,
             "keys_per_request": self.keys_per_request,
             "max_batch_bytes": self.max_batch_bytes,
             "max_repairs_per_cycle": self.max_repairs_per_cycle,
             "max_keys_per_cycle": self.max_keys_per_cycle,
+            "hotqueue_size": self.hotqueue_size,
         }
 
     @classmethod
@@ -676,12 +701,14 @@ class AntiEntropyConfig:
             jitter=_ae_number(document, "jitter", 0.2, minimum=0.0, maximum=1.0),
             grace=_ae_number(document, "grace", 120.0, minimum=0.0),
             settle_delay=_ae_number(document, "settle_delay", 5.0, minimum=0.0),
+            settle_quiet=_ae_number(document, "settle_quiet", 0.5, minimum=0.0),
             concurrency=_ae_int(document, "concurrency", 4, 1),
             pids_per_cycle=_ae_int(document, "pids_per_cycle", 4096, 1),
             keys_per_request=_ae_int(document, "keys_per_request", 1024, 1),
             max_batch_bytes=_ae_int(document, "max_batch_bytes", 4 * 1024 * 1024, 1),
             max_repairs_per_cycle=_ae_int(document, "max_repairs_per_cycle", 10_000, 1),
             max_keys_per_cycle=_ae_int(document, "max_keys_per_cycle", 1_000_000, 1),
+            hotqueue_size=_ae_int(document, "hotqueue_size", 4096, 1),
         )
 
 

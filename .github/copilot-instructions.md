@@ -7,7 +7,7 @@ Path-scoped rules live in [`.github/instructions/`](instructions/). Reusable tas
 
 ## Project in one paragraph
 
-Tourillon is a leaderless, peer-to-peer distributed key-value database in Python 3.14+. Nodes are identical peers arranged on a consistent-hash ring of virtual nodes; keys map to partitions, partitions to preference lists, and requests are coordinated by whichever node receives them. Replication uses per-request quorums, hybrid logical clocks for conflict resolution, hinted handoff for unavailable replicas, gossip for membership, and streaming transfers for rebalancing. Every socket is mTLS-authenticated.
+Tourillon is a leaderless, peer-to-peer distributed key-value database in Python 3.14+. Nodes are identical peers arranged on a consistent-hash ring of virtual nodes; keys map to partitions, partitions to preference lists, and requests are coordinated by whichever node receives them. Replication uses per-request quorums, hybrid logical clocks for conflict resolution, durable replication obligations for missed replicas, gossip for membership, and anti-entropy as the single mechanism that copies data, including on join and drain. Every socket is mTLS-authenticated.
 
 ## Hard rules
 
@@ -33,7 +33,7 @@ uv run ruff check <files>
 runtime (~60 s without them, ~230 s with). Use `-m "not e2e" --no-cov` while you work, then run the
 full `uv run pytest` once before declaring the change done.
 
-**Do not run `black .` or `ruff check --fix .`.** The repository has pre-existing, repo-wide formatting debt; a global run creates a huge unrelated diff. Lint and format only the files you changed, and ignore pre-existing violations elsewhere.
+**Do not run `black .` or `ruff check --fix .`.** These mutating commands can create unrelated changes. Lint and format only the files you changed; CI checks changed files by design.
 
 ## Layering (the most common source of mistakes)
 
@@ -43,7 +43,7 @@ full `uv run pytest` once before declaring the change done.
 
 ## Wire protocol essentials
 
-One frame type, `tourlib.envelope.Envelope`: 32-byte header + UTF-8 `kind` + serialized payload. `kind` is lowercase `domain.action`; responses are `<kind>.accept` / `<kind>.reject`.
+One frame type, `tourlib.envelope.Envelope`: 32-byte header + UTF-8 `kind` + opaque `context` (<= 32 bytes, trace context) + serialized payload. `kind` is lowercase `domain.action`; responses are `<kind>.accept` / `<kind>.reject`.
 
 - Always build responses with `replay_envelope(kind=..., request=..., payload=...)`.
 - Always encode payloads through the injected `Serializer`.

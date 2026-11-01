@@ -52,6 +52,15 @@ class GaugeMetric(Protocol):
     def labels(self, **labels: AttributeValue) -> BoundGauge: ...
 
 
+class HistogramMetric(Protocol):
+    def record(
+        self,
+        value: int | float,
+        *,
+        attributes: Attributes | None = None,
+    ) -> None: ...
+
+
 class Span(Protocol):
     def set_attribute(self, key: str, value: AttributeValue) -> None: ...
 
@@ -113,13 +122,49 @@ class Telemetry(Protocol):
     def gossip_ae_diverged(self) -> CounterMetric: ...
 
     @property
-    def gossip_last_ae_peer(self) -> GaugeMetric: ...
-
-    @property
     def gossip_last_ae_at(self) -> GaugeMetric: ...
 
     @property
     def gossip_failed_announcements_total(self) -> CounterMetric: ...
+
+    @property
+    def kv_requests_total(self) -> CounterMetric:
+        """Coordinated client operations, labelled ``op`` and ``outcome``."""
+
+    @property
+    def kv_request_duration_seconds(self) -> HistogramMetric:
+        """Coordinator latency of client operations, labelled ``op`` and ``outcome``."""
+
+    @property
+    def replication_failures_total(self) -> CounterMetric:
+        """Replica requests that failed or timed out, labelled ``op``."""
+
+    @property
+    def read_repairs_total(self) -> CounterMetric:
+        """Read repairs, labelled ``outcome`` (repaired, failed, skipped)."""
+
+    @property
+    def obligations_total(self) -> CounterMetric:
+        """Replication obligations, labelled ``event``.
+
+        Events: ``recorded``, ``delivered``, ``dropped``, ``deferred``.
+        """
+
+    @property
+    def ae_sessions_total(self) -> CounterMetric:
+        """Anti-entropy sessions, labelled ``goal`` and ``outcome``."""
+
+    @property
+    def ae_versions_total(self) -> CounterMetric:
+        """Versions copied by anti-entropy sessions, labelled ``direction``."""
+
+    @property
+    def ae_bytes_total(self) -> CounterMetric:
+        """Value bytes copied by anti-entropy sessions, labelled ``direction``."""
+
+    @property
+    def ae_sweeps_total(self) -> CounterMetric:
+        """Sweeps, labelled ``outcome`` (complete, interrupted)."""
 
     def start_span(
         self,
@@ -127,6 +172,22 @@ class Telemetry(Protocol):
         *,
         attributes: Attributes | None = None,
     ) -> AbstractContextManager[Span]: ...
+
+    def inject_context(self) -> bytes:
+        """Encode the current span for an outgoing envelope.
+
+        Return ``b""`` when there is nothing worth propagating (tracing off,
+        no active span, or a span that is not sampled), so that the envelope
+        carries no context at all.
+        """
+
+    def extract_context(self, data: bytes) -> AbstractContextManager[None]:
+        """Make the remote span carried by ``data`` the parent of new spans.
+
+        Without a readable context, new spans start a new trace instead of
+        nesting under whatever span is current. Unknown or malformed context never
+        fails the request.
+        """
 
     async def close(self) -> None: ...
 

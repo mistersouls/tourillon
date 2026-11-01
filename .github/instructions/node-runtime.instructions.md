@@ -19,7 +19,7 @@ tourillon/bootstrap/ composition root — the only place that picks implementati
 ## Composition
 
 `Application` holds adapters and the context; `Manager` constructs and owns the node services:
-`Partitioner` + `HashSpace`, `TopologyManager`, `PeerPool`, `SimplePlacementStrategy`, `StoreService`, `NodeLifecycle`, `NodeInspector`, `GossipService`, `TransferService`, `HLCClock`, `FailureDetectorProvider`.
+`Partitioner` + `HashSpace`, `TopologyManager`, `PeerPool`, `SimplePlacementStrategy`, `StoreService`, `NodeLifecycle`, `NodeInspector`, `GossipService`, `AntiEntropyService`, `ObligationQueue`, `HLCClock`, `FailureDetectorProvider`.
 
 Services receive their collaborators by constructor injection. Do not reach for globals or import `get_manager()` from inside `core/` — that helper exists for `bootstrap/handlers/` only.
 
@@ -53,19 +53,21 @@ async with provider.session(write=True) as session:
 - Request models use non-optional integer quorums (`quorum_read`, `quorum_write`) defaulting to 1, including write repair. Explicit values remain validated; handlers treat legacy explicit `null` values as omitted. Configurable defaults tied to replication factor are deferred.
 - Conflict resolution is HLC-based last-writer-wins with deterministic tie-breaks. Any change to the comparison order must keep it a **total order** and be identical on every node, otherwise replicas diverge. Test with shuffled input.
 - Deletes are tombstones, not removals. Preserve tombstone visibility semantics when touching read paths.
-- Unwritable replicas get hinted writes, replayed later by the hint replayer. Keep hint payload shape and its tombstone detection in sync.
+- Missed replicas (handoff, failed replica write, read repair) become durable replication obligations: persisted in `META` with the version, then queued in the bounded `ObligationQueue`. Anti-entropy is the only consumer. Versions are always stored as plain `LIVE` or `TOMBSTONE`; there is no hint or staging tag.
 
 ## Gossip, membership and failure detection
 
 - `GossipService`/`Gossiper` run a hot push loop plus an anti-entropy loop (`gossip.push`, `gossip.ping`/`gossip.pong`, `gossip.digest` → streamed `gossip.delta`).
-- `TopologyManager` owns the member registry and rebuilds the ring on accepted updates; it notifies waiters so join-time transfer planning can replan.
+- `TopologyManager` owns the member registry and rebuilds the ring on accepted updates; its `generation` counter (ring and ownership changes, including a JOINING → READY phase change) wakes anti-entropy's view tracker.
 - `PhiAccrual` computes local suspicion; `PeerFailureDetector` drives probes. Failure detection is **local and advisory** — never treat it as cluster-wide truth.
 - Membership state changes must be idempotent and monotonic: re-applying an older update must not regress a member's phase.
 
-## Transfers
+## Join, drain and anti-entropy
 
-`TransferService` is the peer-facing coordinator: `init` (open/resume a session, return staged resume keys), `claim` (stream a pull window), `chunk` (stage pushed data), `commit` (activate staged data).
-Transfers must be **resumable and idempotent** — a retried chunk must not duplicate or lose data, and staged data must never be readable before commit.
+There is no transfer protocol. Placement states target ownership; `AntiEntropyService` converges data to it.
+- A `JOINING` node is on the ring with `readable=False` and `writable=False`; the lifecycle waits for `AntiEntropyService.wait_joined()` before publishing `READY`.
+- A `DRAINING` node is skipped by the target view; the lifecycle waits for `AntiEntropyService.drain()` before publishing `IDLE`.
+- Copy direction follows ownership; never add a push/pull mode switch. Copies must stay **idempotent**: an existing version is never rewritten.
 
 ## Concurrency
 

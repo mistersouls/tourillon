@@ -15,7 +15,7 @@
 import asyncio
 import logging
 import ssl
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 from tourillon.core.probe.detector import PeerFailureDetector
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT
@@ -33,8 +33,10 @@ class PeerClient(EnvelopeClient):
         tls_ctx: ssl.SSLContext,
         fd: PeerFailureDetector,
         logger: logging.Logger | None = None,
+        *,
+        context: Callable[[], bytes] | None = None,
     ) -> None:
-        super().__init__(bind, tls_ctx, logger)
+        super().__init__(bind, tls_ctx, logger, context=context)
         self._fd = fd
         self._phi_task: asyncio.Task[None] | None = None
 

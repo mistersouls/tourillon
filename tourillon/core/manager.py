@@ -14,10 +14,12 @@
 
 import asyncio
 import contextlib
+import logging
 import signal
 import ssl
 from collections.abc import AsyncIterator
 
+from tourillon.core.ae.obligations import ObligationQueue
 from tourillon.core.config import TourillonConfig
 from tourillon.core.gossip.gossiper import GossipStats
 from tourillon.core.gossip.topology import TopologyManager
@@ -34,7 +36,6 @@ from tourillon.core.services.gossip import GossipService
 from tourillon.core.services.inspector import NodeInspector
 from tourillon.core.services.lifecycle import NodeLifecycle
 from tourillon.core.services.store import StoreService
-from tourillon.core.services.transfer import TransferService
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourlib.models.inspect import NodeInfo, NodeInspectRequest
@@ -78,6 +79,7 @@ class Manager:
             min_size=config.transport.pool.min_size,
             max_size=config.transport.pool.max_size,
             max_overflow=config.transport.pool.max_overflow,
+            priority_size=config.transport.pool.priority_size,
             idle_ttl=config.transport.pool.idle_ttl,
         )
         self._placement_strategy = SimplePlacementStrategy(
@@ -86,6 +88,7 @@ class Manager:
             partitioner=self._partitioner,
             peer_pool=self._peer_pool,
         )
+        self._obligations = ObligationQueue(config.placement.anti_entropy.hotqueue_size)
         self._store = StoreService(
             node_id=config.node.id,
             storage=self._storage,
@@ -96,6 +99,8 @@ class Manager:
             peer_pool=self._peer_pool,
             read_repair=config.placement.read_repair,
             repair=config.placement.repair,
+            obligations=self._obligations,
+            telemetry=self._telemetry,
         )
         self._lifecycle = NodeLifecycle(
             placement_strategy=self._placement_strategy,
@@ -113,6 +118,7 @@ class Manager:
             storage=self._storage,
             telemetry=self._telemetry,
             store=self._store,
+            obligations=self._obligations,
         )
         self._inspector = NodeInspector(
             node_id=self._config.node.id,
@@ -125,12 +131,6 @@ class Manager:
             node_id=self._config.node.id,
             topologymgr=self._topologymgr,
             relay=self._lifecycle.gossiper.relay,
-        )
-        self._transfer = TransferService(
-            topologymgr=self._topologymgr,
-            serializer=serializer,
-            storage=self._storage,
-            partitioner=self._partitioner,
         )
         self._serializer = serializer
 
@@ -155,11 +155,6 @@ class Manager:
         return self._gossip
 
     @property
-    def transfer(self) -> TransferService:
-        """Get the transfer service."""
-        return self._transfer
-
-    @property
     def telemetry(self) -> Telemetry:
         """Get the manager-owned telemetry instance."""
         return self._telemetry
@@ -179,7 +174,7 @@ class Manager:
 
         :param seeds: Optional list of seed peer addresses for joining an existing cluster.
         """
-        logger.info("Starting manager for node '%s'", self.node_id)
+        logger.debug("Starting manager for node '%s'", self.node_id)
         if seeds:
             logger.debug("Startup seeds override provided: %s", seeds)
         try:
@@ -189,19 +184,21 @@ class Manager:
                 "Failed to load latest HLC from storage for node '%s'", self.node_id
             )
             raise
-        logger.info(
-            "Latest persisted HLC for node '%s': wall_ms=%s counter=%s source_node=%s",
-            self.node_id,
+        # A restored clock matters when diagnosing ordering after a restart;
+        # a fresh one is the normal first boot.
+        logger.log(
+            logging.INFO if latest.wall_ms else logging.DEBUG,
+            "HLC restored wall_ms=%s counter=%s source_node=%s",
             latest.wall_ms,
             latest.counter,
-            latest.node_id,
+            latest.node_id or "-",
         )
         self._clock.restore(latest.wall_ms, latest.counter)
         await self._lifecycle.start(seeds=seeds)
-        logger.info("Manager started for node '%s'", self.node_id)
+        logger.debug("Manager started for node '%s'", self.node_id)
 
     async def stop(self) -> None:
-        logger.info("Stopping manager for node '%s'", self.node_id)
+        logger.info("Node '%s' shutting down", self.node_id)
         for step in (
             self._lifecycle.stop,
             # Detached replications must settle while the peer pool and the
@@ -217,7 +214,7 @@ class Manager:
                 logger.exception(
                     "shutdown step failed: %s, reason=%s", step.__qualname__, exc
                 )
-        logger.info("Manager stopped for node '%s'", self.node_id)
+        logger.info("Node '%s' stopped", self.node_id)
 
     async def serve_forever(self, seeds: list[str] | None = None) -> None:
         """Start and serve the peer server indefinitely.
@@ -228,7 +225,7 @@ class Manager:
         self._install_signal_handlers(stop_requested)
         try:
             await self.start(seeds=seeds)
-            logger.info("Node '%s' is serving forever", self.node_id)
+            logger.info("Node '%s' started; serving until stopped", self.node_id)
             try:
                 await stop_requested.wait()
             except KeyboardInterrupt:

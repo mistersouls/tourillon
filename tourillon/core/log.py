@@ -41,6 +41,9 @@ class Logger:
     def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
         self._global_logger.error(msg, *args, **kwargs)
 
+    def log(self, level: int, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._global_logger.log(level, msg, *args, **kwargs)
+
     def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
         self._global_logger.exception(msg, *args, **kwargs)
 
@@ -52,6 +55,17 @@ class Logger:
 
 
 logger = Logger()
+
+
+def describe(exc: BaseException) -> str:
+    """Render an exception for a log line, even when its message is empty.
+
+    Timeouts and cancellations usually carry no message; their type is then
+    the only clue an operator gets.
+    """
+    message = str(exc)
+    name = type(exc).__name__
+    return f"{name}: {message}" if message else name
 
 
 def _resolve_level(name: str) -> int:

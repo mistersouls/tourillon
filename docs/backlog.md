@@ -20,8 +20,7 @@ Use [`.github/prompts/fix-bug.prompt.md`](../.github/prompts/fix-bug.prompt.md) 
 | A3 | **No quotas.** Nothing bounds per-namespace key count or stored bytes. | no implementation found | `principles.md` lists quota management as an objective, not an implemented feature. |
 | A4 | **No named consistency levels.** Consistency is expressed as raw per-request `quorum_read` / `quorum_write` integers; request models default both to 1. | `tourlib/models/kv.py`, `tourillon/bootstrap/handlers/kv.py` | `principles.md` lists configurable consistency levels as an objective. |
 | A5 | **No failure-domain aware placement.** Placement walks the ring and takes distinct members; there is no label model (rack / zone / region / provider) and no anti-affinity constraint. | `tourillon/core/partition/placement.py`, `tourillon/core/models/member.py` | `principles.md` lists label-based anti-affinity as an objective. Requires member labels on the gossip wire first. |
-| A6 | **No steady-state rebalancing.** Transfers are planned during join and replanned on ring change while joining; there is no periodic or operator-triggered rebalance controller. | `tourillon/core/services/lifecycle.py` (`_run_transfers`) | `principles.md` lists dynamic and automatic rebalance as objectives, not as implemented behavior. |
-| A7 | **Read repair is not observable.** Background read repair now writes the winning version back to stale or missing owners, but its counters live on `StoreService.stats` and are not exported through the telemetry port. | `tourillon/core/services/store.py` (`_schedule_read_repair`, `ReplicationStats`) | Wire `ReplicationStats` to `Telemetry` so repairs, skips and failures are visible in metrics. |
+| A6 | **No steady-state rebalancing.** Data only moves when a join or drain changes the target placement (anti-entropy converges it); there is no periodic or operator-triggered rebalance controller. | `tourillon/core/services/lifecycle.py` (`_sync_data`, `_perform_drain`) | `principles.md` lists dynamic and automatic rebalance as objectives, not as implemented behavior. |
 
 ---
 
@@ -39,9 +38,6 @@ Use [`.github/prompts/fix-bug.prompt.md`](../.github/prompts/fix-bug.prompt.md) 
 
 | # | Item | Evidence |
 | --- | --- | --- |
-| C2 | **A leaked refcount makes a pooled connection unreclaimable, and the pool then evicts connections that are in use.** `_remove_expired` only reaps entries whose `refcount == 0`, and an overflow connection is only closed when a `release()` brings it to zero — neither can happen for a peer that gossip has talked to. Once `max_size` and `max_overflow` are both saturated, every new acquisition takes the LRU branch, which closes a permanent connection **without checking its refcount**, aborting any request in flight on it. | `tourillon/core/peer/pool.py:273`, `tourillon/core/peer/pool.py:279`, `tourillon/core/peer/pool.py:183` (`refcount == 0` conditions), `tourillon/core/peer/pool.py:154-156` (LRU eviction ignores refcount) |
-| C3 | **A peer that changes its bind address resets the refcount of concurrent holders.** `_may_refresh_peer` reconnects and sets `peer.refcount = 1`, discarding the count of callers already holding the old client. Their `release()` calls then drive the counter negative, so `refcount == 0` never holds again and the entry is pinned for the life of the process. The same reconnection also closes the old client under those in-flight requests. | `tourillon/core/peer/pool.py:245-251` |
-| C5 | **Dead placeholder branch on the gossip error path.** `_handle_push_error` compares the peer's error code against the literal string `"todo: critical error should trigger stopping program"`, which no handler ever emits, and the branch only logs. There is no protocol-level way for a peer to signal a fatal condition, although `ProcessError` already plays that role for transfers. | `tourillon/core/gossip/gossiper.py:399-407`, versus `tourillon/bootstrap/handlers/transfer.py:33-34` |
 
 ---
 
@@ -49,9 +45,8 @@ Use [`.github/prompts/fix-bug.prompt.md`](../.github/prompts/fix-bug.prompt.md) 
 
 | # | Item | Evidence |
 | --- | --- | --- |
-| D1 | **Repo-wide lint and format debt.** `uv run ruff check .` reports 109 errors (mostly `I001` import ordering) and `uv run black --check .` would rewrite 168 files. Until this is paid down, contributors and CI must lint only changed files. Pay it down deliberately, in a dedicated formatting-only PR, never mixed with behaviour changes. | `uv run ruff check .`, `uv run black --check .` |
 | D2 | **`tourclient` is not in the coverage gate.** `--cov` covers `tourillon`, `tourctl` and `tourlib` only, so the entire client library's coverage is unmeasured. | `pyproject.toml` (`addopts`) |
-| D3 | **Under-tested runtime internals.** The weakest modules are the peer pool, storage group, node lifecycle, transfer planner, transport session, phi-accrual detector and gossip bootstrapper — exactly the code paths where distributed bugs hide. | `uv run pytest --cov-report=term-missing` |
+| D3 | **Under-tested runtime internals.** The weakest modules are the peer pool, storage group, node lifecycle, anti-entropy join/drain goals, transport session, phi-accrual detector and gossip bootstrapper — exactly the code paths where distributed bugs hide. | `uv run pytest --cov-report=term-missing` |
 | D4 | **E2E relies on bounded polling.** `Journey.wait_for` polls with short sleeps and fixed budgets (`COMMAND_TIMEOUT`, `CONVERGENCE_TIMEOUT`, `SCENARIO_TIMEOUT`); these may be tight on loaded CI runners. Prefer waiting on observable state and keep the budgets reviewed. | `tests/e2e/journey.py` |
 | D5 | **Shallow licence-header check.** `check_license_header.py` only looks for two substrings in the first 20 lines, so a mangled or duplicated header passes unnoticed — one such header was found and fixed in `tourillon/bootstrap/usecases/config.py`. Consider matching the full block. | `scripts/check_license_header.py` |
 | D6 | **No type checker.** There is no mypy/pyright configuration or CI step, although the codebase is fully annotated and `.gitignore` already anticipates `.mypy_cache/`. | `pyproject.toml`, `.gitignore` |
@@ -64,7 +59,7 @@ These are not defects; they are decisions Tourillon has not made yet. Resolve th
 
 1. **Consistency API.** Do quorums stay raw integers, or does Tourillon expose named levels mapped to a replication factor?
 2. **Conflict resolution.** Last-writer-wins by HLC is simple but loses concurrent updates. Does Tourillon need causality tracking, sibling values, or application-supplied merge?
-3. **Repair strategy.** Background read repair is enabled by default, an under-replicated write can be resumed on demand through `kv.repair`, and data anti-entropy compares digests between replicas in the background (`architecture.md` §9). Open: whether hinted handoff should eventually defer to anti-entropy for long outages instead of accumulating obligations.
+3. **Repair strategy.** Background read repair is enabled by default, an under-replicated write can be resumed on demand through `kv.repair`, and data anti-entropy compares digests between replicas in the background (`architecture.md` §9). Read repair and handoff produce durable obligations delivered by anti-entropy. Open: whether obligations for a long-dead target should eventually be dropped in favour of the sweep instead of accumulating.
 4. **Namespace lifecycle.** How is a namespace created, configured, and deleted, and what happens to data on deletion?
 5. **Failure-domain model.** What labels does a node advertise, how do they reach other nodes through gossip, and how strictly does placement enforce them when constraints cannot be satisfied?
 7. **Tombstone lifetime.** When may a tombstone be collected without risking resurrection of deleted data?

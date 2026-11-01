@@ -25,6 +25,9 @@ from tourlib.constant import (
     ENVELOPE_HEADER_LEN as _ENVELOPE_HEADER_LEN,
 )
 from tourlib.constant import (
+    MAX_ENVELOPE_CONTEXT as _MAX_CONTEXT,
+)
+from tourlib.constant import (
     MAX_ENVELOPE_PAYLOAD as _MAX_PAYLOAD,
 )
 from tourlib.constant import (
@@ -44,7 +47,12 @@ class Envelope:
 
     - 32-byte fixed header
     - UTF-8 `kind` string
+    - Opaque `context` bytes (0 to MAX_CONTEXT, usually empty)
     - Opaque `payload` bytes
+
+    The context travels next to the payload but is not part of it: the
+    transport carries it unread and the receiving side's telemetry decodes
+    it. An envelope without context is exactly as large as before it existed.
     """
 
     proto_version: int
@@ -53,15 +61,17 @@ class Envelope:
     correlation_id: UUID
     kind: str
     payload: bytes
+    context: bytes = b""
 
     HEADER_LEN: ClassVar[int] = _ENVELOPE_HEADER_LEN
     MAX_PAYLOAD: ClassVar[int] = _MAX_PAYLOAD
     MAX_KIND_LEN: ClassVar[int] = _MAX_KIND_LEN
+    MAX_CONTEXT: ClassVar[int] = _MAX_CONTEXT
 
     MODE_RPC: ClassVar[int] = 0
     MODE_FNF: ClassVar[int] = 1
 
-    HEADER_STRUCT: ClassVar[struct.Struct] = struct.Struct(">B H B 16s I B 7s")
+    HEADER_STRUCT: ClassVar[struct.Struct] = struct.Struct(">B H B 16s I B B 6s")
     KIND_PATTERN: ClassVar[re.Pattern[str]] = re.compile(
         r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$"
     )
@@ -89,6 +99,10 @@ class Envelope:
             raise TypeError("payload must be bytes")
         if len(self.payload) > self.MAX_PAYLOAD:
             raise ValueError("payload exceeds MAX_PAYLOAD")
+        if not isinstance(self.context, bytes):
+            raise TypeError("context must be bytes")
+        if len(self.context) > self.MAX_CONTEXT:
+            raise ValueError("context exceeds MAX_CONTEXT")
 
     def _validate_kind(self) -> None:
         kind_bytes = self.kind.encode("utf-8")
@@ -108,9 +122,10 @@ class Envelope:
             self.correlation_id.bytes,
             len(self.payload),
             len(kind_bytes),
-            b"\x00" * 7,
+            len(self.context),
+            b"\x00" * 6,
         )
-        return b"".join((header, kind_bytes, self.payload))
+        return b"".join((header, kind_bytes, self.context, self.payload))
 
     @classmethod
     def from_bytes(cls, frame: bytes) -> "Envelope":
@@ -125,17 +140,13 @@ class Envelope:
             correlation_bytes,
             payload_len,
             kind_len,
+            context_len,
             _reserved,
         ) = cls.HEADER_STRUCT.unpack_from(frame)
 
-        if mode not in (cls.MODE_RPC, cls.MODE_FNF):
-            raise ProtocolError("unsupported mode")
-        if not 1 <= kind_len <= cls.MAX_KIND_LEN:
-            raise ProtocolError("invalid kind length")
-        if payload_len > cls.MAX_PAYLOAD:
-            raise ProtocolError("payload exceeds MAX_PAYLOAD")
+        _check_header(mode, kind_len, context_len, payload_len, cls.MAX_PAYLOAD)
 
-        expected_len = cls.HEADER_LEN + kind_len + payload_len
+        expected_len = cls.HEADER_LEN + kind_len + context_len + payload_len
         if len(frame) != expected_len:
             raise ProtocolError("frame length does not match envelope header")
 
@@ -150,7 +161,7 @@ class Envelope:
         except UnicodeDecodeError as exc:
             raise ProtocolError("kind is not valid UTF-8") from exc
 
-        payload = frame[kind_end:]
+        context_end = kind_end + context_len
 
         return cls(
             proto_version=proto_version,
@@ -158,8 +169,22 @@ class Envelope:
             mode=mode,
             correlation_id=correlation_id,
             kind=kind,
-            payload=payload,
+            payload=frame[context_end:],
+            context=frame[kind_end:context_end],
         )
+
+
+def _check_header(
+    mode: int, kind_len: int, context_len: int, payload_len: int, max_payload: int
+) -> None:
+    if mode not in (Envelope.MODE_RPC, Envelope.MODE_FNF):
+        raise ProtocolError("unsupported mode")
+    if not 1 <= kind_len <= Envelope.MAX_KIND_LEN:
+        raise ProtocolError("invalid kind length")
+    if context_len > Envelope.MAX_CONTEXT:
+        raise ProtocolError("context exceeds MAX_CONTEXT")
+    if payload_len > max_payload:
+        raise ProtocolError("payload exceeds max_payload")
 
 
 def build_envelope(
@@ -199,17 +224,14 @@ async def read_envelope(
             raise EOFError from exc
         raise ProtocolError("truncated envelope header") from exc
 
-    _, _, mode, _, payload_len, kind_len, _ = Envelope.HEADER_STRUCT.unpack(header)
+    _, _, mode, _, payload_len, kind_len, context_len, _ = (
+        Envelope.HEADER_STRUCT.unpack(header)
+    )
 
-    if mode not in (Envelope.MODE_RPC, Envelope.MODE_FNF):
-        raise ProtocolError("unsupported mode")
-    if not 1 <= kind_len <= Envelope.MAX_KIND_LEN:
-        raise ProtocolError("invalid kind length")
-    if payload_len > max_payload:
-        raise ProtocolError("payload exceeds max_payload")
+    _check_header(mode, kind_len, context_len, payload_len, max_payload)
 
     try:
-        body = await reader.readexactly(kind_len + payload_len)
+        body = await reader.readexactly(kind_len + context_len + payload_len)
     except asyncio.IncompleteReadError as exc:
         raise ProtocolError("truncated envelope body") from exc
 
@@ -217,6 +239,8 @@ async def read_envelope(
 
 
 def replay_envelope(kind: str, request: Envelope, payload: bytes) -> Envelope:
+    # The request's context is deliberately not echoed: a response belongs to
+    # the caller's trace already.
     return Envelope(
         proto_version=request.proto_version,
         schema_id=request.schema_id,

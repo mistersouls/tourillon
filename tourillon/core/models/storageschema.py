@@ -34,35 +34,29 @@ class Keyspace(StrEnum):
 
 
 class MetaKind(Enum):
-    HINT = b"\x01"
+    OBLIGATION = b"\x01"
     DIGEST = b"\x02"
 
 
 @dataclass(frozen=True, slots=True, eq=True)
-class HintPrefix:
-    intent: str | None = None
+class ObligationPrefix:
+    """
+    META prefix grouping replication obligations.
+
+    Without a target the prefix covers every obligation; with a target it
+    covers the obligations owed to that single node.
+    """
+
+    target: str | None = None
 
     def __post_init__(self) -> None:
-        if self.intent is not None:
-            _validate_intent(self.intent)
+        if self.target is not None:
+            _validate_target(self.target)
 
     def to_bytes(self) -> bytes:
-        if self.intent is None:
-            return MetaKind.HINT.value
-        _validate_intent(self.intent)
-        return MetaKind.HINT.value + _length_prefixed(self.intent.encode("utf-8"))
-
-    @classmethod
-    def from_bytes(cls, b: bytes) -> "HintPrefix":
-        walker = BytesWalker(b)
-        if walker.read(1, "metadata kind") != MetaKind.HINT.value:
-            raise ValueError("metadata prefix is not a hint prefix")
-        if b == MetaKind.HINT.value:
-            return cls()
-        intent = walker.read_field("hint intent").decode("utf-8")
-        if walker.read_remaining():
-            raise ValueError("hint prefix contains trailing bytes")
-        return cls(intent=intent)
+        if self.target is None:
+            return MetaKind.OBLIGATION.value
+        return MetaKind.OBLIGATION.value + _length_prefixed(self.target.encode("utf-8"))
 
 
 def _length_prefixed(value: bytes) -> bytes:
@@ -71,10 +65,10 @@ def _length_prefixed(value: bytes) -> bytes:
     return len(value).to_bytes(2, "big") + value
 
 
-def _validate_intent(intent: str) -> None:
-    if not isinstance(intent, str) or not intent:
-        raise ValueError("hint intent must be a non-empty string")
-    validate_node_id_size(intent)
+def _validate_target(target: str) -> None:
+    if not isinstance(target, str) or not target:
+        raise ValueError("obligation target must be a non-empty string")
+    validate_node_id_size(target)
 
 
 @dataclass(frozen=True, slots=True, eq=True, order=True)
@@ -237,49 +231,38 @@ class Key:
 
 
 @dataclass(frozen=True, slots=True, eq=True)
-class HintKey:
-    intent: str
-    hlc: HLCTimestamp
+class ObligationKey:
+    """
+    Durable promise that `target` must eventually hold the version `key`.
+
+    Layout: OBLIGATION | len(target) | target | TAGS(key). Keying by
+    `(target, version)` makes repeated submissions idempotent.
+    """
+
+    target: str
+    key: "Key"
 
     def __post_init__(self) -> None:
-        _validate_intent(self.intent)
+        _validate_target(self.target)
 
     def to_bytes(self) -> bytes:
-        return HintPrefix(self.intent).to_bytes() + self.hlc.to_bytes()
+        return ObligationPrefix(self.target).to_bytes() + self.key.to_bytes(
+            Keyspace.TAGS
+        )
 
     @classmethod
-    def from_bytes(cls, encoded: bytes) -> "HintKey":
+    def from_bytes(cls, encoded: bytes) -> "ObligationKey":
         walker = BytesWalker(encoded)
-        kind = walker.read(1, "metadata kind")
-        if kind != MetaKind.HINT.value:
-            raise ValueError("metadata key is not a hint obligation")
-        intent_bytes = walker.read_field("hint intent")
+        if walker.read(1, "metadata kind") != MetaKind.OBLIGATION.value:
+            raise ValueError("metadata key is not a replication obligation")
         try:
-            intent = intent_bytes.decode("utf-8")
+            target = walker.read_field("obligation target").decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise ValueError("hint intent is not valid UTF-8") from exc
-        hlc = HLCTimestamp.walk(walker)
+            raise ValueError("obligation target is not valid UTF-8") from exc
+        key = Key.walk(walker, Keyspace.TAGS)
         if walker.read_remaining():
-            raise ValueError("hint key contains trailing bytes")
-        return cls(intent=intent, hlc=hlc)
-
-    def prefix(self) -> bytes:
-        return HintPrefix(self.intent).to_bytes()
-
-
-@dataclass(frozen=True, slots=True, eq=True)
-class HintReference:
-    key: Key
-
-    def to_bytes(self) -> bytes:
-        return self.key.to_bytes(Keyspace.TAGS)
-
-    @classmethod
-    def from_bytes(cls, encoded: bytes) -> "HintReference":
-        key = Key.from_bytes(encoded, Keyspace.TAGS)
-        if key.to_bytes(Keyspace.TAGS) != encoded:
-            raise ValueError("hint reference is not canonical")
-        return cls(key=key)
+            raise ValueError("obligation key contains trailing bytes")
+        return cls(target=target, key=key)
 
 
 @dataclass(frozen=True, slots=True, eq=True)
@@ -327,8 +310,6 @@ class Value:
 class TagKind(Enum):
     LIVE = b"\x00"
     TOMBSTONE = b"\x01"
-    STAGING = b"\x02"
-    HINT = b"\x03"
     STALE = b"\x04"
     PHANTOM = b"\x05"
     RESERVED = b"\x06"
@@ -365,94 +346,11 @@ class TagPayload:
         payload = data["payload"]
         return cls(sub=sub, payload=payload)
 
-    def with_source_prefix(self, source: str) -> bytes:
-        """
-        Prefix the serialized payload with the source length and source bytes.
-        Layout: len_src(2B) || src || original_payload_bytes
-
-        The original payload is kept whole (sub-kind included) so that
-        `Tag.unstaging` can restore the original tag exactly.
-        """
-        src = source.encode("utf-8")
-        len_src = len(src).to_bytes(2, "big")
-        return len_src + src + self.to_bytes()
-
-    def extract_source_prefix(self) -> tuple[str, bytes]:
-        """
-        Extract the source prefix added by `with_source_prefix`.
-
-        Returns a tuple of `(source, original_payload_bytes)`.
-        """
-        if len(self.payload) < 2:
-            raise ValueError(
-                "Source-prefixed payload too short to contain source length"
-            )
-        len_src = int.from_bytes(self.payload[0:2], "big")
-        if len(self.payload) < 2 + len_src:
-            raise ValueError("Source-prefixed payload too short to contain full source")
-        src = self.payload[2 : 2 + len_src]
-        return src.decode("utf-8"), self.payload[2 + len_src :]
-
 
 @dataclass(frozen=True, slots=True, eq=True)
 class Tag:
     kind: TagKind
     payload: TagPayload = field(default_factory=TagPayload)
-
-    @classmethod
-    def hint(cls, original: "Tag") -> "Tag":
-        return cls(
-            kind=TagKind.HINT,
-            payload=TagPayload(sub=original.kind, payload=original.payload.to_bytes()),
-        )
-
-    @classmethod
-    def unhint(cls, hinted: "Tag") -> "Tag":
-        """Reverse `Tag.hint` and recover the original tag."""
-        if hinted.kind != TagKind.HINT:
-            raise ValueError("Cannot unhint a non-HINT tag")
-
-        if hinted.payload.sub is None:
-            raise ValueError("Invalid HINT tag: missing original kind in payload.sub")
-
-        return cls(
-            kind=hinted.payload.sub,
-            payload=TagPayload.from_bytes(hinted.payload.payload),
-        )
-
-    @classmethod
-    def staging(cls, original: "Tag", source: str) -> "Tag":
-        payload = original.payload.with_source_prefix(source)
-        return cls(
-            kind=TagKind.STAGING,
-            payload=TagPayload(sub=original.kind, payload=payload),
-        )
-
-    @classmethod
-    def unstaging(cls, staged: "Tag", source: str | None = None) -> "Tag":
-        """
-        Reverse `Tag.staging` and recover the original Tag.
-
-        If `source` is provided, validate that the staged source matches it.
-        """
-        if staged.kind != TagKind.STAGING:
-            raise ValueError("Cannot unstaging a non-STAGING tag")
-
-        if staged.payload.sub is None:
-            raise ValueError(
-                "Invalid STAGING tag: missing original kind in payload.sub"
-            )
-
-        staged_source, original_payload = staged.payload.extract_source_prefix()
-        if source is not None and staged_source != source:
-            raise ValueError(
-                f"Staging source mismatch: expected '{source}', got '{staged_source}'"
-            )
-
-        return cls(
-            kind=staged.payload.sub,
-            payload=TagPayload.from_bytes(original_payload),
-        )
 
     def to_bytes(self) -> bytes:
         """Return a bytes representation of the Tag."""
@@ -553,54 +451,6 @@ class Record(KeyTag):
         value = Value.from_dict(data["value"])
         tag = Tag.from_dict(data["tag"])
         return cls(key=key, value=value, tag=tag)
-
-
-@dataclass(frozen=True, slots=True)
-class Hint:
-    record: Record
-    intent: str
-    hlc: HLCTimestamp
-
-    def __post_init__(self) -> None:
-        _validate_intent(self.intent)
-        original = Tag.unhint(self.record.tag)
-        if original.kind not in {TagKind.LIVE, TagKind.TOMBSTONE}:
-            raise ValueError("hint must wrap a LIVE or TOMBSTONE tag")
-
-
-@dataclass
-class MetaStaging:
-    digest: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return a dictionary representation of the MetaStaging."""
-        return {"digest": self.digest}
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "MetaStaging":
-        """Create a MetaStaging instance from a dictionary representation."""
-        digest = data.get("digest")
-        return cls(digest=digest)
-
-
-@dataclass
-class MetaValue:
-    staging: dict[str, MetaStaging] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return a dictionary representation of the MetaValue."""
-        return {
-            "staging": {source: meta.to_dict() for source, meta in self.staging.items()}
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "MetaValue":
-        """Create a MetaValue instance from a dictionary representation."""
-        staging_data = data.get("staging", {})
-        staging = {
-            source: MetaStaging.from_dict(meta) for source, meta in staging_data.items()
-        }
-        return cls(staging=staging)
 
 
 @dataclass(frozen=True, slots=True, order=True, eq=True)

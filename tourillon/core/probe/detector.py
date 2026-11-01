@@ -18,7 +18,7 @@ import random
 import time
 from enum import StrEnum
 
-from tourillon.core.log import logger
+from tourillon.core.log import describe, logger
 from tourillon.core.probe.phi import PhiAccrual
 from tourlib import Serializer
 from tourlib.envelope import build_envelope
@@ -105,20 +105,16 @@ class PeerFailureDetector:
         if self._client is None:
             raise RuntimeError("Cannot probe peer without an EnvelopeClient")
 
+        failures = 0
         while True:
-            payload = self._serializer.encode({"timestamp_ms": int(time.time() * 1000)})
-            ping = build_envelope(
-                kind="probe.ping", payload=payload, schema_id=self._serializer.schema_id
-            )
-            try:
-                await self._client.request(ping)
-                self._phi_accrual.record()
-            except Exception as exc:
-                logger.warning("Failed to probe peer %s: %s", self._peer_id, exc)
+            failures = await self._probe_once(self._client, failures)
 
             if self._phi_accrual.has_observations and self._phi_accrual.phi() < 1:
                 self._active = False
                 self._phi_accrual.reset()
+                logger.debug(
+                    "probe peer %s confirmed alive, probing stops", self._peer_id
+                )
                 break
 
             interval = self._probe_interval + random.uniform(
@@ -128,6 +124,38 @@ class PeerFailureDetector:
                 "Probing peer %s, next probe in %.2f seconds", self._peer_id, interval
             )
             await asyncio.sleep(interval)
+
+    async def _probe_once(self, client: EnvelopeClient, failures: int) -> int:
+        """Send one ping; return the number of consecutive failed probes.
+
+        Only the first failure of a streak is a warning: a peer that stays down
+        would otherwise log one line per probe interval until it comes back.
+        """
+        payload = self._serializer.encode({"timestamp_ms": int(time.time() * 1000)})
+        ping = build_envelope(
+            kind="probe.ping", payload=payload, schema_id=self._serializer.schema_id
+        )
+        try:
+            await client.request(ping)
+        except Exception as exc:
+            failures += 1
+            log = logger.warning if failures == 1 else logger.debug
+            log(
+                "probe peer %s failed (attempt %d): %s",
+                self._peer_id,
+                failures,
+                describe(exc),
+            )
+            return failures
+
+        self._phi_accrual.record()
+        if failures:
+            logger.info(
+                "probe peer %s answered after %d failed attempt(s)",
+                self._peer_id,
+                failures,
+            )
+        return 0
 
 
 class FailureDetectorProvider:

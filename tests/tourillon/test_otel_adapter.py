@@ -15,6 +15,7 @@
 from typing import cast
 
 import pytest
+from opentelemetry import trace as otel_trace
 from opentelemetry.trace import Status, StatusCode
 
 from tourillon.core.config import TelemetryConfig
@@ -35,11 +36,24 @@ class _FakeInstrument:
     ) -> None:
         self.calls.append((amount, attributes))
 
+    def record(
+        self, amount: int | float, attributes: dict[str, object] | None = None
+    ) -> None:
+        self.calls.append((amount, attributes))
+
 
 class _FakeMeter:
     def __init__(self) -> None:
         self.counters: dict[str, _FakeInstrument] = {}
         self.up_down_counters: dict[str, _FakeInstrument] = {}
+        self.histograms: dict[str, _FakeInstrument] = {}
+
+    def create_histogram(
+        self, *, name: str, description: str, unit: str
+    ) -> _FakeInstrument:
+        instrument = _FakeInstrument(name=name, description=description, unit=unit)
+        self.histograms[name] = instrument
+        return instrument
 
     def create_counter(
         self, *, name: str, description: str, unit: str
@@ -141,7 +155,6 @@ def test_open_telemetry_adapter_records_metrics_and_spans_with_generic_labels() 
     ae_cycle = telemetry.gossip_ae_cycle_total
     hot_queue = telemetry.gossip_hot_queue_size
     ae_diverged = telemetry.gossip_ae_diverged
-    last_ae_peer = telemetry.gossip_last_ae_peer
     last_ae_at = telemetry.gossip_last_ae_at
     failed_announcements = telemetry.gossip_failed_announcements_total
 
@@ -164,7 +177,6 @@ def test_open_telemetry_adapter_records_metrics_and_spans_with_generic_labels() 
     gauge.labels(endpoint="peer").set(1)
     hot_queue.set(5)
     hot_queue.set(2)
-    last_ae_peer.set(123)
     last_ae_at.set(1700000000)
 
     with telemetry.start_span(
@@ -218,9 +230,6 @@ def test_open_telemetry_adapter_records_metrics_and_spans_with_generic_labels() 
         (5.0, None),
         (-3.0, None),
     ]
-    assert metrics_api.meter.up_down_counters["demo_gossip_last_ae_peer"].calls == [
-        (123.0, None),
-    ]
     assert metrics_api.meter.up_down_counters["demo_gossip_last_ae_at"].calls == [
         (1700000000.0, None),
     ]
@@ -236,6 +245,62 @@ def test_open_telemetry_adapter_records_metrics_and_spans_with_generic_labels() 
     assert isinstance(actual_status, Status)
     assert actual_status.status_code == StatusCode.ERROR
     assert actual_status.description == "boom"
+
+
+@pytest.mark.tourillon
+def test_open_telemetry_adapter_records_store_and_ae_metrics() -> None:
+    metrics_api = _FakeMetricsApi()
+    telemetry = otel_adapter.OpenTelemetryTelemetry(
+        prefix="demo",
+        meter=metrics_api.meter,  # type: ignore[arg-type]
+    )
+    labels = {"op": "write", "outcome": "ok"}
+
+    telemetry.kv_requests_total.add(1, attributes=labels)
+    telemetry.kv_request_duration_seconds.record(0.25, attributes=labels)
+    telemetry.kv_request_duration_seconds.record(0.5)
+    telemetry.replication_failures_total.add(1, attributes={"op": "read"})
+    telemetry.read_repairs_total.add(2, attributes={"outcome": "repaired"})
+    telemetry.obligations_total.add(3, attributes={"event": "recorded"})
+    telemetry.ae_sessions_total.add(1, attributes={"goal": "sweep", "outcome": "ok"})
+    telemetry.ae_versions_total.add(4, attributes={"direction": "pull"})
+    telemetry.ae_bytes_total.add(64, attributes={"direction": "pull"})
+    telemetry.ae_sweeps_total.add(1, attributes={"outcome": "complete"})
+
+    meter = metrics_api.meter
+    assert meter.counters["demo_kv_requests_total"].calls == [(1, labels)]
+    histogram = meter.histograms["demo_kv_request_duration_seconds"]
+    assert histogram.unit == "s"
+    assert histogram.calls == [(0.25, labels), (0.5, None)]
+    assert meter.counters["demo_replication_failures_total"].calls == [
+        (1, {"op": "read"})
+    ]
+    assert meter.counters["demo_read_repairs_total"].calls == [
+        (2, {"outcome": "repaired"})
+    ]
+    assert meter.counters["demo_obligations_total"].calls == [
+        (3, {"event": "recorded"})
+    ]
+    assert meter.counters["demo_ae_sessions_total"].calls == [
+        (1, {"goal": "sweep", "outcome": "ok"})
+    ]
+    assert meter.counters["demo_ae_versions_total"].calls == [
+        (4, {"direction": "pull"})
+    ]
+    assert meter.counters["demo_ae_bytes_total"].calls == [(64, {"direction": "pull"})]
+    assert meter.counters["demo_ae_sweeps_total"].calls == [
+        (1, {"outcome": "complete"})
+    ]
+
+
+@pytest.mark.tourillon
+def test_open_telemetry_adapter_histogram_is_noop_without_meter() -> None:
+    telemetry = otel_adapter.OpenTelemetryTelemetry(prefix="demo")
+
+    histogram = telemetry.kv_request_duration_seconds
+
+    histogram.record(1.0, attributes={"op": "read", "outcome": "ok"})
+    histogram.record(2.0)
 
 
 @pytest.mark.tourillon
@@ -540,3 +605,97 @@ def test_open_telemetry_provider_requires_endpoint_option() -> None:
     assert provider._require_endpoint({"endpoint": "http://localhost:4318"}) == (
         "http://localhost:4318"
     )
+
+
+def _sdk_tracer() -> object:
+    from opentelemetry.sdk.trace import TracerProvider
+
+    return TracerProvider().get_tracer("test")
+
+
+@pytest.mark.tourillon
+def test_open_telemetry_adapter_propagates_trace_context_round_trip() -> None:
+    sender = otel_adapter.OpenTelemetryTelemetry(
+        prefix="demo", tracer=_sdk_tracer()  # type: ignore[arg-type]
+    )
+    receiver = otel_adapter.OpenTelemetryTelemetry(
+        prefix="demo", tracer=_sdk_tracer()  # type: ignore[arg-type]
+    )
+
+    with sender.start_span("kv.put"):
+        sent = otel_trace.get_current_span().get_span_context()
+        data = sender.inject_context()
+
+    assert len(data) == 26
+    assert data[0] == 0x01
+    with receiver.extract_context(data), receiver.start_span("transport.envelope"):
+        child = otel_trace.get_current_span()
+        received = child.get_span_context()
+        parent = child.parent  # type: ignore[attr-defined]
+
+    assert received.trace_id == sent.trace_id
+    assert parent.span_id == sent.span_id
+    assert parent.is_remote
+    assert not otel_trace.get_current_span().get_span_context().is_valid
+
+
+@pytest.mark.tourillon
+def test_open_telemetry_adapter_injects_nothing_without_active_span() -> None:
+    telemetry = otel_adapter.OpenTelemetryTelemetry(
+        prefix="demo", tracer=_sdk_tracer()  # type: ignore[arg-type]
+    )
+
+    assert telemetry.inject_context() == b""
+
+
+@pytest.mark.tourillon
+def test_open_telemetry_adapter_without_tracer_neither_injects_nor_extracts() -> None:
+    sender = otel_adapter.OpenTelemetryTelemetry(
+        prefix="demo", tracer=_sdk_tracer()  # type: ignore[arg-type]
+    )
+    disabled = otel_adapter.OpenTelemetryTelemetry(prefix="demo")
+
+    with sender.start_span("kv.put"):
+        data = sender.inject_context()
+        assert disabled.inject_context() == b""
+    with disabled.extract_context(data):
+        assert not otel_trace.get_current_span().get_span_context().is_valid
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"",
+        b"\x01short",
+        b"\x02" + b"\x11" * 25,
+        b"\x01" + b"\x00" * 24 + b"\x01",
+    ],
+    ids=["empty", "truncated", "unknown-format", "invalid-ids"],
+)
+def test_open_telemetry_adapter_ignores_unreadable_context(data: bytes) -> None:
+    telemetry = otel_adapter.OpenTelemetryTelemetry(
+        prefix="demo", tracer=_sdk_tracer()  # type: ignore[arg-type]
+    )
+
+    with telemetry.extract_context(data):
+        assert not otel_trace.get_current_span().get_span_context().is_valid
+
+
+@pytest.mark.tourillon
+def test_open_telemetry_adapter_starts_a_new_trace_without_remote_context() -> None:
+    telemetry = otel_adapter.OpenTelemetryTelemetry(
+        prefix="demo", tracer=_sdk_tracer()  # type: ignore[arg-type]
+    )
+
+    with telemetry.start_span("outer.request"):
+        connection = otel_trace.get_current_span().get_span_context()
+        with (
+            telemetry.extract_context(b""),
+            telemetry.start_span("transport.envelope"),
+        ):
+            envelope = otel_trace.get_current_span()
+        assert otel_trace.get_current_span().get_span_context() == connection
+
+    assert envelope.parent is None  # type: ignore[attr-defined]
+    assert envelope.get_span_context().trace_id != connection.trace_id

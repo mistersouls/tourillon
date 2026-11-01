@@ -18,18 +18,13 @@ import pytest
 
 from tourillon.core.models.storageschema import (
     MAX_VALUE_DATA_LEN,
-    Hint,
-    HintKey,
-    HintPrefix,
-    HintReference,
     Key,
     Keyspace,
     KeyValue,
+    MetaKind,
+    ObligationKey,
+    ObligationPrefix,
     Pid,
-    Record,
-    Tag,
-    TagKind,
-    TagPayload,
     Value,
 )
 from tourlib.models.ts import HLCTimestamp
@@ -103,184 +98,52 @@ def test_value_rejects_payload_over_16mb() -> None:
         Value(data=b"x" * (MAX_VALUE_DATA_LEN + 1), quorum_write=1)
 
 
-@pytest.mark.tourillon
-def test_staging_round_trip_preserves_tag_payloads() -> None:
-    tags = [
-        Tag(kind=TagKind.LIVE),
-        Tag(kind=TagKind.TOMBSTONE),
-        Tag.hint(Tag(kind=TagKind.LIVE)),
-        Tag.hint(Tag(kind=TagKind.TOMBSTONE)),
-    ]
-
-    for tag in tags:
-        staged = Tag.from_bytes(Tag.staging(tag, "source").to_bytes())
-        restored = Tag.unstaging(staged, "source")
-
-        assert staged.kind is TagKind.STAGING
-        assert restored == tag
-        assert Tag.from_bytes(restored.to_bytes()) == tag
-
-
-@pytest.mark.tourillon
-def test_unstaging_rejects_foreign_and_non_staging_tags() -> None:
-    staged = Tag.staging(Tag(kind=TagKind.LIVE), "source")
-
-    with pytest.raises(ValueError, match="source mismatch"):
-        Tag.unstaging(staged, "other")
-    with pytest.raises(ValueError, match="non-STAGING"):
-        Tag.unstaging(Tag(kind=TagKind.LIVE))
-
-
-@pytest.mark.tourillon
-def test_hint_round_trip_restores_original_tag() -> None:
-    original = Tag(
-        kind=TagKind.TOMBSTONE,
-        payload=TagPayload(sub=TagKind.META, payload=b"reason"),
-    )
-    hinted = Tag.from_bytes(Tag.hint(original).to_bytes())
-
-    restored = Tag.unhint(hinted)
-
-    assert hinted.kind is TagKind.HINT
-    assert restored == original
-    assert Tag.from_bytes(restored.to_bytes()) == original
-
-
-@pytest.mark.tourillon
-def test_unhint_rejects_non_hint_tags() -> None:
-    with pytest.raises(ValueError, match="non-HINT"):
-        Tag.unhint(Tag(kind=TagKind.LIVE))
-
-
-def _hint_key() -> HintKey:
-    return HintKey(
-        intent="node-a",
-        hlc=HLCTimestamp(wall_ms=123, counter=4, node_id="node-b"),
-    )
-
-
-def _record(tag: Tag) -> Record:
-    return Record(
-        key=Key(
-            pid=Pid(8),
-            address=Address(key=b"k", namespace=b"ns"),
-            ts=HLCTimestamp(wall_ms=456, counter=2, node_id="node-a"),
-        ),
-        value=Value(data=b"value", quorum_write=1),
-        tag=tag,
+def _key() -> Key:
+    return Key(
+        pid=Pid(7),
+        address=Address(namespace=b"ns", key=b"key"),
+        ts=HLCTimestamp(wall_ms=10, counter=2, node_id="node-a"),
     )
 
 
 @pytest.mark.tourillon
-def test_hint_prefix_and_key_round_trip_with_and_without_intent_filter() -> None:
-    prefixes = [HintPrefix(), HintPrefix(intent="node-a")]
-
-    for prefix in prefixes:
-        assert HintPrefix.from_bytes(prefix.to_bytes()) == prefix
-
-    key = _hint_key()
-    assert HintKey.from_bytes(key.to_bytes()) == key
-    assert key.to_bytes().startswith(key.prefix())
+def test_obligation_prefix_scopes_all_or_one_target() -> None:
+    assert ObligationPrefix().to_bytes() == MetaKind.OBLIGATION.value
+    scoped = ObligationPrefix("node-b").to_bytes()
+    assert scoped == MetaKind.OBLIGATION.value + b"\x00\x06node-b"
+    assert ObligationKey("node-b", _key()).to_bytes().startswith(scoped)
 
 
 @pytest.mark.tourillon
-def test_hint_reference_round_trip_uses_the_tags_key_encoding() -> None:
-    record = _record(Tag(kind=TagKind.LIVE))
-    key = record.key
-    reference = HintReference(key=key)
+@pytest.mark.parametrize("target", ["x" * 63, "é" * 31 + "a"])
+def test_obligation_key_round_trips_with_the_tags_key_encoding(target: str) -> None:
+    obligation = ObligationKey(target, _key())
 
-    assert HintReference.from_bytes(reference.to_bytes()) == reference
-    assert reference.to_bytes() == reference.key.to_bytes(Keyspace.TAGS)
+    encoded = obligation.to_bytes()
 
-
-@pytest.mark.tourillon
-@pytest.mark.parametrize("intent", ["x" * 63, "é" * 31 + "a"])
-def test_hint_intent_accepts_at_most_63_utf8_bytes(intent: str) -> None:
-    prefix = HintPrefix(intent=intent)
-    template = _hint_key()
-    hlc = template.hlc
-    key = HintKey(intent=intent, hlc=hlc)
-
-    assert HintPrefix.from_bytes(prefix.to_bytes()) == prefix
-    assert HintKey.from_bytes(key.to_bytes()) == key
+    assert encoded.endswith(_key().to_bytes(Keyspace.TAGS))
+    assert ObligationKey.from_bytes(encoded) == obligation
+    assert hash(ObligationKey.from_bytes(encoded)) == hash(obligation)
 
 
 @pytest.mark.tourillon
-@pytest.mark.parametrize("intent", ["", "x" * 64, "é" * 32])
-def test_hint_intent_rejects_empty_or_more_than_63_utf8_bytes(intent: str) -> None:
-    template = _hint_key()
-    hlc = template.hlc
+@pytest.mark.parametrize("target", ["", "x" * 64, "é" * 32])
+def test_obligation_target_rejects_empty_or_oversized_names(target: str) -> None:
     with pytest.raises(ValueError):
-        HintPrefix(intent=intent)
+        ObligationKey(target, _key())
     with pytest.raises(ValueError):
-        HintKey(intent=intent, hlc=hlc)
+        ObligationPrefix(target)
 
 
 @pytest.mark.tourillon
-def test_hint_prefix_rejects_wrong_kind_malformed_and_trailing_bytes() -> None:
-    valid = HintPrefix(intent="node-a").to_bytes()
+def test_obligation_key_rejects_wrong_kind_malformed_and_trailing_bytes() -> None:
+    valid = ObligationKey("node-b", _key()).to_bytes()
 
-    with pytest.raises(ValueError, match="not a hint prefix"):
-        HintPrefix.from_bytes(b"\x02")
+    with pytest.raises(ValueError, match="not a replication obligation"):
+        ObligationKey.from_bytes(MetaKind.DIGEST.value + valid[1:])
+    with pytest.raises(ValueError, match="not valid UTF-8"):
+        ObligationKey.from_bytes(b"\x01\x00\x01\xff" + valid[9:])
     with pytest.raises(ValueError):
-        HintPrefix.from_bytes(b"\x01\x00")
-    with pytest.raises(ValueError):
-        HintPrefix.from_bytes(b"\x01\x00\x01\xff")
-    with pytest.raises(ValueError, match="trailing"):
-        HintPrefix.from_bytes(valid + b"\x00")
-
-
-@pytest.mark.tourillon
-def test_hint_key_rejects_wrong_kind_malformed_and_trailing_bytes() -> None:
-    valid = _hint_key().to_bytes()
-
-    with pytest.raises(ValueError, match="not a hint obligation"):
-        HintKey.from_bytes(b"\x02")
-    with pytest.raises(ValueError):
-        HintKey.from_bytes(b"\x01\x00\x02x")
-    with pytest.raises(ValueError, match="UTF-8"):
-        HintKey.from_bytes(b"\x01\x00\x01\xff" + b"\x00" * 12)
-    with pytest.raises(ValueError):
-        HintKey.from_bytes(valid[:-1])
-    with pytest.raises(ValueError, match="trailing"):
-        HintKey.from_bytes(valid + b"\x00")
-
-
-@pytest.mark.tourillon
-def test_hint_reference_rejects_malformed_and_trailing_bytes() -> None:
-    record = _record(Tag(kind=TagKind.TOMBSTONE))
-    key = record.key
-    reference = HintReference(key=key)
-
-    with pytest.raises(ValueError):
-        HintReference.from_bytes(reference.to_bytes()[:-1])
-    with pytest.raises(ValueError, match="canonical"):
-        HintReference.from_bytes(reference.to_bytes() + b"\x00")
-
-
-@pytest.mark.tourillon
-@pytest.mark.parametrize("kind", [TagKind.LIVE, TagKind.TOMBSTONE])
-def test_hint_accepts_only_wrapped_live_and_tombstone_records(kind: TagKind) -> None:
-    record = _record(Tag.hint(Tag(kind=kind)))
-
-    template = _hint_key()
-    hlc = template.hlc
-    hint = Hint(record=record, intent="node-b", hlc=hlc)
-    hinted_record = hint.record
-    assert hinted_record == record
-
-
-@pytest.mark.tourillon
-def test_hint_rejects_unwrapped_and_non_transferable_record_tags() -> None:
-    template = _hint_key()
-    hlc = template.hlc
-
-    with pytest.raises(ValueError, match="non-HINT"):
-        Hint(record=_record(Tag(kind=TagKind.LIVE)), intent="node-b", hlc=hlc)
-    for original_kind in (TagKind.STAGING, TagKind.STALE, TagKind.PHANTOM):
-        with pytest.raises(ValueError, match="LIVE or TOMBSTONE"):
-            Hint(
-                record=_record(Tag.hint(Tag(kind=original_kind))),
-                intent="node-b",
-                hlc=hlc,
-            )
+        ObligationKey.from_bytes(valid[:-1])
+    with pytest.raises(ValueError, match="trailing bytes"):
+        ObligationKey.from_bytes(valid + b"\x00")

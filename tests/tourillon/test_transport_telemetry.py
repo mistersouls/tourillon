@@ -16,7 +16,7 @@ import asyncio
 import ssl
 from collections import defaultdict
 from collections.abc import AsyncIterator, Mapping
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -119,14 +119,18 @@ class _SpanContextRecorder(AbstractContextManager[Span]):
         store: list[tuple[str, dict[str, AttributeValue]]],
         name: str,
         attributes: Attributes | None,
+        recorders: list[_SpanRecorder] | None = None,
     ) -> None:
         self._store = store
+        self._recorders = recorders if recorders is not None else []
         self._name = name
         self._attributes = dict(attributes or {})
 
     def __enter__(self) -> Span:
         self._store.append((self._name, self._attributes))
-        return _SpanRecorder()
+        span = _SpanRecorder()
+        self._recorders.append(span)
+        return span
 
     def __exit__(self, exc_type, exc, tb) -> bool | None:
         _ = exc_type
@@ -150,6 +154,8 @@ class _TelemetryRecorder(Telemetry):
         self._pool_size_permanent = _GaugeMetricRecorder()
         self._pool_size_overflow = _GaugeMetricRecorder()
         self.spans: list[tuple[str, dict[str, AttributeValue]]] = []
+        self.span_recorders: list[_SpanRecorder] = []
+        self.extracted: list[bytes] = []
 
     @property
     def protocol_errors_total(self) -> CounterMetric:
@@ -205,7 +211,14 @@ class _TelemetryRecorder(Telemetry):
         *,
         attributes: Mapping[str, AttributeValue] | None = None,
     ) -> AbstractContextManager[Span]:
-        return _SpanContextRecorder(self.spans, name, attributes)
+        return _SpanContextRecorder(self.spans, name, attributes, self.span_recorders)
+
+    def inject_context(self) -> bytes:
+        return b""
+
+    def extract_context(self, data: bytes) -> AbstractContextManager[None]:
+        self.extracted.append(data)
+        return nullcontext()
 
 
 @pytest.mark.tourillon
@@ -244,6 +257,7 @@ async def test_transport_telemetry_records_nominal_metrics_and_spans(
         correlation_id=uuid4(),
         kind="gossip.ping",
         payload=b"hello",
+        context=b"\x01remote-span",
     )
     writer.write(request.to_bytes())
     await writer.drain()
@@ -258,13 +272,10 @@ async def test_transport_telemetry_records_nominal_metrics_and_spans(
     assert telemetry._connections_closed_total.values[endpoint_key] == 1
     assert telemetry._dispatched_total.values[endpoint_key] == 1
     assert telemetry._in_flight_current.values[endpoint_key] == 0
+    assert telemetry.extracted == [b"\x01remote-span"]
     span_names = [name for name, _ in telemetry.spans]
-    assert "transport.connection" in span_names
+    assert "transport.connection" not in span_names
     assert "transport.envelope" in span_names
-    assert any(
-        name == "transport.connection" and attributes.get("endpoint") == "server"
-        for name, attributes in telemetry.spans
-    )
     assert any(
         name == "transport.envelope" and attributes.get("endpoint") == "server"
         for name, attributes in telemetry.spans
@@ -354,5 +365,10 @@ async def test_transport_telemetry_records_handler_error_metric(
 
     endpoint_key = _label_key({"endpoint": "server"})
     assert telemetry._protocol_errors_total.values[endpoint_key] == 1
-    span_names = [name for name, _ in telemetry.spans]
-    assert "transport.envelope.error" in span_names
+    # The failure is recorded on the request span itself, not on a sibling
+    # span that would be detached from the request in a trace view.
+    names = [name for name, _ in telemetry.spans]
+    assert "transport.envelope.error" not in names
+    span = telemetry.span_recorders[names.index("transport.envelope")]
+    assert [type(exc) for exc in span.exceptions] == [RuntimeError]
+    assert span.error_descriptions == ["RuntimeError: boom"]
