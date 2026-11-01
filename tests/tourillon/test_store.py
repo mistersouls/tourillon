@@ -1587,6 +1587,7 @@ async def test_failed_replica_write_records_local_obligation() -> None:
     until the next anti-entropy pass.
     """
     queue = ObligationQueue(8)
+    telemetry = RecordingTelemetry()
     store, storage, _, _, _ = _build_store(
         node_id="node-a",
         preferences=(
@@ -1597,6 +1598,7 @@ async def test_failed_replica_write_records_local_obligation() -> None:
         local_store=_StoreStub(),
         remote_responses={},
         obligations=queue,
+        telemetry=telemetry,
     )
 
     await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
@@ -1605,6 +1607,10 @@ async def test_failed_replica_write_records_local_obligation() -> None:
     assert _obligations(storage) == [ObligationKey("node-b", storage.store.record.key)]
     assert store.stats.obligations_recorded == 1
     assert queue.to_dict()["queued"] == 1
+    assert (
+        "storage.obligations.put",
+        {},
+    ) in telemetry.spans
 
 
 @pytest.mark.tourillon
@@ -2691,6 +2697,86 @@ async def test_store_measures_a_successful_operation() -> None:
 
 
 @pytest.mark.tourillon
+async def test_put_traces_storage_and_peer_requests() -> None:
+    telemetry = RecordingTelemetry()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference("node-a", True, None, writable=True),
+            Preference("node-b", True, None, writable=True),
+        ),
+        members={"node-b": _member("node-b", "127.0.0.1:9001")},
+        local_store=_StoreStub(),
+        remote_responses={
+            "replication.write": _record(Address(namespace=b"ns", key=b"key")).to_dict()
+        },
+        telemetry=telemetry,
+    )
+
+    await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+
+    assert ("storage.write", {"group": 7}) in telemetry.spans
+    assert ("storage.transaction", {"group": 7}) in telemetry.spans
+    assert ("storage.record.put", {}) in telemetry.spans
+    assert (
+        "storage.operation",
+        {"group": 7, "kind": "kv.put"},
+    ) in telemetry.spans
+    assert (
+        "peer.request",
+        {"kind": "replication.write", "peer": "node-b"},
+    ) in telemetry.spans
+    assert all(
+        "key" not in attributes and "value" not in attributes
+        for _, attributes in telemetry.spans
+    )
+
+
+@pytest.mark.tourillon
+async def test_put_traces_storage_write_failure() -> None:
+    telemetry = RecordingTelemetry()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, None, writable=True),),
+        members={},
+        local_store=_FailingStore(),
+        remote_responses={},
+        telemetry=telemetry,
+    )
+
+    with pytest.raises(StoreOperationError):
+        await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+
+    assert ("storage.write", {"group": 7}) in telemetry.spans
+    assert ("storage.record.put", {}) in telemetry.spans
+
+
+@pytest.mark.tourillon
+async def test_get_delete_and_repair_trace_local_storage_cost() -> None:
+    record = _record(Address(namespace=b"ns", key=b"key"))
+    telemetry = RecordingTelemetry()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, None, writable=True),),
+        members={},
+        local_store=_StoreStub(record),
+        remote_responses={},
+        telemetry=telemetry,
+    )
+
+    await store.get(GetRequest(namespace=b"ns", key=b"key"))
+    await store.delete(DeleteRequest(namespace=b"ns", key=b"key"))
+    await store.repair(RepairRequest(token=_repair_token(record)))
+
+    kinds = [
+        attributes["kind"]
+        for name, attributes in telemetry.spans
+        if name == "storage.operation"
+    ]
+    assert kinds == ["kv.get", "kv.delete", "kv.repair"]
+
+
+@pytest.mark.tourillon
 async def test_store_measures_a_failed_quorum_and_the_failed_replica(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2718,6 +2804,10 @@ async def test_store_measures_a_failed_quorum_and_the_failed_replica(
     ]
     assert telemetry.total("replication_failures_total", op="write") == 1
     assert telemetry.total("obligations_total", event="recorded") >= 1
+    assert (
+        "peer.request",
+        {"kind": "replication.write", "peer": "node-c"},
+    ) in telemetry.spans
     messages = caplog.messages
     assert any(m.startswith("replication.write failed node=node-a") for m in messages)
     assert any(m.startswith("store.write failed node=node-a") for m in messages)

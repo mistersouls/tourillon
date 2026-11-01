@@ -40,12 +40,13 @@ class _RecordedMetric:
 
 
 class RecordingTelemetry:
-    """Record metric calls as ``calls[name] == [(amount, attributes), ...]``."""
+    """Record metric calls and span starts for unit tests."""
 
     def __init__(self) -> None:
         self.calls: dict[str, list[tuple[float, dict[str, AttributeValue]]]] = (
             defaultdict(list)
         )
+        self.spans: list[tuple[str, dict[str, AttributeValue]]] = []
         self._noop = build_noop_telemetry()
 
     def __getattr__(self, name: str) -> _RecordedMetric:
@@ -59,7 +60,9 @@ class RecordingTelemetry:
         *,
         attributes: Mapping[str, AttributeValue] | None = None,
     ) -> AbstractContextManager[Span]:
-        return self._noop.start_span(name, attributes=attributes)
+        recorded_attributes = dict(attributes or {})
+        self.spans.append((name, recorded_attributes))
+        return self._noop.start_span(name, attributes=recorded_attributes)
 
     def inject_context(self) -> bytes:
         return b""

@@ -280,7 +280,7 @@ class StoreService:
             request.quorum_write,
         )
         records, errors = await self._replicate_write(
-            record, preflist.preferences, request.quorum_write
+            record, preflist.preferences, request.quorum_write, kind="kv.put"
         )
         if not records and errors:
             raise self._replication_error("write", errors)
@@ -308,7 +308,7 @@ class StoreService:
             addr, b"", preflist.placement.partition.pid, True, request.quorum_write
         )
         records, errors = await self._replicate_write(
-            record, preflist.preferences, request.quorum_write
+            record, preflist.preferences, request.quorum_write, kind="kv.delete"
         )
         if not records and errors:
             raise self._replication_error("write", errors)
@@ -325,11 +325,11 @@ class StoreService:
         return version
 
     async def read(self, addr: PartitionAddress) -> Record | None:
-        return await self._local_read(addr)
+        return await self._local_read(addr, kind="replication.read")
 
     async def read_at(self, key: Key) -> Record | None:
         """Answer whether this node holds one exact version."""
-        return await self._local_read_at(key)
+        return await self._local_read_at(key, kind="replication.lookup")
 
     async def write(self, record: Record) -> Record:
         with self._operation("replication.write"):
@@ -345,10 +345,12 @@ class StoreService:
         if record.tag.kind not in _OWNED_KINDS:
             raise ValueError("hint requires a LIVE or TOMBSTONE record")
         with self._operation("replication.hint"):
-            await self._oblige(record, (intent,))
+            await self._oblige(record, (intent,), kind="replication.hint")
         return record
 
-    async def _oblige(self, record: Record, targets: Iterable[str]) -> None:
+    async def _oblige(
+        self, record: Record, targets: Iterable[str], *, kind: str
+    ) -> None:
         """Store ``record`` and the obligations to copy it to ``targets``.
 
         Both land in one write transaction, so an obligation never refers to
@@ -361,10 +363,23 @@ class StoreService:
             if target != self._node_id
         ]
         group = self._partitioner.group_for(record.key.pid.value)
-        provider = await self._storage.session_provider_for(group)
-        async with GroupSessionManager(provider).session(write=True) as session:
-            await session.put(record)
-            await session.put_obligations(obligations)
+        with (
+            self._telemetry.start_span("storage.write", attributes={"group": group}),
+            self._telemetry.start_span(
+                "storage.operation",
+                attributes={"group": group, "kind": kind},
+            ),
+        ):
+            provider = await self._storage.session_provider_for(group)
+            with self._telemetry.start_span(
+                "storage.transaction", attributes={"group": group}
+            ):
+                async with GroupSessionManager(provider).session(write=True) as session:
+                    with self._telemetry.start_span("storage.record.put"):
+                        await session.put(record)
+                    if obligations:
+                        with self._telemetry.start_span("storage.obligations.put"):
+                            await session.put_obligations(obligations)
         self._stats.obligations_recorded += len(obligations)
         self._telemetry.obligations_total.add(
             len(obligations), attributes={"event": "recorded"}
@@ -398,7 +413,7 @@ class StoreService:
                 expected,
                 record.key.address.namespace,
             )
-        return await self._local_write(record)
+        return await self._local_write(record, kind="replication.write")
 
     async def repair(self, request: RepairRequest) -> RepairResult:
         with self._operation("repair"):
@@ -446,7 +461,9 @@ class StoreService:
             self._ensure_repair_quorum(len(holders), request, read_errors, token)
             return RepairResult(RepairIssue.ALREADY_DURABLE, len(holders), token)
 
-        applied, errors = await self._fanout_write(source, missing, None)
+        applied, errors = await self._fanout_write(
+            source, missing, None, kind="kv.repair"
+        )
         durable = len(holders) + len(applied)
         self._ensure_repair_quorum(durable, request, [*read_errors, *errors], token)
         return RepairResult(RepairIssue.REPAIRED, durable, token)
@@ -579,7 +596,7 @@ class StoreService:
         self, target_node_id: str, key: Key
     ) -> Record | None:
         if target_node_id == self._node_id:
-            return await self._local_read_at(key)
+            return await self._local_read_at(key, kind="kv.repair")
         return await self._remote_read_at(target_node_id, key)
 
     async def _replicate_write(
@@ -587,23 +604,29 @@ class StoreService:
         record: Record,
         preferences: Sequence[Preference],
         quorum: int | None,
+        *,
+        kind: str,
     ) -> tuple[list[Record], list[Exception]]:
         targets = self._write_targets(preferences)
         if not targets:
             raise NoReplicaAvailableError("write")
-        return await self._fanout_write(record, targets, quorum)
+        return await self._fanout_write(record, targets, quorum, kind=kind)
 
     async def _fanout_write(
         self,
         record: Record,
         targets: Sequence[tuple[str, str | None]],
         quorum: int | None,
+        *,
+        kind: str,
     ) -> tuple[list[Record], list[Exception]]:
         applied: list[Record] = []
         errors: list[Exception] = []
         tasks = {
             asyncio.create_task(
-                self._write_to_target(target_node_id, record, hinted_node_id),
+                self._write_to_target(
+                    target_node_id, record, hinted_node_id, kind=kind
+                ),
                 name=target_node_id,
             )
             for target_node_id, hinted_node_id in targets
@@ -690,7 +713,7 @@ class StoreService:
         self, target_node_id: str, addr: PartitionAddress
     ) -> Record | None:
         if target_node_id == self._node_id:
-            return await self._local_read(addr)
+            return await self._local_read(addr, kind="kv.get")
         return await self._remote_read(target_node_id, addr)
 
     def _schedule_read_repair(
@@ -805,7 +828,7 @@ class StoreService:
         node_id = marker[1]
         try:
             async with self._repair_slots:
-                await self._apply_hint(holder, record, node_id)
+                await self._apply_hint(holder, record, node_id, kind="replication.hint")
             self._read_repairs("repaired", 1)
         except Exception as exc:
             self._read_repairs("failed", 1)
@@ -831,28 +854,39 @@ class StoreService:
         target_node_id: str,
         record: Record,
         hinted_node_id: str | None,
+        *,
+        kind: str,
     ) -> Record:
         if hinted_node_id is not None:
-            return await self._apply_hint(target_node_id, record, hinted_node_id)
+            return await self._apply_hint(
+                target_node_id, record, hinted_node_id, kind=kind
+            )
         try:
-            return await self._apply_write(target_node_id, record)
+            return await self._apply_write(target_node_id, record, kind=kind)
         except Exception:
             # The placement believed this replica healthy, so nothing else will
             # notice it missed the write. Record the obligation locally and let
             # anti-entropy deliver it instead of dropping it.
-            await self._record_obligation(target_node_id, record)
+            await self._record_obligation(target_node_id, record, kind=kind)
             raise
 
-    async def _apply_write(self, target_node_id: str, record: Record) -> Record:
+    async def _apply_write(
+        self, target_node_id: str, record: Record, *, kind: str
+    ) -> Record:
         if target_node_id == self._node_id:
-            return await self._local_write(record)
+            return await self._local_write(record, kind=kind)
         return await self._remote_write(target_node_id, record)
 
     async def _apply_hint(
-        self, target_node_id: str, record: Record, intent: str
+        self,
+        target_node_id: str,
+        record: Record,
+        intent: str,
+        *,
+        kind: str,
     ) -> Record:
         if target_node_id == self._node_id:
-            await self._oblige(record, (intent,))
+            await self._oblige(record, (intent,), kind=kind)
             return record
         payload = await self._remote_request(
             "replication.hint",
@@ -861,7 +895,9 @@ class StoreService:
         )
         return Record.from_dict(payload)
 
-    async def _record_obligation(self, target_node_id: str, record: Record) -> None:
+    async def _record_obligation(
+        self, target_node_id: str, record: Record, *, kind: str
+    ) -> None:
         """Owe `target_node_id` this version, never masking the write error.
 
         There is nothing to record when the failing target is this node: our
@@ -872,7 +908,7 @@ class StoreService:
         if target_node_id == self._node_id:
             return
         try:
-            await self._oblige(record, (target_node_id,))
+            await self._oblige(record, (target_node_id,), kind=kind)
         except Exception as exc:
             logger.warning(
                 "obligation.record failed target=%s key=%s error=%s",
@@ -906,21 +942,25 @@ class StoreService:
     async def _remote_request(
         self, kind: str, node_id: str, payload: dict[str, Any]
     ) -> Any:
-        client = await self._peer_pool.acquire(node_id)
-        try:
-            envelope = build_envelope(
-                kind=kind,
-                payload=self._serializer.encode(payload),
-                schema_id=self._serializer.schema_id,
-            )
-            response = await client.request(envelope)
-        finally:
-            await self._peer_pool.release(node_id)
+        with self._telemetry.start_span(
+            "peer.request",
+            attributes={"kind": kind, "peer": node_id},
+        ):
+            client = await self._peer_pool.acquire(node_id)
+            try:
+                envelope = build_envelope(
+                    kind=kind,
+                    payload=self._serializer.encode(payload),
+                    schema_id=self._serializer.schema_id,
+                )
+                response = await client.request(envelope)
+            finally:
+                await self._peer_pool.release(node_id)
 
-        expected = f"{kind}.accept"
-        if response.kind != expected:
-            raise RuntimeError(f"invalid response kind for {kind}: {response.kind}")
-        return self._serializer.decode(response.payload)
+            expected = f"{kind}.accept"
+            if response.kind != expected:
+                raise RuntimeError(f"invalid response kind for {kind}: {response.kind}")
+            return self._serializer.decode(response.payload)
 
     @staticmethod
     def _replication_targets(
@@ -975,25 +1015,44 @@ class StoreService:
     ) -> StoreOperationError:
         return StoreOperationError(operation=operation, errors=errors, message=message)
 
-    async def _local_read(self, addr: PartitionAddress) -> Record | None:
+    async def _local_read(self, addr: PartitionAddress, *, kind: str) -> Record | None:
         group = self._partitioner.group_for(addr.pid.value)
-        session_provider = await self._storage.session_provider_for(group)
-        async with GroupSessionManager(session_provider).session() as session:
-            return await session.get(addr)
+        with self._telemetry.start_span(
+            "storage.operation", attributes={"group": group, "kind": kind}
+        ):
+            session_provider = await self._storage.session_provider_for(group)
+            async with GroupSessionManager(session_provider).session() as session:
+                return await session.get(addr)
 
-    async def _local_read_at(self, key: Key) -> Record | None:
+    async def _local_read_at(self, key: Key, *, kind: str) -> Record | None:
         group = self._partitioner.group_for(key.pid.value)
-        session_provider = await self._storage.session_provider_for(group)
-        async with GroupSessionManager(session_provider).session() as session:
-            return await session.read(key)
+        with self._telemetry.start_span(
+            "storage.operation", attributes={"group": group, "kind": kind}
+        ):
+            session_provider = await self._storage.session_provider_for(group)
+            async with GroupSessionManager(session_provider).session() as session:
+                return await session.read(key)
 
-    async def _local_write(self, record: Record) -> Record:
+    async def _local_write(self, record: Record, *, kind: str) -> Record:
         if record.tag.kind not in _OWNED_KINDS:
             raise ValueError("replicated records must be LIVE or TOMBSTONE")
         group = self._partitioner.group_for(record.key.pid.value)
-        session_provider = await self._storage.session_provider_for(group)
-        async with GroupSessionManager(session_provider).session(write=True) as session:
-            await session.put(record)
+        with (
+            self._telemetry.start_span("storage.write", attributes={"group": group}),
+            self._telemetry.start_span(
+                "storage.operation",
+                attributes={"group": group, "kind": kind},
+            ),
+        ):
+            session_provider = await self._storage.session_provider_for(group)
+            with self._telemetry.start_span(
+                "storage.transaction", attributes={"group": group}
+            ):
+                async with GroupSessionManager(session_provider).session(
+                    write=True
+                ) as session:
+                    with self._telemetry.start_span("storage.record.put"):
+                        await session.put(record)
         return record
 
     async def _drain_parallel_tasks(
