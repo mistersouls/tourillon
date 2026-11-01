@@ -53,8 +53,8 @@ async def lookup(request: Envelope) -> AsyncIterator[Envelope]:
     try:
         data: dict[str, Any] = serializer.decode(request.payload)
         key = Key.from_dict(data["key"])
-        record = await manager.store.read_at(key)
-        payload = None if record is None else record.to_dict()
+        result = await manager.store.lookup(key)
+        payload = result.to_dict()
         yield replay_envelope(
             kind="replication.lookup.accept",
             request=request,

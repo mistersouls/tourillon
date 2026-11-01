@@ -56,7 +56,14 @@ pytestmark = pytest.mark.tourillon
 
 VIEW = b"v" * 16
 CELL = b"c" * 24
-SCOPE = Scope((7,), VIEW)
+SCOPE = Scope((7,), VIEW, 64)
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("enabled", [True, False])
+def test_anti_entropy_cannot_be_toggled(enabled: bool) -> None:
+    with pytest.raises(ValidationError, match="anti-entropy is mandatory"):
+        AntiEntropyConfig.from_document({"enabled": enabled})
 
 
 def _record(pid: int = 7, data: bytes = b"value") -> Record:
@@ -84,7 +91,7 @@ def test_requests_and_responses_round_trip() -> None:
     stop = (7).to_bytes(4, "big") + b"\xff"
 
     messages = [
-        RootsRequest(Scope((1, 2), VIEW), (CELL, CELL)),
+        RootsRequest(Scope((1, 2), VIEW, 64), (CELL, CELL)),
         RootsResponse(((1, CELL),)),
         BucketsRequest(SCOPE, None, 5),
         BucketsRequest(SCOPE, 3, 5),
@@ -200,7 +207,6 @@ def test_reject_round_trips_and_tolerates_bad_retry_hints() -> None:
 
 def test_anti_entropy_config_round_trips_through_placement() -> None:
     config = AntiEntropyConfig(
-        enabled=False,
         sweep_period=60.0,
         min_interval=0.5,
         jitter=0.0,

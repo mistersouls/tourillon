@@ -43,9 +43,11 @@ from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import SimplePlacementStrategy
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.probe.detector import FailureDetectorProvider
+from tourillon.core.services.gc import GarbageCollector
 from tourillon.core.services.lifecycle import NodeLifecycle, _background_task
 from tourillon.core.services.store import StoreService
 from tourillon.core.spaces.hashspace import HashSpace
+from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.telemetry import build_noop_telemetry
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourlib.adapter import MsgPackSerializer
@@ -170,9 +172,11 @@ def _build_lifecycle(
         partitioner=partitioner,
         peer_pool=peer_pool,
     )
+    retention = RetentionPolicy(config.placement.retention)
     store = StoreService(
+        retention=retention,
         node_id=config.node.id,
-        storage=storage,  # type: ignore[arg-type]
+        storage=storage,
         partitioner=partitioner,
         placement_strategy=placement,
         clock=HLCClock(node_id=config.node.id),
@@ -191,10 +195,17 @@ def _build_lifecycle(
         peer_pool=peer_pool,
         topologymgr=topologymgr,
         partitioner=Partitioner(hashspace=HashSpace(bits=128), pshift=17, gshift=5),
-        storage=_StorageStub(),  # type: ignore[arg-type]
+        storage=storage,
         gossip_stats=GossipStats(),
         telemetry=build_noop_telemetry(),
         store=store,
+        gc=GarbageCollector(
+            storage,
+            partitioner,
+            config.placement.retention,
+            node_id=config.node.id,
+            telemetry=build_noop_telemetry(),
+        ),
     )
 
 

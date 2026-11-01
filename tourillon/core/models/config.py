@@ -612,10 +612,6 @@ def _ae_int(document: Mapping[str, Any], name: str, default: int, minimum: int) 
 class AntiEntropyConfig:
     """Data anti-entropy runtime options (``[placement.anti_entropy]``).
 
-    - ``enabled``: run the periodic background sweep. Obligation delivery and
-      the join/drain synchronisation goals always run: anti-entropy is the
-      only mechanism that copies versions between nodes.
-
     - ``sweep_period``: target time, in seconds, for this node to compare every
       partition it shares with every co-replica once. Cycles are spread evenly
       over it, so the per-node request rate stays flat whatever the cluster
@@ -654,7 +650,6 @@ class AntiEntropyConfig:
       ones that do not fit are reloaded from META once the queue drains.
     """
 
-    enabled: bool = True
     sweep_period: float = 600.0
     min_interval: float = 1.0
     jitter: float = 0.2
@@ -671,7 +666,6 @@ class AntiEntropyConfig:
 
     def to_document(self) -> dict[str, Any]:
         return {
-            "enabled": self.enabled,
             "sweep_period": self.sweep_period,
             "min_interval": self.min_interval,
             "jitter": self.jitter,
@@ -689,13 +683,12 @@ class AntiEntropyConfig:
 
     @classmethod
     def from_document(cls, document: Mapping[str, Any]) -> "AntiEntropyConfig":
-        enabled = document.get("enabled", True)
-
-        if not isinstance(enabled, bool):
-            raise ValidationError(f"{_AE_PREFIX}enabled must be a boolean")
+        if "enabled" in document:
+            raise ValidationError(
+                f"{_AE_PREFIX}enabled is not supported: anti-entropy is mandatory"
+            )
 
         return cls(
-            enabled=enabled,
             sweep_period=_ae_number(document, "sweep_period", 600.0, minimum=1.0),
             min_interval=_ae_number(document, "min_interval", 1.0, minimum=0.01),
             jitter=_ae_number(document, "jitter", 0.2, minimum=0.0, maximum=1.0),
@@ -707,8 +700,63 @@ class AntiEntropyConfig:
             keys_per_request=_ae_int(document, "keys_per_request", 1024, 1),
             max_batch_bytes=_ae_int(document, "max_batch_bytes", 4 * 1024 * 1024, 1),
             max_repairs_per_cycle=_ae_int(document, "max_repairs_per_cycle", 10_000, 1),
-            max_keys_per_cycle=_ae_int(document, "max_keys_per_cycle", 1_000_000, 1),
+            max_keys_per_cycle=_ae_int(document, "max_keys_per_cycle", 1_000_000, 2),
             hotqueue_size=_ae_int(document, "hotqueue_size", 4096, 1),
+        )
+
+
+@dataclass(frozen=True)
+class RetentionConfig:
+    """Common replica retention policy and bounded local collection."""
+
+    versions: int = 2
+    interval: float = 600.0
+    batch_size: int = 64
+    hotqueue_size: int = 4096
+
+    def __post_init__(self) -> None:
+        for name, maximum in (
+            ("versions", 64),
+            ("batch_size", 1024),
+            ("hotqueue_size", 65536),
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= maximum
+            ):
+                raise ValidationError(
+                    f"placement.retention.{name} must be in [1, {maximum}]"
+                )
+
+        if (
+            isinstance(self.interval, bool)
+            or not isinstance(self.interval, (int, float))
+            or not 0.01 <= self.interval <= 86400
+        ):
+            raise ValidationError(
+                "placement.retention.interval must be in [0.01, 86400]"
+            )
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "versions": self.versions,
+            "interval": self.interval,
+            "batch_size": self.batch_size,
+            "hotqueue_size": self.hotqueue_size,
+        }
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> "RetentionConfig":
+        if not isinstance(document, Mapping):
+            raise ValidationError("placement.retention must be a table")
+
+        return cls(
+            **{
+                name: document.get(name, default)
+                for name, default in cls().to_document().items()
+            }
         )
 
 
@@ -720,6 +768,7 @@ class PlacementConfig:
     read_repair: ReadRepairConfig = field(default_factory=ReadRepairConfig)
     repair: RepairConfig = field(default_factory=RepairConfig)
     anti_entropy: AntiEntropyConfig = field(default_factory=AntiEntropyConfig)
+    retention: RetentionConfig = field(default_factory=RetentionConfig)
 
     def to_document(self) -> dict[str, Any]:
         return {
@@ -727,6 +776,7 @@ class PlacementConfig:
             "read_repair": self.read_repair.to_document(),
             "repair": self.repair.to_document(),
             "anti_entropy": self.anti_entropy.to_document(),
+            "retention": self.retention.to_document(),
         }
 
     @classmethod
@@ -753,6 +803,7 @@ class PlacementConfig:
             read_repair=ReadRepairConfig.from_document(read_repair_doc),
             repair=RepairConfig.from_document(repair_doc),
             anti_entropy=AntiEntropyConfig.from_document(anti_entropy_doc),
+            retention=RetentionConfig.from_document(document.get("retention", {})),
         )
 
 

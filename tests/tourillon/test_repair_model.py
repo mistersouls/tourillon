@@ -17,10 +17,19 @@ import pytest
 from tourillon.core.models.repair import (
     RepairIssue,
     RepairResult,
+    VersionLookup,
     decode_token,
     encode_token,
 )
-from tourillon.core.models.storageschema import Key, Pid
+from tourillon.core.models.storageschema import (
+    Key,
+    KeyTag,
+    Pid,
+    Record,
+    Tag,
+    TagKind,
+    Value,
+)
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
 
@@ -77,3 +86,28 @@ def test_repair_result_roundtrips_through_its_document() -> None:
     )
 
     assert RepairResult.from_dict(result.to_dict()) == result
+
+
+@pytest.mark.tourillon
+def test_version_lookup_round_trip() -> None:
+    record = Record(key=_key(), tag=Tag(TagKind.LIVE), value=Value(b"value", 1))
+    lookup = VersionLookup(record, (KeyTag(record.key, record.tag),), True)
+    assert VersionLookup.from_dict(lookup.to_dict()) == lookup
+    absent = VersionLookup(None)
+    assert VersionLookup.from_dict(absent.to_dict()) == absent
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"record": None, "retained": None, "outside_retention": False},
+        {"record": None, "retained": [None] * 65, "outside_retention": False},
+        {"record": None, "retained": [], "outside_retention": 1},
+    ],
+)
+def test_version_lookup_rejects_malformed_or_unbounded_payload(payload) -> None:
+    with pytest.raises(ValueError):
+        VersionLookup.from_dict(payload)

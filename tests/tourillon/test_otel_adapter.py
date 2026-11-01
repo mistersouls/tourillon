@@ -19,6 +19,7 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.trace import Status, StatusCode
 
 from tourillon.core.config import TelemetryConfig
+from tourillon.core.telemetry import build_noop_telemetry
 from tourillon.infra.adapter.telemetry import otel_adapter
 from tourillon.infra.adapter.telemetry.otel_provider import OpenTelemetryProvider
 from tourlib.exceptions import ValidationError
@@ -291,6 +292,39 @@ def test_open_telemetry_adapter_records_store_and_ae_metrics() -> None:
     assert meter.counters["demo_ae_sweeps_total"].calls == [
         (1, {"outcome": "complete"})
     ]
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize(
+    "name,operation,collection,unit",
+    [
+        ("gc_passes_total", "add", "counters", "1"),
+        ("gc_versions_total", "add", "counters", "1"),
+        ("gc_record_bytes_removed_total", "add", "counters", "1"),
+        ("gc_errors_total", "add", "counters", "1"),
+        ("gc_pass_duration_seconds", "record", "histograms", "s"),
+        ("gc_transaction_duration_seconds", "record", "histograms", "s"),
+        ("gc_hot_queue_size", "set", "up_down_counters", "1"),
+    ],
+)
+def test_gc_metrics_use_cached_instruments_and_support_disabled_telemetry(
+    name: str, operation: str, collection: str, unit: str
+) -> None:
+    meter = _FakeMetricsApi().meter
+    telemetry = otel_adapter.OpenTelemetryTelemetry(
+        prefix="demo",
+        meter=meter,  # type: ignore[arg-type]
+    )
+    labels = {"source": "hot"}
+    metric = getattr(telemetry, name)
+    getattr(metric, operation)(2, attributes=labels)
+    assert getattr(telemetry, name) is metric
+    instrument = getattr(meter, collection)[f"demo_{name}"]
+    assert instrument.unit == unit
+    assert instrument.calls == [(2, labels)]
+    disabled = otel_adapter.OpenTelemetryTelemetry(prefix="demo")
+    getattr(getattr(disabled, name), operation)(2, attributes=labels)
+    getattr(getattr(build_noop_telemetry(), name), operation)(2, attributes=labels)
 
 
 @pytest.mark.tourillon

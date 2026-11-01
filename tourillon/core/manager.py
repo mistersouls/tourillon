@@ -32,11 +32,13 @@ from tourillon.core.ports import Telemetry, TelemetryProvider
 from tourillon.core.ports.storage import StorageProvider
 from tourillon.core.probe.detector import FailureDetectorProvider
 from tourillon.core.services.antientropy import AntiEntropyService
+from tourillon.core.services.gc import GarbageCollector
 from tourillon.core.services.gossip import GossipService
 from tourillon.core.services.inspector import NodeInspector
 from tourillon.core.services.lifecycle import NodeLifecycle
 from tourillon.core.services.store import StoreService
 from tourillon.core.spaces.hashspace import HashSpace
+from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourlib.models.inspect import NodeInfo, NodeInspectRequest
 from tourlib.port import Persistence, Serializer
@@ -89,9 +91,17 @@ class Manager:
             peer_pool=self._peer_pool,
         )
         self._obligations = ObligationQueue(config.placement.anti_entropy.hotqueue_size)
+        self._gc = GarbageCollector(
+            self._storage,
+            self._partitioner,
+            config.placement.retention,
+            node_id=config.node.id,
+            telemetry=self._telemetry,
+        )
         self._store = StoreService(
             node_id=config.node.id,
             storage=self._storage,
+            retention=RetentionPolicy(config.placement.retention),
             partitioner=self._partitioner,
             placement_strategy=self._placement_strategy,
             clock=self._clock,
@@ -119,6 +129,7 @@ class Manager:
             telemetry=self._telemetry,
             store=self._store,
             obligations=self._obligations,
+            gc=self._gc,
         )
         self._inspector = NodeInspector(
             node_id=self._config.node.id,
@@ -169,6 +180,10 @@ class Manager:
         """Get the data anti-entropy service."""
         return self._lifecycle.antientropy
 
+    @property
+    def gc(self) -> GarbageCollector:
+        return self._gc
+
     async def start(self, seeds: list[str] | None = None) -> None:
         """Start the Tourillon daemon.
 
@@ -194,6 +209,7 @@ class Manager:
             latest.node_id or "-",
         )
         self._clock.restore(latest.wall_ms, latest.counter)
+        await self._gc.start()
         await self._lifecycle.start(seeds=seeds)
         logger.debug("Manager started for node '%s'", self.node_id)
 
@@ -201,6 +217,7 @@ class Manager:
         logger.info("Node '%s' shutting down", self.node_id)
         for step in (
             self._lifecycle.stop,
+            self._gc.stop,
             # Detached replications must settle while the peer pool and the
             # storage they depend on are still open.
             self._store.close,

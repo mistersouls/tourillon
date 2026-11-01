@@ -63,6 +63,18 @@ class LmdbSession(Session):
     async def exists(self, ref: KVRef) -> bool:
         return await self._executor.execute(self._txn.exists, ref)
 
+    async def keys(
+        self,
+        keyspace: Keyspace,
+        prefix: SupportsBytes | None = None,
+        start: bytes | None = None,
+        limit: int = 64,
+        reverse: bool = False,
+    ) -> list[KVRef]:
+        return await self._executor.execute(
+            self._txn.keys, keyspace, prefix, start, limit, reverse
+        )
+
     async def put(self, kv: KVPair, overwrite: bool = True) -> bool:
         return await self._executor.execute(self._txn.put, kv, overwrite=overwrite)
 

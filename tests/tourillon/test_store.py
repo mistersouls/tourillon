@@ -28,17 +28,24 @@ from tourillon.core.exceptions import (
     InvalidRepairTokenError,
     NodeDrainingError,
     NoReplicaAvailableError,
+    OutdatedRepairError,
     QuorumNotMetError,
     StoreOperationError,
     VersionNotFoundError,
 )
 from tourillon.core.models.clock import HLCClock
-from tourillon.core.models.config import ReadRepairConfig
+from tourillon.core.models.config import ReadRepairConfig, RetentionConfig
 from tourillon.core.models.member import Member, MemberPhase
-from tourillon.core.models.repair import RepairIssue, decode_token, encode_token
+from tourillon.core.models.repair import (
+    RepairIssue,
+    VersionLookup,
+    decode_token,
+    encode_token,
+)
 from tourillon.core.models.storageschema import (
     Key,
     Keyspace,
+    KeyTag,
     KVPair,
     KVRef,
     MetaKind,
@@ -62,6 +69,7 @@ from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports.storage import Storage
 from tourillon.core.services.store import StoreService
 from tourillon.core.spaces.vnode import VNode
+from tourillon.core.storage.retention import RetentionPolicy
 from tourlib.adapter import MsgPackSerializer
 from tourlib.constant import MAX_CLOCK_SKEW_MS, MAX_QUORUM
 from tourlib.envelope import Envelope, build_envelope
@@ -112,6 +120,7 @@ class _StoreStub:
 class _SessionStub:
     def __init__(self, store: _StoreStub) -> None:
         self.store = store
+        self.key_pages = 0
         self._pairs: dict[tuple[Keyspace, bytes], KVPair] = {}
         if store.record is not None:
             self._pairs[(Keyspace.LOGS, store.record.key.to_bytes(Keyspace.LOGS))] = (
@@ -186,7 +195,7 @@ class _SessionStub:
 class _WriteBatch:
     def __init__(self, session: _SessionStub) -> None:
         self._session = session
-        self._ops: list[tuple[str, KVPair | KVRef, bool]] = []
+        self._ops: list[tuple[str, Any, bool]] = []
 
     async def __aenter__(self) -> "_WriteBatch":
         return self
@@ -203,6 +212,10 @@ class _WriteBatch:
     def exists(self, ref: KVRef) -> None:
         self._ops.append(("exists", ref, False))
 
+    def keys(self, keyspace, prefix=None, start=None, limit=64, reverse=False) -> None:
+        self._session.key_pages += 1
+        self._ops.append(("keys", (keyspace, prefix, start, limit), reverse))
+
     async def result(self) -> list[Any]:
         results = []
         for kind, item, overwrite in self._ops:
@@ -212,6 +225,20 @@ class _WriteBatch:
             elif kind == "exists":
                 assert isinstance(item, KVRef)
                 results.append(await self._session.exists(item))
+            elif kind == "keys":
+                ks, prefix, start, limit = item
+                prefix_bytes = b"" if prefix is None else prefix.to_bytes()
+                keys = sorted(
+                    (
+                        key
+                        for space, key in self._session._pairs
+                        if space == ks
+                        and key.startswith(prefix_bytes)
+                        and (start is None or key > start)
+                    ),
+                    reverse=overwrite,
+                )
+                results.append([KVRef(key, ks) for key in keys[:limit]])
             else:
                 results.append(await self._session.get(item))
         return results
@@ -311,6 +338,16 @@ class _PeerClientStub:
             await asyncio.sleep(delay)
         response = self._responses[envelope.kind]
         payload_doc = response.pop(0) if isinstance(response, list) else response
+        if envelope.kind == "replication.lookup":
+            payload_doc = (
+                payload_doc.to_dict()
+                if isinstance(payload_doc, VersionLookup)
+                else {
+                    "record": payload_doc,
+                    "retained": [],
+                    "outside_retention": False,
+                }
+            )
         payload = self._serializer.encode(payload_doc)
         return build_envelope(
             kind=f"{envelope.kind}.accept",
@@ -385,6 +422,133 @@ def _record(
     )
 
 
+@pytest.mark.tourillon
+async def test_exact_repair_reports_outdated_without_substituting_a_newer_version() -> (
+    None
+):
+    address = Address(namespace=b"ns", key=b"key")
+    old = _record(address, wall_ms=1)
+    current = _record(address, wall_ms=3)
+    members = {
+        node: _member(node, f"127.0.0.1:{port}")
+        for node, port in [("node-a", 9001), ("node-b", 9002)]
+    }
+    store, _, _, _, client = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference("node-a", True, None, True),
+            Preference("node-b", True, None, True),
+        ),
+        members=members,
+        local_store=_StoreStub(current),
+        remote_responses={
+            "replication.lookup": VersionLookup(
+                None, (KeyTag(current.key, current.tag),), True
+            )
+        },
+        retention_versions=1,
+    )
+    with pytest.raises(OutdatedRepairError) as caught:
+        await store.repair(RepairRequest(token=encode_token(old.key), quorum_write=2))
+    payload = caught.value.to_dict()
+    assert payload["code"] == "outdated"
+    assert payload["received"] == 0
+    assert payload["required"] == 2
+    assert payload["newer"] == [
+        {
+            "version": KeyTag(current.key, current.tag).to_dict(),
+            "replicas": 2,
+            "owners": ["node-a", "node-b"],
+        }
+    ]
+    assert all(e.kind == "replication.lookup" for e in client.requests)
+    assert await store.read_at(current.key) == current
+    assert await store.read_at(old.key) is None
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("hinted", [False, True])
+async def test_replication_stores_exact_history_without_retention_admission(
+    hinted: bool,
+) -> None:
+    address = Address(namespace=b"ns", key=b"key")
+    current = _record(address, wall_ms=3)
+    store, storage, *_ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, None, True),),
+        members={"node-a": _member("node-a", "127.0.0.1:9001")},
+        local_store=_StoreStub(current),
+        remote_responses={},
+        retention_versions=1,
+    )
+    old = _record(address, wall_ms=1)
+    if hinted:
+        result = await store.hint(old, "node-b")
+    else:
+        result = await store.write(old)
+    assert result == old
+    assert await store.read_at(old.key) == old
+    assert await store.read_at(current.key) == current
+    assert storage._session.key_pages == 0
+    assert (
+        any(
+            ks == Keyspace.META and key.startswith(MetaKind.OBLIGATION.value)
+            for ks, key in storage._session._pairs
+        )
+        == hinted
+    )
+
+
+@pytest.mark.tourillon
+async def test_exact_repair_restores_history_when_another_replica_has_a_source() -> (
+    None
+):
+    address = Address(namespace=b"ns", key=b"key")
+    old = _record(address, wall_ms=1)
+    current = _record(address, wall_ms=3)
+    store, storage, _, _, client = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference("node-a", True, None, True),
+            Preference("node-b", True, None, True),
+        ),
+        members={
+            node: _member(node, f"127.0.0.1:{port}")
+            for node, port in [("node-a", 9001), ("node-b", 9002)]
+        },
+        local_store=_StoreStub(current),
+        remote_responses={"replication.lookup": VersionLookup(old)},
+        retention_versions=1,
+    )
+    result = await store.repair(
+        RepairRequest(token=encode_token(old.key), quorum_write=2)
+    )
+    assert result.issue == RepairIssue.REPAIRED
+    assert result.replicas == 2
+    assert await store.read_at(old.key) == old
+    assert await store.read_at(current.key) == current
+    assert storage._session.key_pages == 1
+    assert all(e.kind == "replication.lookup" for e in client.requests)
+
+
+@pytest.mark.tourillon
+async def test_kv_put_does_not_read_retention_metadata() -> None:
+    store, storage, *_ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, None, True),),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    for data in [b"first", b"second", b"third"]:
+        version = await store.put(PutRequest(namespace=b"ns", key=b"key", value=data))
+        assert version is not None
+        assert version.data == data
+    assert storage._session.key_pages == 0
+    assert sum(ks == Keyspace.LOGS for ks, _ in storage._session._pairs) == 3
+    await store.close()
+
+
 def _build_store(
     *,
     node_id: str,
@@ -398,6 +562,7 @@ def _build_store(
     read_repair: ReadRepairConfig | None = None,
     obligations: ObligationQueue | None = None,
     telemetry: RecordingTelemetry | None = None,
+    retention_versions: int = 2,
 ) -> tuple[
     StoreService, _StorageStub, _PeerPoolStub, MsgPackSerializer, _PeerClientStub
 ]:
@@ -408,6 +573,7 @@ def _build_store(
     service = StoreService(
         node_id=node_id,
         storage=cast(Storage, cast(object, storage)),
+        retention=RetentionPolicy(RetentionConfig(versions=retention_versions)),
         partitioner=cast(Partitioner, cast(object, _PartitionerStub(partitioner_pid))),
         placement_strategy=cast(
             PlacementStrategy, cast(object, _PlacementStub(preferences))
@@ -940,6 +1106,7 @@ async def test_put_raises_when_remote_response_kind_is_invalid() -> None:
     service = StoreService(
         node_id="node-a",
         storage=cast(Storage, cast(object, storage)),
+        retention=RetentionPolicy(RetentionConfig(versions=2)),
         partitioner=cast(Partitioner, cast(object, _PartitionerStub())),
         placement_strategy=cast(
             PlacementStrategy,

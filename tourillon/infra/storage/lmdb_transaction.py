@@ -119,6 +119,40 @@ class LmdbTransaction:
 
         return items
 
+    def keys(
+        self,
+        keyspace: Keyspace,
+        prefix: SupportsBytes | None = None,
+        start: bytes | None = None,
+        limit: int = 64,
+        reverse: bool = False,
+    ) -> list[KVRef]:
+        if limit <= 0:
+            return []
+
+        prefix_bytes = prefix.to_bytes() if prefix is not None else None
+        with self._txn.cursor(db=self._dbis[keyspace]) as cursor:
+            if not self._position_cursor(cursor, prefix_bytes, start, reverse):
+                return []
+
+            iterator = (
+                cursor.iterprev(keys=True, values=False)
+                if reverse
+                else cursor.iternext(keys=True, values=False)
+            )
+            keys: list[KVRef] = []
+
+            for raw in iterator:
+                key = bytes(raw)
+                if prefix_bytes is not None and not key.startswith(prefix_bytes):
+                    break
+
+                keys.append(KVRef(key, keyspace))
+                if len(keys) >= limit:
+                    break
+
+            return keys
+
     @staticmethod
     def _advance_cursor(cursor: lmdb.Cursor, reverse: bool) -> bool:
         if reverse:

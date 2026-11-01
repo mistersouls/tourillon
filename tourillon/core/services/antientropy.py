@@ -100,7 +100,9 @@ from tourillon.core.ae.sync import (
     PeerSync,
     SessionLimits,
     SessionTally,
+    SyncProgress,
     ViewChangedError,
+    delivery_count,
     human_bytes,
 )
 from tourillon.core.ae.tracker import ViewTracker
@@ -118,11 +120,18 @@ from tourillon.core.models.antientropy import (
 from tourillon.core.models.config import AntiEntropyConfig
 from tourillon.core.models.member import MemberPhase
 from tourillon.core.models.retry import BackoffRetry
-from tourillon.core.models.storageschema import Key, Keyspace, ObligationKey, Record
+from tourillon.core.models.storageschema import (
+    Key,
+    Keyspace,
+    ObligationKey,
+    PartitionAddress,
+    Record,
+)
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports.storage import Storage
 from tourillon.core.ports.telemetry import Telemetry
+from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.telemetry import build_noop_telemetry
 from tourlib import Serializer
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT
@@ -337,10 +346,12 @@ class AntiEntropyService:
         replication_factor: int,
         config: AntiEntropyConfig,
         *,
+        retention: RetentionPolicy,
         obligations: ObligationQueue | None = None,
         clock: Callable[[], float] = time.time,
         backoff: BackoffRetry | None = None,
         telemetry: Telemetry | None = None,
+        notify: Callable[[PartitionAddress], None],
     ) -> None:
         self._node_id = node_id
         self._telemetry = telemetry or build_noop_telemetry()
@@ -350,7 +361,7 @@ class AntiEntropyService:
         self._serializer = serializer
         self._config = config
         self._clock = clock
-        self.local = LocalStore(storage, partitioner)
+        self.local = LocalStore(storage, partitioner, notify, retention)
         self.obligations = obligations or ObligationQueue(config.hotqueue_size)
 
         self.tracker = ViewTracker(
@@ -375,6 +386,7 @@ class AntiEntropyService:
         self._batch = min(config.keys_per_request, MAX_PAGE_LIMIT)
         self._batch_bytes = min(config.max_batch_bytes, MAX_BATCH_BYTES)
         self._retry_delay = max(1.0, config.min_interval)
+        self._progress: dict[tuple[str, str], SyncProgress] = {}
 
     @property
     def stats(self) -> AntiEntropyStats:
@@ -387,7 +399,6 @@ class AntiEntropyService:
     def to_dict(self) -> dict[str, Any]:
         view = self.tracker.view
         return {
-            "enabled": self._config.enabled,
             "running": self.running,
             "serial": None if view is None else view.serial,
             "served_applied": self.responder.applied,
@@ -397,23 +408,16 @@ class AntiEntropyService:
         }
 
     async def start(self) -> None:
-        """Start the view tracker, the responder, delivery and the sweep.
-
-        Delivery always runs; ``enabled`` only governs the periodic sweep.
-        """
+        """Start the view tracker, the responder, delivery and the sweep."""
         if self.running:
             return
 
         self.tracker.start()
         self.responder.start()
         self._tasks = [
-            asyncio.create_task(self._deliver_loop(), name="antientropy-delivery")
+            asyncio.create_task(self._deliver_loop(), name="antientropy-delivery"),
+            asyncio.create_task(self._run(), name="antientropy-loop"),
         ]
-
-        if self._config.enabled:
-            self._tasks.append(
-                asyncio.create_task(self._run(), name="antientropy-loop")
-            )
 
         logger.info("ae.started node=%s", self._node_id)
 
@@ -837,13 +841,19 @@ class AntiEntropyService:
     async def deliver(self, batch: Sequence[ObligationKey], view: ReplicaView) -> None:
         """Push the versions of ``batch`` to their targets, then forget them.
 
-        An obligation is dropped without a copy when the version is gone or
-        no longer owned, or when its target no longer replicates the pid in
-        the target view: the sweep and the drain then cover that version.
+        A captured debt is covered by the latest local version. Missing
+        covering data is reported and retained; only a target no longer in
+        the preference list makes a debt obsolete without delivery.
         """
         owed = {ob for ob in batch if self._owed(ob, view)}
-        records = await self.local.records([ob.key for ob in owed])
-        obsolete = [ob for ob in batch if ob not in owed or ob.key not in records]
+        records = await self.local.latest_records(list(owed))
+        obsolete = [ob for ob in batch if ob not in owed]
+        unavailable = [ob for ob in owed if ob.key not in records]
+        if unavailable:
+            self.obligations.backlog = True
+            logger.error(
+                "ae.obligations no covering local version count=%d", len(unavailable)
+            )
         ready = sorted((ob for ob in owed if ob.key in records), key=_delivery_order)
 
         for target, group in groupby(ready, key=lambda ob: ob.target):
@@ -913,13 +923,19 @@ class AntiEntropyService:
         view: ReplicaView,
     ) -> bool:
         call = self._caller(target)
-        scope = Scope((pid,), view.view_hash((pid,)))
+        scope = Scope((pid,), view.view_hash((pid,)), self.local.retention_versions)
 
         for chunk in _chunks(obligations, records, self._batch_bytes):
-            request = PushRequest(scope, tuple(records[ob.key] for ob in chunk))
+            unique = {records[ob.key].key: records[ob.key] for ob in chunk}
+            request = PushRequest(scope, tuple(unique.values()))
 
             try:
-                await call("antientropy.push", request.to_dict())
+                result = await call("antientropy.push", request.to_dict())
+                acknowledged = delivery_count(result)
+                if acknowledged != len(unique):
+                    raise ProtocolError(
+                        "obligation push did not acknowledge every record"
+                    )
             except _SESSION_ERRORS as exc:
                 self._failed(target, exc)
                 return False
@@ -950,8 +966,28 @@ class AntiEntropyService:
         )
 
         return PeerSync(
-            self.local, peer, self._caller(peer), view, stale, limits, cutoff_ms, goal
+            self.local,
+            peer,
+            self._caller(peer),
+            view,
+            stale,
+            limits,
+            cutoff_ms,
+            goal,
+            progress=self._sync_progress(peer, view),
         )
+
+    def _sync_progress(self, peer: str, view: ReplicaView) -> SyncProgress:
+        key = (peer, view.serial)
+        if key not in self._progress:
+            self._progress = {
+                k: v for k, v in self._progress.items() if k[1] == view.serial
+            }
+            if len(self._progress) >= 256:
+                self._progress.pop(next(iter(self._progress)))
+            self._progress[key] = SyncProgress()
+
+        return self._progress[key]
 
     def _cutoff_ms(self) -> int:
         return int((self._clock() - self._config.grace) * 1000)
@@ -1107,14 +1143,18 @@ def _chunks(
     current: list[ObligationKey] = []
     size = 0
 
+    grouped: dict[Key, list[ObligationKey]] = {}
     for obligation in obligations:
-        cost = record_size(records[obligation.key])
+        grouped.setdefault(records[obligation.key].key, []).append(obligation)
+
+    for debts in grouped.values():
+        cost = record_size(records[debts[0].key])
 
         if current and size + cost > max_bytes:
             chunks.append(current)
             current, size = [], 0
 
-        current.append(obligation)
+        current.extend(debts)
         size += cost
 
     if current:

@@ -54,7 +54,8 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from itertools import groupby
 from typing import Any
 
 from tourillon.core.ae.local import LocalStore
@@ -121,6 +122,14 @@ class SessionLimits:
     max_keys_scanned: int
 
 
+@dataclass
+class SyncProgress:
+    """In-memory budget checkpoints, scoped to one peer and replica view."""
+
+    positions: dict[int, tuple[int, bytes | None]] = field(default_factory=dict)
+    next_pid: int = 0
+
+
 class PeerSync:
     def __init__(
         self,
@@ -132,6 +141,8 @@ class PeerSync:
         limits: SessionLimits,
         cutoff_ms: int,
         goal: str | None = None,
+        *,
+        progress: SyncProgress,
     ) -> None:
         self._local = local
         self._peer = peer
@@ -142,7 +153,12 @@ class PeerSync:
 
         # Pages and batches are clamped to what one envelope holds; anything
         # beyond is paginated, never refused.
-        self._page = min(limits.keys_per_request, MAX_PAGE_LIMIT)
+        self._page = min(
+            limits.keys_per_request,
+            MAX_PAGE_LIMIT,
+            max(1, limits.max_keys_scanned // 2),
+            max(1, limits.max_repairs),
+        )
         self._batch_bytes = min(limits.max_batch_bytes, MAX_BATCH_BYTES)
         self._cutoff_ms = cutoff_ms
         self.tally = SessionTally()
@@ -157,6 +173,7 @@ class PeerSync:
         # bucket: those versions were not compared yet, so the pid is not
         # fully reconciled even when the session succeeds.
         self.recent: set[int] = set()
+        self._progress = progress
 
     async def sync_roots(self, pids: Sequence[int]) -> None:
         """Compare roots of ``pids`` with the peer, then reconcile those that differ.
@@ -166,6 +183,7 @@ class PeerSync:
         ViewChangedError, BudgetSpentError or the transport / reject error that
         stopped it.
         """
+        pids = sorted(pids, key=lambda pid: (pid < self._progress.next_pid, pid))
         pages = -(-len(pids) // MAX_PIDS_PER_REQUEST)
 
         for index, start in enumerate(range(0, len(pids), MAX_PIDS_PER_REQUEST)):
@@ -221,8 +239,14 @@ class PeerSync:
         differing = {pid for pid, _ in response.diffs if pid in local}
         self.tally.pids_diverged += len(differing)
 
-        for pid in sorted(differing):
+        ordered = sorted(
+            differing, key=lambda pid: (pid < self._progress.next_pid, pid)
+        )
+        for pid in ordered:
+            self._progress.next_pid = pid
             await self.sync_pid(pid)
+            self._progress.positions.pop(pid, None)
+            self._progress.next_pid = pid + 1
 
         return len(differing)
 
@@ -246,6 +270,11 @@ class PeerSync:
             for bucket in sorted(theirs.keys() | mine.keys()):
                 if bucket > cutoff_bucket:
                     break
+                saved_bucket, _ = self._progress.positions.get(pid, (-1, None))
+                if bucket < saved_bucket:
+                    continue
+                if bucket > saved_bucket:
+                    self._progress.positions[pid] = (bucket, None)
                 await self._sync_bucket(
                     scope, pid, bucket, theirs.get(bucket), mine.get(bucket)
                 )
@@ -312,50 +341,86 @@ class PeerSync:
         ``keys_per_request`` even when one side holds a whole bucket the
         other lacks.
         """
-        cursor = start
+        _, saved = self._progress.positions.get(pid, (-1, None))
+        cursor = saved if saved is not None and start <= saved < stop else start
 
         while cursor is not None:
+            remaining = self._limits.max_keys_scanned - self.tally.keys_scanned
+            if remaining < 2:
+                raise BudgetSpentError("keys scanned")
+            limit = min(self._page, remaining // 2)
             page = KeysResponse.from_dict(
                 await self._rpc(
                     "antientropy.keys",
-                    KeysRequest(scope, cursor, stop, self._page).to_dict(),
+                    KeysRequest(scope, cursor, stop, limit).to_dict(),
                 )
             )
 
-            self._spend_scan(len(page.keys))
-            window_stop = stop if page.cursor is None else page.cursor + b"\x00"
-
-            missing = await self._push_window(
-                scope, pid, cursor, window_stop, set(page.keys)
+            local, local_cursor = await self._local.keys(cursor, stop, limit)
+            self._spend_scan(len(page.keys) + len(local))
+            ends = [c for c in (page.cursor, local_cursor) if c is not None]
+            cursor = min(ends) if ends else None
+            boundary = stop if cursor is None else cursor + b"\x00"
+            bucket = (
+                int.from_bytes(start[PID_SIZE : PID_SIZE + 8], "big")
+                >> DEFAULT_BUCKET_SHIFT
+            )
+            await self._merge_page(
+                scope,
+                pid,
+                bucket,
+                boundary,
+                {k.to_bytes(Keyspace.TAGS) for k in local},
+                set(page.keys),
+            )
+            self._progress.positions[pid] = (
+                (bucket + 1, None) if cursor is None else (bucket, cursor)
             )
 
-            if missing and self._view.is_replica(pid):
-                await self._pull(scope, pid, sorted(missing))
+    async def _merge_page(
+        self,
+        scope: Scope,
+        pid: int,
+        bucket: int,
+        boundary: bytes,
+        mine: set[bytes],
+        theirs: set[bytes],
+    ) -> None:
+        ordered = sorted(k for k in mine | theirs if k < boundary)
+        for direction, group in groupby(
+            ordered, key=lambda raw: self._direction(raw, pid, mine, theirs)
+        ):
+            keys = list(group)
+            while keys:
+                if direction != "skip":
+                    self._spend_repairs()
+                remaining = (
+                    self._limits.max_repairs - self.tally.pushed - self.tally.pulled
+                )
+                chunk = keys[: min(self._page, max(1, remaining))]
+                await self._merge_chunk(scope, pid, direction, chunk)
+                # Only completed chunks advance the exclusive key checkpoint.
+                self._progress.positions[pid] = (bucket, chunk[-1])
+                keys = keys[len(chunk) :]
 
-            cursor = page.cursor
+    def _direction(
+        self, raw: bytes, pid: int, mine: set[bytes], theirs: set[bytes]
+    ) -> str:
+        if raw not in theirs and self._view.is_replica(pid, self._peer):
+            return "push"
+        if raw not in mine and self._view.is_replica(pid):
+            return "pull"
+        return "skip"
 
-    async def _push_window(
-        self, scope: Scope, pid: int, start: bytes, stop: bytes, theirs: set[bytes]
-    ) -> set[bytes]:
-        """Push local keys of the window the peer lacks; return the ones we lack."""
-        cursor: bytes | None = start
-
-        while cursor is not None:
-            keys, cursor = await self._local.keys(cursor, stop, self._page)
-            self._spend_scan(len(keys))
-            extra: list[Key] = []
-
-            for key in keys:
-                raw = key.to_bytes(Keyspace.TAGS)
-                if raw in theirs:
-                    theirs.discard(raw)
-                else:
-                    extra.append(key)
-
-            if extra and self._view.is_replica(pid, self._peer):
-                await self._push(scope, pid, extra)
-
-        return theirs
+    async def _merge_chunk(
+        self, scope: Scope, pid: int, direction: str, keys: list[bytes]
+    ) -> None:
+        if direction == "push":
+            await self._push(
+                scope, pid, [Key.from_bytes(raw, Keyspace.TAGS) for raw in keys]
+            )
+        elif direction == "pull":
+            await self._pull(scope, pid, keys)
 
     async def _push(self, scope: Scope, pid: int, keys: list[Key]) -> None:
         while keys:
@@ -370,7 +435,9 @@ class PeerSync:
                 "antientropy.push", PushRequest(scope, tuple(records)).to_dict()
             )
 
-            self.tally.pushed += _count(response, "applied")
+            if delivery_count(response) != len(records):
+                raise ValueError("push did not account for every submitted record")
+            self.tally.pushed += response["applied"]
             self.tally.pushed_bytes += _size(records)
 
     async def _pull(self, scope: Scope, pid: int, keys: list[bytes]) -> None:
@@ -396,7 +463,9 @@ class PeerSync:
             self.tally.pulled_bytes += _size(records)
 
     def _scope(self, pids: Sequence[int]) -> Scope:
-        return Scope(tuple(pids), self._view.view_hash(pids))
+        return Scope(
+            tuple(pids), self._view.view_hash(pids), self._local.retention_versions
+        )
 
     async def _rpc(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         if self._stale.is_set():
@@ -441,6 +510,11 @@ def _wanted(record: Record, pid: int, requested: set[bytes]) -> bool:
     )
 
 
-def _count(payload: dict[str, Any], name: str) -> int:
-    value = payload.get(name, 0)
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+def delivery_count(payload: dict[str, Any]) -> int:
+    total = 0
+    for name in ("applied", "already_present", "ignored_retention"):
+        value = payload.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"invalid push disposition: {name}")
+        total += value
+    return total

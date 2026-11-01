@@ -33,6 +33,7 @@ from tourillon.core.models.storageschema import (
     PID_SIZE,
     Key,
     Keyspace,
+    KeyTag,
     KVPair,
     KVRef,
     MetaKind,
@@ -162,6 +163,104 @@ class GroupSession:
                 self._fold(record.key)
 
         return written
+
+    async def latest_identities(
+        self, addr: PartitionAddress, limit: int
+    ) -> list[KeyTag]:
+        identities = await self.latest_identities_many([addr], limit)
+        return identities[addr]
+
+    async def latest_identities_many(
+        self, addresses: Sequence[PartitionAddress], limit: int
+    ) -> dict[PartitionAddress, list[KeyTag]]:
+        """Read bounded owned identities for each address without payloads."""
+        addresses = list(dict.fromkeys(addresses))
+        async with self._session.batch() as batch:
+            for address in addresses:
+                batch.keys(Keyspace.LOGS, prefix=address, limit=limit, reverse=True)
+
+        pages = await batch.result()
+        keys = [
+            (address, Key.from_bytes(ref.key, ref.keyspace))
+            for address, page in zip(addresses, pages, strict=True)
+            for ref in page
+        ]
+        async with self._session.batch() as batch:
+            for _, key in keys:
+                batch.get(KVRef(key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
+
+        tags = await batch.result()
+        identities: dict[PartitionAddress, list[KeyTag]] = {
+            addr: [] for addr in addresses
+        }
+        for (address, key), kv in zip(keys, tags, strict=True):
+            if kv is not None:
+                tag = Tag.from_bytes(kv.value)
+                if tag.kind in OWNED_KINDS:
+                    identities[address].append(KeyTag(key, tag))
+
+        return identities
+
+    async def log_page(self, after: bytes | None, limit: int) -> list[Key]:
+        async with self._session.batch() as batch:
+            batch.list(Keyspace.TAGS, start=after, limit=limit)
+
+        (page,) = await batch.result()
+        return [Key.from_bytes(kv.key, Keyspace.TAGS) for kv in page]
+
+    async def oldest_keys(self, address: PartitionAddress, limit: int) -> list[Key]:
+        async with self._session.batch() as batch:
+            batch.keys(Keyspace.LOGS, prefix=address, limit=limit)
+
+        (page,) = await batch.result()
+        return [Key.from_bytes(ref.key, ref.keyspace) for ref in page]
+
+    async def remove(
+        self, keys: Sequence[Key], *, dry_run: bool = False
+    ) -> tuple[int, int]:
+        """Remove owned records and their digest contributions atomically.
+
+        The caller is responsible for deciding which records may be removed.
+        Returned bytes include LOGS/TAGS keys and values, not backend overhead
+        or digest changes.
+        """
+        candidates: list[Key] = []
+        size = 0
+
+        for key in dict.fromkeys(keys):
+            record = await self.read(key)
+            if record is not None and record.tag.kind in OWNED_KINDS:
+                candidates.append(key)
+                size += len(record.to_bytes(Keyspace.TAGS)) + len(
+                    record.key.to_bytes(Keyspace.LOGS)
+                )
+
+        if not dry_run:
+            await self._remove_records(candidates)
+
+        return len(candidates), size
+
+    async def _remove_records(self, keys: Sequence[Key]) -> None:
+        refs = self._unknown_cells(keys)
+        async with self._session.batch() as batch:
+            for ref in refs:
+                batch.get(KVRef(ref, Keyspace.META))
+
+        values = await batch.result()
+        self._stored.update(
+            (ref, _cell(kv)) for ref, kv in zip(refs, values, strict=True)
+        )
+
+        async with self._session.batch() as batch:
+            for key in keys:
+                batch.delete(KVRef(key.to_bytes(Keyspace.LOGS), Keyspace.LOGS))
+                batch.delete(KVRef(key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
+                for ref in self._cell_keys(key):
+                    self._deltas[ref] = self._deltas.get(
+                        ref, DigestCell()
+                    ) - DigestCell.of(key)
+
+        await batch.result()
 
     async def get(self, addr: PartitionAddress) -> Record | None:
         kv_log = await self._session.last(
@@ -447,7 +546,10 @@ class GroupSessionManager:
     async def session(self, write: bool = False) -> AsyncIterator[GroupSession]:
         """Flush digest changes before committing; roll back on any failure."""
         async with self._session_provider.session(write=write) as raw:
-            session = GroupSession(raw, bucket_shift=DEFAULT_BUCKET_SHIFT)
+            session = GroupSession(
+                raw,
+                bucket_shift=DEFAULT_BUCKET_SHIFT,
+            )
             yield session
             if write:
                 await session.flush()

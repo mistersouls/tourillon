@@ -442,6 +442,57 @@ class OpenTelemetryTelemetry(Telemetry):
             description="Anti-entropy sweeps, by outcome.",
         )
 
+    @property
+    def gc_passes_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="gc_passes_total",
+            description="GC passes, by source, mode and outcome.",
+        )
+
+    @property
+    def gc_versions_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="gc_versions_total",
+            description="GC versions scanned, collected or estimated collectible.",
+        )
+
+    @property
+    def gc_record_bytes_removed_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="gc_record_bytes_removed_total",
+            description="Logical LOGS/TAGS record bytes removed by GC, not disk space reclaimed.",
+        )
+
+    @property
+    def gc_errors_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="gc_errors_total",
+            description="Failed GC transactions, by source.",
+        )
+
+    @property
+    def gc_pass_duration_seconds(self) -> HistogramMetric:
+        return self._histogram_metric(
+            name="gc_pass_duration_seconds",
+            description="GC pass duration, by source, mode and outcome.",
+            unit="s",
+        )
+
+    @property
+    def gc_transaction_duration_seconds(self) -> HistogramMetric:
+        return self._histogram_metric(
+            name="gc_transaction_duration_seconds",
+            description="GC transaction lifetime including commit.",
+            unit="s",
+        )
+
+    @property
+    def gc_hot_queue_size(self) -> GaugeMetric:
+        return self._gauge_metric(
+            name="gc_hot_queue_size",
+            description="Pending distinct GC hot addresses, not remaining history.",
+        )
+
     def start_span(
         self,
         name: str,
