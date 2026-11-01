@@ -43,7 +43,7 @@ full `uv run pytest` once before declaring the change done.
 
 ## Wire protocol essentials
 
-One frame type, `tourlib.envelope.Envelope`: 32-byte header + UTF-8 `kind` + serialized payload. `kind` is lowercase `domain.action`; responses are `<kind>.accept` / `<kind>.reject`.
+One frame type, `tourlib.envelope.Envelope`: 32-byte header + UTF-8 `kind` + opaque `context` (<= 32 bytes, trace context) + serialized payload. `kind` is lowercase `domain.action`; responses are `<kind>.accept` / `<kind>.reject`.
 
 - Always build responses with `replay_envelope(kind=..., request=..., payload=...)`.
 - Always encode payloads through the injected `Serializer`.

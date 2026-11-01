@@ -270,7 +270,8 @@ async def test_envelope_server_closes_on_invalid_payload_header(
             uuid4().bytes,
             Envelope.MAX_PAYLOAD + 1,
             len(kind),
-            b"\x00" * 7,
+            0,
+            b"\x00" * 6,
         )
         + kind
     )

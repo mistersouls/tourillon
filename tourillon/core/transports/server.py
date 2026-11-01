@@ -70,7 +70,7 @@ class EnvelopeServer:
         if self._server is not None:
             raise RuntimeError("server is already running")
 
-        logger.info("Starting transport server '%s' on %s:%s", self._name, host, port)
+        logger.debug("Starting transport server '%s' on %s:%s", self._name, host, port)
 
         self._server = await asyncio.start_server(
             self._handle_connection,
@@ -120,12 +120,11 @@ class EnvelopeServer:
             telemetry=self._telemetry,
             endpoint=endpoint,
         )
+        # No connection span: a pooled peer connection lives for hours, so a
+        # span would never end. Connections are tracked by metrics; each
+        # envelope gets its own span.
         try:
-            with self._telemetry.start_span(
-                "transport.connection",
-                attributes={"endpoint": endpoint, "peer": str(peer)},
-            ):
-                await session.serve()
+            await session.serve()
         finally:
             self._telemetry.connections_closed_total.labels(endpoint=endpoint).inc()
             logger.debug("Closed connection on '%s' from %s", self._name, peer)

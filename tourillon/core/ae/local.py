@@ -278,7 +278,7 @@ class LocalStore:
             return False
 
         logger.warning(
-            "antientropy.foreign version: pid=%s expected=%s key=%s",
+            "ae.foreign version: pid=%s expected=%s key=%s",
             record.key.pid.value,
             expected,
             record.key.to_bytes(Keyspace.TAGS).hex(),

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextvars
 import logging
 import ssl
 from collections.abc import Mapping
@@ -42,7 +43,7 @@ from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import SimplePlacementStrategy
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.probe.detector import FailureDetectorProvider
-from tourillon.core.services.lifecycle import NodeLifecycle
+from tourillon.core.services.lifecycle import NodeLifecycle, _background_task
 from tourillon.core.services.store import StoreService
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.telemetry import build_noop_telemetry
@@ -278,7 +279,7 @@ async def test_lifecycle_configures_peer_pool_from_transport_pool_options(
 
 
 @pytest.mark.tourillon
-def test_log_state_tokens_renders_epoch_and_one_line_per_token(
+def test_log_state_tokens_renders_one_line_per_token(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -290,17 +291,23 @@ def test_log_state_tokens_renders_epoch_and_one_line_per_token(
         node_id="node-a",
         phase=MemberPhase.READY,
         epoch=7,
-        tokens=("0x0000000000000001", "0x000000001234abcd", "0x0000000123456789"),
+        tokens=(
+            "0x0000000000000001",
+            "0x000000001234abcd",
+            "0x0123456789abcdef0123456789abcdef",
+        ),
     )
 
-    caplog.set_level(logging.INFO, logger="tourillon.global")
+    caplog.set_level(logging.DEBUG, logger="tourillon.global")
     lifecycle._log_tokens(state)
 
     messages = [record.getMessage() for record in caplog.records]
-    assert "Node state epoch=7 tokens (3):" in messages
-    assert "  0x0000000000000001 (1)" in messages
-    assert "  0x000000001234abcd (2)" in messages
-    assert "  0x0000000123456789 (3)" in messages
+    assert messages == [
+        "Node 'node-a' epoch=7 owns 3 token(s):",
+        "  [1] 0x0000000000000001",
+        "  [2] 0x000000001234abcd",
+        "  [3] 0x0123456789abcdef",
+    ]
 
 
 @pytest.mark.tourillon
@@ -319,12 +326,11 @@ def test_log_state_tokens_renders_none_when_empty(
         tokens=(),
     )
 
-    caplog.set_level(logging.INFO, logger="tourillon.global")
+    caplog.set_level(logging.DEBUG, logger="tourillon.global")
     lifecycle._log_tokens(state)
 
     messages = [record.getMessage() for record in caplog.records]
-    assert "Node state epoch=0 tokens (0):" in messages
-    assert "  (none)" in messages
+    assert messages == ["Node 'node-a' epoch=0 owns 0 token(s)"]
 
 
 @pytest.mark.tourillon
@@ -1331,3 +1337,21 @@ def test_drain_seeds_skips_ineligible_peers_and_bounds_fallback() -> None:
     ]
     assert NodeLifecycle._drain_seeds(state, []) == list(state.seeds[:5])
     assert NodeLifecycle._drain_seeds(NodeState(node_id="node-a"), []) == []
+
+
+_REQUEST_SCOPE: contextvars.ContextVar[str] = contextvars.ContextVar("request_scope")
+
+
+@pytest.mark.tourillon
+async def test_background_task_does_not_inherit_the_request_context() -> None:
+    seen: list[str] = []
+
+    async def operation() -> None:
+        seen.append(_REQUEST_SCOPE.get("detached"))
+
+    _REQUEST_SCOPE.set("node.join request")
+    await _background_task(operation(), name="node-join")
+    inherited = asyncio.create_task(operation())
+    await inherited
+
+    assert seen == ["detached", "node.join request"]

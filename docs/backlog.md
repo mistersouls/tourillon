@@ -21,7 +21,6 @@ Use [`.github/prompts/fix-bug.prompt.md`](../.github/prompts/fix-bug.prompt.md) 
 | A4 | **No named consistency levels.** Consistency is expressed as raw per-request `quorum_read` / `quorum_write` integers; request models default both to 1. | `tourlib/models/kv.py`, `tourillon/bootstrap/handlers/kv.py` | `principles.md` lists configurable consistency levels as an objective. |
 | A5 | **No failure-domain aware placement.** Placement walks the ring and takes distinct members; there is no label model (rack / zone / region / provider) and no anti-affinity constraint. | `tourillon/core/partition/placement.py`, `tourillon/core/models/member.py` | `principles.md` lists label-based anti-affinity as an objective. Requires member labels on the gossip wire first. |
 | A6 | **No steady-state rebalancing.** Data only moves when a join or drain changes the target placement (anti-entropy converges it); there is no periodic or operator-triggered rebalance controller. | `tourillon/core/services/lifecycle.py` (`_sync_data`, `_perform_drain`) | `principles.md` lists dynamic and automatic rebalance as objectives, not as implemented behavior. |
-| A7 | **Read repair is not observable.** Background read repair now writes the winning version back to stale or missing owners, but its counters live on `StoreService.stats` and are not exported through the telemetry port. | `tourillon/core/services/store.py` (`_schedule_read_repair`, `ReplicationStats`) | Wire `ReplicationStats` to `Telemetry` so repairs, skips and failures are visible in metrics. |
 
 ---
 

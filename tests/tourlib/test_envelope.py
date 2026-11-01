@@ -20,7 +20,7 @@ import pytest
 from tests.helpers import make_envelope
 from tourlib import ValidationError
 from tourlib.constant import TRANSPORT_ERROR_KIND
-from tourlib.envelope import Envelope, read_envelope
+from tourlib.envelope import Envelope, read_envelope, replay_envelope
 from tourlib.exceptions import ProtocolError
 
 
@@ -161,7 +161,7 @@ def test_from_bytes_rejects_too_large_payload_header_value() -> None:
     frame = bytearray(envelope.to_bytes())
     frame[20:24] = (Envelope.MAX_PAYLOAD + 1).to_bytes(4, byteorder="big", signed=False)
 
-    with pytest.raises(ProtocolError, match="payload exceeds MAX_PAYLOAD"):
+    with pytest.raises(ProtocolError, match="payload exceeds max_payload"):
         Envelope.from_bytes(bytes(frame))
 
 
@@ -203,7 +203,8 @@ async def test_read_envelope_rejects_invalid_kind_length_in_header() -> None:
         uuid4().bytes,
         0,
         0,
-        b"\x00" * 7,
+        0,
+        b"\x00" * 6,
     )
     reader.feed_data(header)
     reader.feed_eof()
@@ -223,7 +224,8 @@ async def test_read_envelope_rejects_payload_exceeding_max_payload_argument() ->
         uuid4().bytes,
         2,
         len(kind),
-        b"\x00" * 7,
+        0,
+        b"\x00" * 6,
     )
     reader.feed_data(header)
     reader.feed_eof()
@@ -243,7 +245,8 @@ async def test_read_envelope_rejects_truncated_body() -> None:
         uuid4().bytes,
         3,
         len(kind),
-        b"\x00" * 7,
+        0,
+        b"\x00" * 6,
     )
     reader.feed_data(header + kind)
     reader.feed_eof()
@@ -265,3 +268,96 @@ async def test_read_envelope_returns_transport_error_envelope() -> None:
 
     assert decoded.kind == TRANSPORT_ERROR_KIND
     assert decoded.payload == b"unknown kind: kv.get"
+
+
+def test_envelope_round_trips_context_between_kind_and_payload() -> None:
+    envelope = Envelope(
+        proto_version=1,
+        schema_id=1,
+        mode=Envelope.MODE_RPC,
+        correlation_id=uuid4(),
+        kind="kv.get",
+        payload=b"payload",
+        context=b"\x01trace",
+    )
+
+    frame = envelope.to_bytes()
+
+    assert frame[25] == len(b"\x01trace")
+    assert frame[Envelope.HEADER_LEN + len(b"kv.get") :].startswith(b"\x01tracepayload")
+    assert Envelope.from_bytes(frame) == envelope
+
+
+def test_envelope_without_context_keeps_the_header_only_size() -> None:
+    envelope = make_envelope(kind="kv.get", payload=b"p")
+
+    assert len(envelope.to_bytes()) == Envelope.HEADER_LEN + len(b"kv.get") + 1
+    assert envelope.context == b""
+
+
+def test_envelope_rejects_too_large_context() -> None:
+    with pytest.raises(ValueError, match="context exceeds MAX_CONTEXT"):
+        Envelope(
+            proto_version=1,
+            schema_id=1,
+            mode=Envelope.MODE_RPC,
+            correlation_id=uuid4(),
+            kind="kv.get",
+            payload=b"",
+            context=b"x" * (Envelope.MAX_CONTEXT + 1),
+        )
+
+
+def test_envelope_rejects_non_bytes_context() -> None:
+    with pytest.raises(TypeError, match="context must be bytes"):
+        Envelope(
+            proto_version=1,
+            schema_id=1,
+            mode=Envelope.MODE_RPC,
+            correlation_id=uuid4(),
+            kind="kv.get",
+            payload=b"",
+            context="trace",  # type: ignore[arg-type]
+        )
+
+
+def test_from_bytes_rejects_too_large_context_header_value() -> None:
+    frame = bytearray(make_envelope(kind="kv.get", payload=b"x").to_bytes())
+    frame[25] = Envelope.MAX_CONTEXT + 1
+
+    with pytest.raises(ProtocolError, match="context exceeds MAX_CONTEXT"):
+        Envelope.from_bytes(bytes(frame))
+
+
+@pytest.mark.asyncio
+async def test_read_envelope_reads_the_context() -> None:
+    envelope = Envelope(
+        proto_version=1,
+        schema_id=1,
+        mode=Envelope.MODE_FNF,
+        correlation_id=uuid4(),
+        kind="gossip.push",
+        payload=b"members",
+        context=b"\x01" + b"t" * 25,
+    )
+    reader = asyncio.StreamReader()
+    reader.feed_data(envelope.to_bytes())
+
+    assert await read_envelope(reader) == envelope
+
+
+def test_replay_envelope_does_not_echo_the_context() -> None:
+    request = Envelope(
+        proto_version=1,
+        schema_id=1,
+        mode=Envelope.MODE_RPC,
+        correlation_id=uuid4(),
+        kind="kv.get",
+        payload=b"",
+        context=b"\x01trace",
+    )
+
+    response = replay_envelope(kind="kv.get.accept", request=request, payload=b"ok")
+
+    assert response.context == b""
+    assert response.correlation_id == request.correlation_id

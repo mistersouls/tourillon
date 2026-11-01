@@ -99,8 +99,10 @@ class SimplePlacementStrategy:
             member = topology.registry.get(vnode.node_id)
             if member is None:
                 logger.warning(
-                    "vnode present in ring but missing from registry",
-                    extra={"node_id": vnode.node_id, "token": vnode.token},
+                    "placement vnode in ring but missing from registry "
+                    "node_id=%s token=%s",
+                    vnode.node_id,
+                    vnode.token,
                 )
                 continue
             if member.phase in _EXCLUDED_PHASES:
@@ -145,8 +147,10 @@ class SimplePlacementStrategy:
             member = topology.registry.get(vnode.node_id)
             if member is None:
                 logger.warning(
-                    "vnode present in ring but missing from registry",
-                    extra={"node_id": vnode.node_id, "token": vnode.token},
+                    "placement vnode in ring but missing from registry "
+                    "node_id=%s token=%s",
+                    vnode.node_id,
+                    vnode.token,
                 )
                 continue
             # JOINING, PAUSED and DRAINING members are under handoff themselves.

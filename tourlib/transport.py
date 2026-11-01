@@ -17,8 +17,9 @@ import logging
 import ssl
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
+from dataclasses import replace
 
 from tourlib.constant import (
     ENVELOPE_RESPONSE_TIMEOUT,
@@ -37,10 +38,13 @@ class EnvelopeClient:
         bind: str,
         tls_ctx: ssl.SSLContext,
         logger: logging.Logger | None = None,
+        *,
+        context: Callable[[], bytes] | None = None,
     ) -> None:
         self._bind = bind
         self._tls_ctx = tls_ctx
         self._logger = logger or default_logger
+        self._context = context
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._read_task: asyncio.Task[None] | None = None
@@ -114,7 +118,8 @@ class EnvelopeClient:
                 return await future
         except TimeoutError:
             raise ResponseTimeoutError(
-                f"No response within {timeout}s for {envelope.correlation_id}"
+                f"No response to {envelope.kind} from {self._bind} within "
+                f"{timeout}s (cid={envelope.correlation_id})"
             ) from None
         finally:
             self._pending.pop(key, None)
@@ -238,7 +243,7 @@ class EnvelopeClient:
                 self._logger.debug(
                     "Received kind=%s cid=%.8s bind=%s",
                     envelope.kind,
-                    envelope.correlation_id.bytes,
+                    envelope.correlation_id.hex,
                     self._bind,
                 )
                 self._route(envelope)
@@ -246,13 +251,21 @@ class EnvelopeClient:
             failure = ConnectionError("Connection closed by peer")
             raise failure from exc
         except Exception as exc:
-            self._logger.exception("Read loop error: %s", exc_info=exc)
+            self._logger.exception("Read loop failed bind=%s: %s", self._bind, exc)
             failure = exc
             raise exc
         finally:
             await self._teardown_reader(failure or ConnectionError("Connection closed"))
 
+    def _with_context(self, envelope: Envelope) -> Envelope:
+        """Attach the caller's context unless the envelope carries one."""
+        if self._context is None or envelope.context:
+            return envelope
+        context = self._context()
+        return replace(envelope, context=context) if context else envelope
+
     async def _send(self, envelope: Envelope) -> None:
+        envelope = self._with_context(envelope)
         try:
             async with self._write_lock:
                 if self._closing:
@@ -268,11 +281,20 @@ class EnvelopeClient:
                 self._logger.debug(
                     "Sent %s cid=%.8s bind=%s",
                     envelope.kind,
-                    envelope.correlation_id.bytes,
+                    envelope.correlation_id.hex,
                     self._bind,
                 )
         except Exception as exc:
-            self._logger.exception("Send error: %s", exc_info=exc)
+            # The caller receives the error and owns its reporting; this line
+            # only ties it to the connection being torn down.
+            self._logger.debug(
+                "Send failed kind=%s cid=%.8s bind=%s error=%s: %s",
+                envelope.kind,
+                envelope.correlation_id.hex,
+                self._bind,
+                type(exc).__name__,
+                exc,
+            )
             await self.close()
             raise exc
 

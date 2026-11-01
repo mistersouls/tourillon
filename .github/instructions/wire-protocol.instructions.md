@@ -7,9 +7,9 @@ applyTo: "tourlib/**/*.py,tourclient/**/*.py,tourillon/bootstrap/handlers/**/*.p
 ## Frame layout
 
 ```
-Envelope := header(32B) || kind(UTF-8, kind_len bytes) || payload(payload_len bytes)
-header   := struct ">B H B 16s I B 7s"
-            proto_version | schema_id | mode | correlation_id(uuid16) | payload_len | kind_len | reserved(7)
+Envelope := header(32B) || kind(UTF-8, kind_len bytes) || context(context_len bytes, <= 32) || payload(payload_len bytes)
+header   := struct ">B H B 16s I B B 6s"
+            proto_version | schema_id | mode | correlation_id(uuid16) | payload_len | kind_len | context_len | reserved(6)
 mode     := 0 RPC | 1 fire-and-forget
 ```
 

@@ -14,6 +14,7 @@
 
 import asyncio
 import contextlib
+import logging
 import signal
 import ssl
 from collections.abc import AsyncIterator
@@ -98,6 +99,7 @@ class Manager:
             read_repair=config.placement.read_repair,
             repair=config.placement.repair,
             obligations=self._obligations,
+            telemetry=self._telemetry,
         )
         self._lifecycle = NodeLifecycle(
             placement_strategy=self._placement_strategy,
@@ -171,7 +173,7 @@ class Manager:
 
         :param seeds: Optional list of seed peer addresses for joining an existing cluster.
         """
-        logger.info("Starting manager for node '%s'", self.node_id)
+        logger.debug("Starting manager for node '%s'", self.node_id)
         if seeds:
             logger.debug("Startup seeds override provided: %s", seeds)
         try:
@@ -181,19 +183,21 @@ class Manager:
                 "Failed to load latest HLC from storage for node '%s'", self.node_id
             )
             raise
-        logger.info(
-            "Latest persisted HLC for node '%s': wall_ms=%s counter=%s source_node=%s",
-            self.node_id,
+        # A restored clock matters when diagnosing ordering after a restart;
+        # a fresh one is the normal first boot.
+        logger.log(
+            logging.INFO if latest.wall_ms else logging.DEBUG,
+            "HLC restored wall_ms=%s counter=%s source_node=%s",
             latest.wall_ms,
             latest.counter,
-            latest.node_id,
+            latest.node_id or "-",
         )
         self._clock.restore(latest.wall_ms, latest.counter)
         await self._lifecycle.start(seeds=seeds)
-        logger.info("Manager started for node '%s'", self.node_id)
+        logger.debug("Manager started for node '%s'", self.node_id)
 
     async def stop(self) -> None:
-        logger.info("Stopping manager for node '%s'", self.node_id)
+        logger.info("Node '%s' shutting down", self.node_id)
         for step in (
             self._lifecycle.stop,
             # Detached replications must settle while the peer pool and the
@@ -209,7 +213,7 @@ class Manager:
                 logger.exception(
                     "shutdown step failed: %s, reason=%s", step.__qualname__, exc
                 )
-        logger.info("Manager stopped for node '%s'", self.node_id)
+        logger.info("Node '%s' stopped", self.node_id)
 
     async def serve_forever(self, seeds: list[str] | None = None) -> None:
         """Start and serve the peer server indefinitely.
@@ -220,7 +224,7 @@ class Manager:
         self._install_signal_handlers(stop_requested)
         try:
             await self.start(seeds=seeds)
-            logger.info("Node '%s' is serving forever", self.node_id)
+            logger.info("Node '%s' started; serving until stopped", self.node_id)
             try:
                 await stop_requested.wait()
             except KeyboardInterrupt:

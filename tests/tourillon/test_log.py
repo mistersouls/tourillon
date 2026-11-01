@@ -16,7 +16,7 @@ import logging
 
 import pytest
 
-from tourillon.core.log import init_loggers, logger
+from tourillon.core.log import describe, init_loggers, logger
 from tourillon.core.models.config import LoggerConfig, LoggingConfig
 
 
@@ -115,3 +115,28 @@ def test_log_info_supports_scoped_format_arguments(
         record.name == "tourillon.transport" and record.getMessage() == "hello wire"
         for record in caplog.records
     )
+
+
+@pytest.mark.tourillon
+def test_describe_prefixes_the_message_with_the_exception_type() -> None:
+    assert describe(ConnectionResetError("peer reset")) == (
+        "ConnectionResetError: peer reset"
+    )
+
+
+@pytest.mark.tourillon
+def test_describe_falls_back_to_the_type_for_an_empty_message() -> None:
+    assert describe(TimeoutError()) == "TimeoutError"
+
+
+@pytest.mark.tourillon
+def test_log_uses_the_requested_level(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG, logger="tourillon.global")
+
+    logger.log(logging.DEBUG, "quiet %d", 1)
+    logger.log(logging.INFO, "loud %d", 2)
+
+    assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+        (logging.DEBUG, "quiet 1"),
+        (logging.INFO, "loud 2"),
+    ]

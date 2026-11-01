@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import logging
 import time
 from contextlib import asynccontextmanager
 from time import perf_counter
@@ -20,6 +21,7 @@ from typing import Any, cast
 
 import pytest
 
+from tests.helpers.telemetry import RecordingTelemetry
 from tourillon.core.ae.obligations import ObligationQueue
 from tourillon.core.exceptions import (
     InvalidQuorumError,
@@ -395,6 +397,7 @@ def _build_store(
     partitioner_pid: int = 7,
     read_repair: ReadRepairConfig | None = None,
     obligations: ObligationQueue | None = None,
+    telemetry: RecordingTelemetry | None = None,
 ) -> tuple[
     StoreService, _StorageStub, _PeerPoolStub, MsgPackSerializer, _PeerClientStub
 ]:
@@ -415,6 +418,7 @@ def _build_store(
         response_delay=response_delay,
         read_repair=read_repair,
         obligations=obligations,
+        telemetry=None if telemetry is None else telemetry.as_port(),
     )
     return service, storage, peer_pool, serializer, client
 
@@ -2663,3 +2667,82 @@ async def test_put_quorum_failure_hands_back_a_resumable_token() -> None:
     key = decode_token(token)
     assert key.address == addr
     assert key.pid.value == 7
+
+
+@pytest.mark.tourillon
+async def test_store_measures_a_successful_operation() -> None:
+    telemetry = RecordingTelemetry()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, None, writable=True),),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+        telemetry=telemetry,
+    )
+
+    await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+
+    labels = {"op": "write", "outcome": "ok"}
+    assert telemetry.calls["kv_requests_total"] == [(1, labels)]
+    ((elapsed, duration_labels),) = telemetry.calls["kv_request_duration_seconds"]
+    assert elapsed >= 0 and duration_labels == labels
+    assert telemetry.calls["replication_failures_total"] == []
+
+
+@pytest.mark.tourillon
+async def test_store_measures_a_failed_quorum_and_the_failed_replica(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    telemetry = RecordingTelemetry()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference("node-a", True, None, writable=True),
+            Preference("node-c", True, None, writable=True),
+        ),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+        telemetry=telemetry,
+    )
+    caplog.set_level(logging.WARNING, logger="tourillon.global")
+
+    with pytest.raises(QuorumNotMetError):
+        await store.put(
+            PutRequest(namespace=b"ns", key=b"key", value=b"value", quorum_write=2)
+        )
+
+    assert telemetry.calls["kv_requests_total"] == [
+        (1, {"op": "write", "outcome": "quorum_not_met"})
+    ]
+    assert telemetry.total("replication_failures_total", op="write") == 1
+    assert telemetry.total("obligations_total", event="recorded") >= 1
+    messages = caplog.messages
+    assert any(m.startswith("replication.write failed node=node-a") for m in messages)
+    assert any(m.startswith("store.write failed node=node-a") for m in messages)
+
+
+@pytest.mark.tourillon
+async def test_store_counts_a_refusal_without_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    telemetry = RecordingTelemetry()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(Preference("node-a", True, None, writable=True),),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+        telemetry=telemetry,
+    )
+    store.pause()
+    caplog.set_level(logging.WARNING, logger="tourillon.global")
+
+    with pytest.raises(NodeDrainingError):
+        await store.put(PutRequest(namespace=b"ns", key=b"key", value=b"value"))
+
+    assert telemetry.calls["kv_requests_total"] == [
+        (1, {"op": "write", "outcome": "node_draining"})
+    ]
+    assert caplog.records == []

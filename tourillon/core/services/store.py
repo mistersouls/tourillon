@@ -31,7 +31,7 @@ from tourillon.core.exceptions import (
     StoreOperationError,
     VersionNotFoundError,
 )
-from tourillon.core.log import logger
+from tourillon.core.log import describe, logger
 from tourillon.core.models.clock import HLCClock
 from tourillon.core.models.config import ReadRepairConfig, RepairConfig
 from tourillon.core.models.repair import (
@@ -55,7 +55,9 @@ from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import PlacementStrategy, Preference
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports.storage import Storage
+from tourillon.core.ports.telemetry import Telemetry
 from tourillon.core.storage.session import GroupSessionManager
+from tourillon.core.telemetry import build_noop_telemetry
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT, MAX_CLOCK_SKEW_MS, MAX_QUORUM
 from tourlib.envelope import build_envelope
 from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest, RepairRequest
@@ -81,6 +83,16 @@ class ReplicationStats:
     repairs_rejected: int = 0
 
 
+# Failures caused by the request or the node's own phase rather than by
+# replication: expected, so they are not logged as warnings.
+_REFUSALS = (
+    NodeDrainingError,
+    InvalidQuorumError,
+    InvalidRepairTokenError,
+    VersionNotFoundError,
+)
+
+
 class StoreService:
     def __init__(
         self,
@@ -95,8 +107,10 @@ class StoreService:
         read_repair: ReadRepairConfig | None = None,
         repair: RepairConfig | None = None,
         obligations: ObligationQueue | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         self._node_id = node_id
+        self._telemetry = telemetry or build_noop_telemetry()
         self._storage = storage
         self._partitioner = partitioner
         self._placement_strategy = placement_strategy
@@ -142,14 +156,45 @@ class StoreService:
 
     @contextmanager
     def _operation(self, operation: str) -> Iterator[None]:
+        """Admit, track and measure one store operation.
+
+        Every operation ends in exactly one ``kv_requests_total`` sample whose
+        ``outcome`` is ``ok``, the stable error code of a store failure, or
+        ``error`` / ``cancelled`` for anything else.
+        """
+        started = time.perf_counter()
+        outcome = "cancelled"
+        try:
+            self._admit(operation)
+            with self._tracked(operation):
+                yield
+            outcome = "ok"
+        except StoreOperationError as exc:
+            outcome = exc.code
+            self._report_failure(operation, exc)
+            raise
+        except Exception:
+            # Unexpected failures propagate to the transport, which logs them
+            # with their traceback; counting them is enough here.
+            outcome = "error"
+            raise
+        finally:
+            attributes = {"op": operation, "outcome": outcome}
+            self._telemetry.kv_requests_total.add(1, attributes=attributes)
+            self._telemetry.kv_request_duration_seconds.record(
+                time.perf_counter() - started, attributes=attributes
+            )
+
+    def _admit(self, operation: str) -> None:
         accepting = (
             self._accepting_reads if operation == "read" else self._accepting_operations
         )
         if not accepting:
-            logger.warning(
-                "Node '%s' refuses %s while draining", self._node_id, operation
-            )
             raise NodeDrainingError(operation)
+
+    @contextmanager
+    def _tracked(self, operation: str) -> Iterator[None]:
+        """Register a mutation so that ``drain`` can wait for it to settle."""
         if operation == "read":
             yield
             return
@@ -160,6 +205,15 @@ class StoreService:
         finally:
             settled.set_result(None)
             self._mutations.discard(settled)
+
+    def _report_failure(self, operation: str, exc: StoreOperationError) -> None:
+        # Refusals are the caller's business and expected while draining; a
+        # replication failure is the node's, and the first thing to look at
+        # when clients see errors.
+        if isinstance(exc, _REFUSALS):
+            logger.debug("store.%s refused node=%s: %s", operation, self._node_id, exc)
+            return
+        logger.warning("store.%s failed node=%s: %s", operation, self._node_id, exc)
 
     @property
     def stats(self) -> "ReplicationStats":
@@ -312,6 +366,9 @@ class StoreService:
             await session.put(record)
             await session.put_obligations(obligations)
         self._stats.obligations_recorded += len(obligations)
+        self._telemetry.obligations_total.add(
+            len(obligations), attributes={"event": "recorded"}
+        )
         if self._obligations is not None:
             self._obligations.submit(obligations)
 
@@ -480,7 +537,7 @@ class StoreService:
                 try:
                     answers[task.get_name()] = task.result()
                 except Exception as exc:
-                    logger.warning("replication.lookup failed error=%s", exc)
+                    self._replica_failed("lookup", task.get_name(), exc)
                     errors.append(exc)
 
         unanswered = await self._drain_parallel_tasks(tasks, collect, None)
@@ -557,7 +614,7 @@ class StoreService:
                 try:
                     applied.append(task.result())
                 except Exception as exc:
-                    logger.warning("replication.write failed error=%s", exc)
+                    self._replica_failed("write", task.get_name(), exc)
                     errors.append(exc)
 
         def quorum_met() -> bool:
@@ -603,7 +660,7 @@ class StoreService:
                 try:
                     records[task.get_name()] = task.result()
                 except Exception as exc:
-                    logger.warning("replication.read failed error=%s", exc)
+                    self._replica_failed("read", task.get_name(), exc)
                     errors.append(exc)
 
         def quorum_met() -> bool:
@@ -668,7 +725,7 @@ class StoreService:
         ):
             # The valve: when a node comes back from a long outage, repairing
             # on every read is exactly when the cluster can least afford it.
-            self._stats.read_repairs_skipped += len(targets)
+            self._read_repairs("skipped", len(targets))
             return
         for node_id in targets:
             self._start_repair(node_id, record, holder)
@@ -729,7 +786,7 @@ class StoreService:
 
     def _start_repair(self, node_id: str, record: Record, holder: str) -> None:
         if not self._accepting_read_repairs:
-            self._stats.read_repairs_skipped += 1
+            self._read_repairs("skipped", 1)
             return
         marker = (record.key.to_bytes(Keyspace.LOGS), node_id)
         if marker in self._repairs_inflight:
@@ -749,11 +806,14 @@ class StoreService:
         try:
             async with self._repair_slots:
                 await self._apply_hint(holder, record, node_id)
-            self._stats.read_repairs_repaired += 1
+            self._read_repairs("repaired", 1)
         except Exception as exc:
-            self._stats.read_repairs_failed += 1
+            self._read_repairs("failed", 1)
             logger.warning(
-                "read_repair failed target=%s key=%s error=%s", node_id, record.key, exc
+                "read_repair failed target=%s key=%s error=%s",
+                node_id,
+                record.key,
+                describe(exc),
             )
         finally:
             self._repairs_inflight.discard(marker)
@@ -818,7 +878,7 @@ class StoreService:
                 "obligation.record failed target=%s key=%s error=%s",
                 target_node_id,
                 record.key,
-                exc,
+                describe(exc),
             )
 
     async def _remote_read(self, node_id: str, addr: PartitionAddress) -> Record | None:
@@ -990,7 +1050,30 @@ class StoreService:
             return
         exc = task.exception()
         if exc is not None:
-            logger.warning("replication.write settled late with error=%s", exc)
+            self._replica_failed("write", task.get_name(), exc, late=True)
+
+    def _replica_failed(
+        self, operation: str, target: str, exc: BaseException, *, late: bool = False
+    ) -> None:
+        # One replica failing is routine and absorbed by the quorum; WARNING
+        # is kept because a replica that fails repeatedly is worth spotting.
+        self._telemetry.replication_failures_total.add(1, attributes={"op": operation})
+        logger.warning(
+            "replication.%s failed%s node=%s target=%s error=%s",
+            operation,
+            " (late)" if late else "",
+            self._node_id,
+            target,
+            describe(exc),
+        )
+
+    def _read_repairs(self, outcome: str, count: int) -> None:
+        setattr(
+            self._stats,
+            f"read_repairs_{outcome}",
+            getattr(self._stats, f"read_repairs_{outcome}") + count,
+        )
+        self._telemetry.read_repairs_total.add(count, attributes={"outcome": outcome})
 
     def _unanswered(self, tasks: set[asyncio.Task[Any]]) -> list[Exception]:
         """Report replicas that did not answer before the deadline as timeouts."""

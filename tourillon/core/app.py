@@ -83,7 +83,7 @@ class Application:
 
     async def create_manager(self, config: TourillonConfig) -> Manager:
         """Create a Manager instance for the given configuration."""
-        logger.info("Creating manager for node '%s'", config.node.id)
+        logger.debug("Creating manager for node '%s'", config.node.id)
         tls_server = await config.tls_server()
         tls_client = await config.tls_client()
         manager = Manager(

@@ -14,7 +14,6 @@
 
 import asyncio
 import contextlib
-import hashlib
 import math
 import random
 import uuid
@@ -24,7 +23,7 @@ from functools import partial
 from typing import Any
 
 from tourillon.core.gossip.topology import TopologyManager
-from tourillon.core.log import logger
+from tourillon.core.log import describe, logger
 from tourillon.core.models.config import GossipConfig
 from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.peer.pool import PeerPool
@@ -34,6 +33,10 @@ from tourlib.constant import PROTOCOL_VERSION
 from tourlib.envelope import Envelope
 from tourlib.exceptions import EnvelopeError
 from tourlib.transport import EnvelopeClient
+
+# Failures of one exchange with one peer: a refused or malformed answer, a
+# lost connection or a timeout. They are reported, never propagated.
+_PEER_ERRORS = (EnvelopeError, ValidationError, OSError, TimeoutError)
 
 
 @dataclass
@@ -273,18 +276,10 @@ class Gossiper:
     def _unix_now() -> int:
         return int(datetime.now(UTC).timestamp())
 
-    @staticmethod
-    def _stable_peer_id_value(peer_node_id: str) -> int:
-        digest = hashlib.blake2b(peer_node_id.encode("utf-8"), digest_size=8).digest()
-        return int.from_bytes(digest, byteorder="big", signed=False)
-
     def _update_hot_queue_size_metric(self) -> None:
         self._telemetry.gossip_hot_queue_size.set(self._hot_queue.qsize())
 
-    def _set_last_ae_metrics(self, peer_node_id: str) -> None:
-        self._telemetry.gossip_last_ae_peer.set(
-            self._stable_peer_id_value(peer_node_id)
-        )
+    def _set_last_ae_metrics(self) -> None:
         self._telemetry.gossip_last_ae_at.set(self._unix_now())
 
     def _build_envelope(
@@ -435,15 +430,15 @@ class Gossiper:
                             target.node_id,
                         )
                         return
-            except (EnvelopeError, ValidationError) as exc:
+            except _PEER_ERRORS as exc:
                 self._telemetry.gossip_push_error_total.add()
                 span.record_exception(exc)
-                span.set_status_error(str(exc))
+                span.set_status_error(describe(exc))
                 logger.warning(
-                    "gossip._send_push failed node_id=%s target=%s error=%s",
+                    "gossip.push failed node_id=%s target=%s error=%s",
                     self._node_id,
                     target.node_id,
-                    exc,
+                    describe(exc),
                 )
 
     async def _handle_push_error(self, envelope: Envelope, target: Member) -> None:
@@ -500,14 +495,14 @@ class Gossiper:
             try:
                 async with self._peer_pool.lease(peer.node_id) as client:
                     await self._ae_exchange(peer, client)
-            except (EnvelopeError, ValidationError) as exc:
+            except _PEER_ERRORS as exc:
                 span.record_exception(exc)
-                span.set_status_error(str(exc))
+                span.set_status_error(describe(exc))
                 logger.warning(
                     "gossip.ping failed node_id=%s peer=%s error=%s",
                     self._node_id,
                     peer.node_id,
-                    exc,
+                    describe(exc),
                 )
 
     async def _ae_exchange(self, peer: Member, client: EnvelopeClient) -> None:
@@ -529,7 +524,7 @@ class Gossiper:
         pong_data: dict[str, Any] = self._serializer.decode(pong.payload)
         self._stats.last_ae_peer = peer.node_id
         self._stats.last_ae_at = self._utc_now()
-        self._set_last_ae_metrics(peer.node_id)
+        self._set_last_ae_metrics()
 
         same = pong_data.get("same", True)
 

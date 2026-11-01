@@ -204,7 +204,7 @@ class TopologyManager:
             return old_phase is not new.phase and new.phase in RING_PHASES
 
         logger.info(
-            "topology.ring updated node_id=%s from=%s to=%s size=%s",
+            "topology.ring updated node_id=%s from=%s to=%s vnodes=%d",
             new.node_id,
             old_phase.value,
             new.phase.value,

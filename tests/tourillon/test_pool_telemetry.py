@@ -17,7 +17,7 @@ import ssl
 import time
 from collections import defaultdict
 from collections.abc import Mapping
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -53,6 +53,8 @@ class _FakeClient:
         tls_ctx: ssl.SSLContext,
         fd: object | None = None,
         logger: object | None = None,
+        *,
+        context: object | None = None,
     ) -> None:
         self.bind = bind
         self.tls_ctx = tls_ctx
@@ -288,6 +290,12 @@ class _TelemetryRecorder(Telemetry):
     ) -> AbstractContextManager[Span]:
         return _SpanCtx(self.spans, name, attributes)
 
+    def inject_context(self) -> bytes:
+        return b""
+
+    def extract_context(self, data: bytes) -> AbstractContextManager[None]:
+        return nullcontext()
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -337,7 +345,7 @@ async def test_pool_telemetry_records_new_permanent_connection(
 
     await pool.acquire("peer-a")
 
-    key = _label_key({"peer_id": "peer-a", "type": "permanent"})
+    key = _label_key({"type": "permanent"})
     assert telemetry._pool_connections_total.values[key] == 1
     assert telemetry._pool_size_permanent.values[()] == 1
 
@@ -362,7 +370,7 @@ async def test_pool_telemetry_records_new_overflow_connection(
     await pool.acquire("peer-a")
     await pool.acquire("peer-b")
 
-    key = _label_key({"peer_id": "peer-b", "type": "overflow"})
+    key = _label_key({"type": "overflow"})
     assert telemetry._pool_connections_total.values[key] == 1
     assert telemetry._pool_size_overflow.values[()] == 1
 
@@ -387,7 +395,7 @@ async def test_pool_telemetry_records_lru_eviction(
     await pool.acquire("peer-a")
     await pool.acquire("peer-b")
 
-    evict_key = _label_key({"peer_id": "peer-a", "reason": "lru_evict"})
+    evict_key = _label_key({"reason": "lru_evict"})
     assert telemetry._pool_evictions_total.values[evict_key] == 1
 
 
@@ -412,7 +420,7 @@ async def test_pool_telemetry_records_overflow_release_eviction(
     await pool.acquire("peer-b")
     await pool.release("peer-b")
 
-    evict_key = _label_key({"peer_id": "peer-b", "reason": "overflow_release"})
+    evict_key = _label_key({"reason": "overflow_release"})
     assert telemetry._pool_evictions_total.values[evict_key] == 1
     assert telemetry._pool_size_overflow.values[()] == 0
 
@@ -439,7 +447,7 @@ async def test_pool_telemetry_records_idle_expired_eviction(
     await asyncio.sleep(0.02)
     await pool._remove_expired()
 
-    evict_key = _label_key({"peer_id": "peer-a", "reason": "idle_expired"})
+    evict_key = _label_key({"reason": "idle_expired"})
     assert telemetry._pool_evictions_total.values[evict_key] == 1
     assert telemetry._pool_size_permanent.values[()] == 0
 
@@ -475,7 +483,7 @@ async def test_pool_telemetry_records_promotion(
     await pool._remove_expired()
     await pool._try_promote_overflow()
 
-    promo_key = _label_key({"peer_id": "peer-c"})
+    promo_key = _label_key()
     assert telemetry._pool_promotions_total.values[promo_key] == 1
     assert telemetry._pool_size_overflow.values[()] == 0
 
@@ -502,6 +510,8 @@ async def test_pool_telemetry_records_acquire_error_on_timeout(
         tls_ctx: ssl.SSLContext,
         fd: object | None = None,
         logger: object | None = None,
+        *,
+        context: object | None = None,
     ) -> _FakeClient:
         c = _FakeClient(bind=bind, tls_ctx=tls_ctx, fd=fd, logger=logger)
         c.connect_delay = 1.0
@@ -512,7 +522,7 @@ async def test_pool_telemetry_records_acquire_error_on_timeout(
     with pytest.raises(asyncio.TimeoutError):
         await pool.acquire("peer-a")
 
-    error_key = _label_key({"peer_id": "peer-a"})
+    error_key = _label_key({"reason": "timeout"})
     assert telemetry._pool_acquire_errors_total.values[error_key] == 1
 
 
@@ -535,8 +545,8 @@ async def test_pool_telemetry_records_refresh_eviction_and_new_connection(
     topologymgr.binds["peer-a"] = "127.0.0.1:5000"
     await pool.acquire("peer-a")
 
-    evict_key = _label_key({"peer_id": "peer-a", "reason": "refresh"})
-    conn_key = _label_key({"peer_id": "peer-a", "type": "permanent"})
+    evict_key = _label_key({"reason": "refresh"})
+    conn_key = _label_key({"type": "permanent"})
     assert telemetry._pool_evictions_total.values[evict_key] == 1
     assert telemetry._pool_connections_total.values[conn_key] == 2
 
@@ -563,22 +573,21 @@ async def test_pool_telemetry_records_pool_close_evictions(
     await pool.acquire("peer-c")
     await pool.shutdown()
 
-    for peer_id in ("peer-a", "peer-b", "peer-c"):
-        key = _label_key({"peer_id": peer_id, "reason": "pool_close"})
-        assert telemetry._pool_evictions_total.values[key] == 1
+    key = _label_key({"reason": "pool_close"})
+    assert telemetry._pool_evictions_total.values[key] == 3
 
     assert telemetry._pool_size_permanent.values[()] == 0
     assert telemetry._pool_size_overflow.values[()] == 0
 
 
 # ---------------------------------------------------------------------------
-# Tests – spans
+# Tests - cardinality and spans
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_pool_telemetry_acquire_emits_span(
+async def test_pool_telemetry_acquire_emits_no_span_nor_peer_label(
     tls_ctx: ssl.SSLContext,
     fd_provider: FailureDetectorProvider,
     topologymgr: _TopologyManagerStub,
@@ -592,18 +601,19 @@ async def test_pool_telemetry_acquire_emits_span(
     )
 
     await pool.acquire("peer-a")
+    await pool.acquire("peer-b")
 
-    span_names = [name for name, _ in telemetry.spans]
-    assert "pool.acquire" in span_names
-    assert any(
-        name == "pool.acquire" and attrs.get("peer_id") == "peer-a"
-        for name, attrs in telemetry.spans
-    )
+    # Acquiring a pooled connection is a hot path: a span per call would
+    # drown the traces, and a peer label would grow with the cluster.
+    assert telemetry.spans == []
+    assert telemetry._pool_connections_total.values == {
+        _label_key({"type": "permanent"}): 2
+    }
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_pool_telemetry_acquire_span_records_error_on_timeout(
+async def test_pool_telemetry_records_acquire_error_on_refused_connection(
     tls_ctx: ssl.SSLContext,
     fd_provider: FailureDetectorProvider,
     monkeypatch: pytest.MonkeyPatch,
@@ -614,25 +624,17 @@ async def test_pool_telemetry_acquire_span_records_error_on_timeout(
         tls_ctx=tls_ctx,
         topologymgr=_as_topologymgr(topologymgr),
         fd_provider=fd_provider,
-        connection_timeout=0.01,
         telemetry=telemetry,
     )
 
-    def slow_client(
-        bind: str,
-        tls_ctx: ssl.SSLContext,
-        fd: object | None = None,
-        logger: object | None = None,
-    ) -> _FakeClient:
-        c = _FakeClient(bind=bind, tls_ctx=tls_ctx, fd=fd, logger=logger)
-        c.connect_delay = 1.0
-        return c
+    class _RefusingClient(_FakeClient):
+        async def connect(self) -> None:
+            raise ConnectionRefusedError("refused")
 
-    monkeypatch.setattr(pool_module, "PeerClient", slow_client)
+    monkeypatch.setattr(pool_module, "PeerClient", _RefusingClient)
 
-    with pytest.raises(asyncio.TimeoutError):
+    with pytest.raises(ConnectionRefusedError):
         await pool.acquire("peer-a")
 
-    # The span should have been opened (name recorded)
-    span_names = [name for name, _ in telemetry.spans]
-    assert "pool.acquire" in span_names
+    error_key = _label_key({"reason": "connect"})
+    assert telemetry._pool_acquire_errors_total.values[error_key] == 1

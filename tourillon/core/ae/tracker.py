@@ -103,7 +103,7 @@ class ViewTracker:
             generation = await self._topologymgr.wait_for_change(generation)
             self._invalidate()
             logger.info(
-                "antientropy.view invalidated generation=%d quiet=%.2fs max=%.2fs",
+                "ae.view invalidated generation=%d quiet=%.2fs max=%.2fs",
                 generation,
                 self._settle_quiet,
                 self._settle_delay,
@@ -136,7 +136,7 @@ class ViewTracker:
 
             changes += 1
             logger.debug(
-                "antientropy.view settle extended generation=%d changes=%d",
+                "ae.view settle extended generation=%d changes=%d",
                 generation,
                 changes,
             )
@@ -146,14 +146,14 @@ class ViewTracker:
     def _log_settled(self, elapsed: float, changes: int, capped: bool) -> None:
         if capped:
             logger.warning(
-                "antientropy.view rebuilt under churn after %.2fs changes=%d: "
+                "ae.view rebuilt under churn after %.2fs changes=%d: "
                 "membership kept changing for settle_delay",
                 elapsed,
                 changes,
             )
             return
 
-        logger.info("antientropy.view settled after %.2fs changes=%d", elapsed, changes)
+        logger.info("ae.view settled after %.2fs changes=%d", elapsed, changes)
 
     def _invalidate(self) -> None:
         self._view = None
@@ -175,8 +175,6 @@ class ViewTracker:
         self._view = view
         self._ready.set()
 
-        logger.info(
-            "antientropy.view rebuilt serial=%s peers=%d", serial, len(view.shared)
-        )
+        logger.info("ae.view rebuilt serial=%s peers=%d", serial, len(view.shared))
 
         return generation

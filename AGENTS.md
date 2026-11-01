@@ -155,9 +155,9 @@ If you need a new backend capability: extend the protocol, implement it in `infr
 All network traffic is a single `Envelope` frame (`tourlib/envelope.py`):
 
 ```
-32-byte header | UTF-8 kind | payload bytes
-header := >B H B 16s I B 7s
-          proto_version, schema_id, mode, correlation_id(uuid16), payload_len, kind_len, reserved
+32-byte header | UTF-8 kind | context bytes (<= 32) | payload bytes
+header := >B H B 16s I B B 6s
+          proto_version, schema_id, mode, correlation_id(uuid16), payload_len, kind_len, context_len, reserved
 mode := 0 (RPC) | 1 (fire-and-forget)
 ```
 

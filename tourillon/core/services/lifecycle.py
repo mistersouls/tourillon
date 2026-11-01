@@ -14,8 +14,9 @@
 
 import asyncio
 import contextlib
+import contextvars
 import ssl
-from collections.abc import Iterable
+from collections.abc import Coroutine, Iterable
 from pathlib import Path
 
 from tourillon.core.ae.obligations import ObligationQueue
@@ -47,6 +48,18 @@ from tourlib.helpers import parse_bind
 from tourlib.port import Persistence
 
 MAX_DRAIN_SEEDS = 5
+
+
+def _background_task(
+    coro: Coroutine[object, object, None], *, name: str
+) -> asyncio.Task[None]:
+    """Run a membership operation outside the request that triggered it.
+
+    A join or drain starts long-lived loops (gossip, anti-entropy, listeners)
+    that would otherwise inherit the request's context, trace span included,
+    and keep that trace growing for the life of the node.
+    """
+    return asyncio.create_task(coro, name=name, context=contextvars.Context())
 
 
 class NodeLifecycle:
@@ -114,6 +127,7 @@ class NodeLifecycle:
             replication_factor=config.placement.replication_factor,
             config=config.placement.anti_entropy,
             obligations=obligations,
+            telemetry=telemetry,
         )
 
         self._state_file = Path(self._config.storage.data_dir) / NODE_STATE_FILENAME
@@ -132,11 +146,16 @@ class NodeLifecycle:
         return self._gossiper
 
     async def start(self, seeds: list[str] | None = None) -> None:
-        logger.info("Starting node lifecycle for '%s'", self._config.node.id)
+        logger.debug("Starting node lifecycle for '%s'", self._config.node.id)
         if seeds:
             logger.debug("Lifecycle received seed overrides: %s", seeds)
         state = await self._load_or_create_state()
-        logger.info("Applying startup phase '%s'", state.phase.value)
+        logger.info(
+            "Node '%s' starting in phase '%s' (epoch=%d)",
+            state.node_id,
+            state.phase.value,
+            state.epoch,
+        )
         match state.phase:
             case MemberPhase.IDLE:
                 await self._startup_idle(state, seeds)
@@ -151,10 +170,10 @@ class NodeLifecycle:
             case MemberPhase.PAUSED:
                 await self._startup_paused()
 
-        logger.info("Node lifecycle started for '%s'", self._config.node.id)
+        logger.debug("Node lifecycle started for '%s'", self._config.node.id)
 
     async def stop(self) -> None:
-        logger.info("Stopping node lifecycle for '%s'", self._config.node.id)
+        logger.debug("Stopping node lifecycle for '%s'", self._config.node.id)
         await self._stop_client()
         if self.is_draining():
             assert self._drain_task is not None
@@ -171,7 +190,7 @@ class NodeLifecycle:
         await self._antientropy.stop()
         await self._gossiper.stop()
         await self._stop_peer()
-        logger.info("Node lifecycle stopped for '%s'", self._config.node.id)
+        logger.debug("Node lifecycle stopped for '%s'", self._config.node.id)
 
     def is_joining(self) -> bool:
         return self._join_task is not None and not self._join_task.done()
@@ -192,8 +211,8 @@ class NodeLifecycle:
                 raise JoinError("Cannot join while the node is draining.")
             effective_seeds = seeds or state.seeds or self._config.node.seeds or []
             if not effective_seeds:
-                logger.error(
-                    "No seed peers provided for join operation, 'seeds' are required"
+                logger.warning(
+                    "Join refused: no seed peers provided, 'seeds' are required"
                 )
                 raise JoinError(
                     "No seed peers provided for join operation, 'seeds' are required."
@@ -208,7 +227,7 @@ class NodeLifecycle:
             )
             self._log_tokens(joining_state)
             logger.info("Triggering join operation for node '%s'", self._config.node.id)
-            self._join_task = asyncio.create_task(
+            self._join_task = _background_task(
                 self._perform_join(joining_state), name="node-join"
             )
 
@@ -236,7 +255,11 @@ class NodeLifecycle:
 
             self._store.pause()
             await self._publish_state(state)
-            self._drain_task = asyncio.create_task(
+            logger.info(
+                "Drain requested for node '%s'; writes are refused from now on",
+                state.node_id,
+            )
+            self._drain_task = _background_task(
                 self._perform_drain(state), name="node-drain"
             )
 
@@ -269,6 +292,7 @@ class NodeLifecycle:
             idle = await self._transition_to(state, MemberPhase.IDLE)
             await self._publish_state(idle)
             await self._antientropy.stop()
+            logger.info("Drain completed for node '%s'; node is IDLE", state.node_id)
         except Exception as exc:
             logger.exception(
                 "Drain failed for node '%s'; node remains DRAINING. Reason: %s",
@@ -302,13 +326,17 @@ class NodeLifecycle:
 
     @staticmethod
     def _log_tokens(state: NodeState) -> None:
-        logger.info("Node state epoch=%s tokens (%d):", state.epoch, len(state.tokens))
-        if not state.tokens:
-            logger.info("  (none)")
-            return
-
-        for idx, token in enumerate(state.tokens):
-            logger.info("  %.18s (%s)", token, idx + 1)
+        logger.info(
+            "Node '%s' epoch=%d owns %d token(s)%s",
+            state.node_id,
+            state.epoch,
+            len(state.tokens),
+            ":" if state.tokens else "",
+        )
+        # The leading 64 bits identify a token on the ring; the full value
+        # is in the state file.
+        for idx, token in enumerate(state.tokens, start=1):
+            logger.info("  [%d] %.18s", idx, token)
 
     async def _perform_join(self, state: NodeState) -> None:
         """Enter the ring as JOINING, then wait for the sync goal before READY.
@@ -437,7 +465,7 @@ class NodeLifecycle:
         await self._gossiper.start()
         await self._publish_state(state)
         await self._start_client()
-        self._drain_task = asyncio.create_task(
+        self._drain_task = _background_task(
             self._perform_drain(state), name="node-drain"
         )
 
@@ -449,7 +477,7 @@ class NodeLifecycle:
 
     async def _start_peer(self) -> None:
         peer_addr = self._config.server_peer.bind
-        logger.info("Starting peer listener on %s", peer_addr)
+        logger.debug("Starting peer listener on %s", peer_addr)
         try:
             host, port = parse_bind(peer_addr)
         except ValueError:
@@ -468,11 +496,11 @@ class NodeLifecycle:
 
         self._peer_started = True
         peer_host, peer_port = self._peer_server.endpoint
-        logger.info("Peer listener started on %s:%s", peer_host, peer_port)
+        logger.debug("Peer listener started on %s:%s", peer_host, peer_port)
 
     async def _start_client(self) -> None:
         client_addr = self._config.server_client.bind
-        logger.info("Starting client listener on %s", client_addr)
+        logger.debug("Starting client listener on %s", client_addr)
         try:
             host, port = parse_bind(client_addr)
         except ValueError:
@@ -491,7 +519,7 @@ class NodeLifecycle:
 
         self._client_started = True
         client_host, client_port = self._client_server.endpoint
-        logger.info("Client listener started on %s:%s", client_host, client_port)
+        logger.debug("Client listener started on %s:%s", client_host, client_port)
 
     async def _stop_client(self) -> None:
         if not self._client_started:
@@ -534,7 +562,13 @@ class NodeLifecycle:
         with_tokens: bool = False,
         with_seeds: list[str] | None = None,
     ) -> NodeState:
-        logger.info("Transitioning node phase to '%s'", new_phase.value)
+        logger.info(
+            "node.phase %s -> %s node=%s epoch=%d",
+            state.phase.value,
+            new_phase.value,
+            state.node_id,
+            state.epoch + 1,
+        )
 
         async with self._persistence.edit(self._state_file) as document:
             node = document.setdefault("node", {})

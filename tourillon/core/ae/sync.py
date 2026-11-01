@@ -189,7 +189,7 @@ class PeerSync:
         )
         logger.get().log(
             self._level,
-            "antientropy.%s page %d/%d peer=%s pids=%d..%d (%d) diverged=%d "
+            "ae.%s page %d/%d peer=%s pids=%d..%d (%d) diverged=%d "
             "pulled=%d (%s) pushed=%d (%s) in %.2fs",
             self._goal or "sweep",
             index,

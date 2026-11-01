@@ -23,6 +23,7 @@ exercised together.
 import asyncio
 import contextlib
 import dataclasses
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ from typing import Any
 
 import pytest
 
+from tests.helpers.telemetry import RecordingTelemetry
 from tourillon.bootstrap.handlers import antientropy as handlers
 from tourillon.core.ae.sync import (
     BudgetSpentError,
@@ -235,6 +237,7 @@ class _Cluster:
         config: AntiEntropyConfig | None = None,
         *,
         serve: bool = True,
+        telemetry: RecordingTelemetry | None = None,
     ) -> AntiEntropyService:
         storage = _Storage(self._tmp_path / node_id)
         self.storages.append(storage)
@@ -250,6 +253,7 @@ class _Cluster:
             config=config or AntiEntropyConfig(grace=10.0, settle_delay=0.0),
             clock=lambda: NOW,
             backoff=BackoffRetry(initial_delay=0.0, max_delay=0.0, jitter=0.0),
+            telemetry=None if telemetry is None else telemetry.as_port(),
         )
 
         self.network.nodes[node_id] = service
@@ -516,7 +520,7 @@ async def test_refused_sessions_retry_after_the_quiet_period(
         )
 
     assert a.stats.rejects == {AntiEntropyRejectError.NOT_READY: 1}
-    assert "antientropy.session deferred peer=node-b" in caplog.text
+    assert "ae.session deferred peer=node-b" in caplog.text
     assert "retry_after=0.25s" in caplog.text
 
 
@@ -759,8 +763,8 @@ async def test_tracker_rebuilds_an_isolated_change_after_the_quiet_period(
             view = await asyncio.wait_for(tracker.wait_ready(), 2)
 
     assert any("node-c" in r for r in view.replicas)
-    assert "antientropy.view invalidated" in caplog.text
-    assert "antientropy.view settled after" in caplog.text
+    assert "ae.view invalidated" in caplog.text
+    assert "ae.view settled after" in caplog.text
     assert "changes=1" in caplog.text
 
 
@@ -778,8 +782,8 @@ async def test_tracker_coalesces_a_burst_of_changes_into_one_rebuild(
             await asyncio.wait_for(stale.wait(), 2)
             await asyncio.wait_for(tracker.wait_ready(), 2)
 
-    assert caplog.text.count("antientropy.view rebuilt") == 1
-    assert caplog.text.count("antientropy.view settle extended") == 2
+    assert caplog.text.count("ae.view rebuilt") == 1
+    assert caplog.text.count("ae.view settle extended") == 2
     assert "changes=3" in caplog.text
 
 
@@ -1340,14 +1344,14 @@ async def test_join_reports_every_page_and_the_data_it_copied(
     with caplog.at_level("INFO", logger="tourillon.global"):
         await asyncio.wait_for(c.wait_joined(), 5)
 
-    pages = [m for m in caplog.messages if m.startswith("antientropy.join page")]
-    sessions = [m for m in caplog.messages if "antientropy.join session" in m]
+    pages = [m for m in caplog.messages if m.startswith("ae.join page")]
+    sessions = [m for m in caplog.messages if "ae.join session" in m]
     assert len(pages) == len(split) and len(sessions) == len(split)
     assert all(" 1/1 " in m and "diverged=" in m for m in pages)
     assert all("session done" in m for m in sessions)
     assert c.stats.pulled == len(copied) and c.stats.bytes_pulled == size
     assert f"pulled={len(copied)} ({size} B)" in caplog.text
-    assert "antientropy.join synced" in caplog.text
+    assert "ae.join synced" in caplog.text
 
 
 async def test_sweep_pages_are_reported_at_debug_only(
@@ -1361,11 +1365,11 @@ async def test_sweep_pages_are_reported_at_debug_only(
 
     with caplog.at_level("INFO", logger="tourillon.global"):
         await a.run_unit(unit, view, a.tracker.stale_signal())
-    assert "antientropy.sweep page" not in caplog.text
+    assert "ae.sweep page" not in caplog.text
 
     with caplog.at_level("DEBUG", logger="tourillon.global"):
         await a.run_unit(unit, view, a.tracker.stale_signal())
-    assert "antientropy.sweep page 1/1 peer=node-b" in caplog.text
+    assert "ae.sweep page 1/1 peer=node-b" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -1456,3 +1460,55 @@ async def test_drain_goal_is_not_reached_while_a_replica_is_down(
     draining.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await draining
+
+
+async def test_sweep_that_copies_data_is_measured_and_logged_at_info(
+    cluster: _Cluster, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = AntiEntropyConfig(
+        grace=10.0, settle_delay=0.0, sweep_period=0.1, min_interval=0.0, jitter=0.0
+    )
+    members = [_member(n) for n in TOKENS]
+    telemetry = RecordingTelemetry()
+    a = await cluster.node(
+        "node-a", await _topology(*members), config, telemetry=telemetry
+    )
+    b = await cluster.node("node-b", await _topology(*members), config)
+    await cluster.node("node-c", await _topology(*members), config)
+    view = _view(a)
+    await _write(b, _shared_records(view, "node-b"))
+    caplog.set_level(logging.DEBUG, logger="tourillon.global")
+
+    assert await a.sweep(view, a.tracker.stale_signal()) is True
+
+    assert telemetry.calls["ae_sweeps_total"] == [(1, {"outcome": "complete"})]
+    assert telemetry.total("ae_sessions_total", goal="sweep", outcome="ok") >= 1
+    assert telemetry.total("ae_versions_total", direction="pull") > 0
+    assert telemetry.total("ae_bytes_total", direction="pull") > 0
+    summary = [
+        r for r in caplog.records if r.getMessage().startswith("ae.sweep complete")
+    ]
+    assert [r.levelno for r in summary] == [logging.INFO]
+
+
+async def test_interrupted_idle_sweep_is_counted_and_logged_at_debug(
+    cluster: _Cluster, caplog: pytest.LogCaptureFixture
+) -> None:
+    members = [_member(n) for n in TOKENS]
+    telemetry = RecordingTelemetry()
+    a = await cluster.node("node-a", await _topology(*members), telemetry=telemetry)
+    view = _view(a)
+    stale = asyncio.Event()
+    stale.set()
+    caplog.set_level(logging.DEBUG, logger="tourillon.global")
+
+    await a.run_unit(Unit("node-b", view.shared["node-b"]), view, stale)
+    assert await a.sweep(view, stale) is False
+
+    assert telemetry.calls["ae_sweeps_total"] == [(1, {"outcome": "interrupted"})]
+    assert telemetry.total("ae_sessions_total", outcome="view_changed") == 1
+    assert telemetry.calls["ae_versions_total"] == []
+    summary = [
+        r for r in caplog.records if r.getMessage().startswith("ae.sweep interrupted")
+    ]
+    assert [r.levelno for r in summary] == [logging.DEBUG]

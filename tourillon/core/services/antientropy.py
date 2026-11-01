@@ -82,6 +82,7 @@ obligations are still in META, so the work is found again.
 import asyncio
 import contextlib
 import hashlib
+import logging
 import random
 import time
 from collections.abc import Callable, Coroutine, Iterable, Sequence
@@ -106,7 +107,7 @@ from tourillon.core.ae.tracker import ViewTracker
 from tourillon.core.ae.view import ReplicaView
 from tourillon.core.exceptions import AntiEntropyRejectError
 from tourillon.core.gossip.topology import TopologyManager
-from tourillon.core.log import logger
+from tourillon.core.log import describe, logger
 from tourillon.core.models.antientropy import (
     MAX_BATCH_BYTES,
     MAX_PAGE_LIMIT,
@@ -121,6 +122,8 @@ from tourillon.core.models.storageschema import Key, Keyspace, ObligationKey, Re
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports.storage import Storage
+from tourillon.core.ports.telemetry import Telemetry
+from tourillon.core.telemetry import build_noop_telemetry
 from tourlib import Serializer
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT
 from tourlib.envelope import Envelope, build_envelope
@@ -192,8 +195,20 @@ class AntiEntropyStats:
         else:
             self.pushed += tally.pushed
 
+    def progress(self) -> dict[str, int]:
+        """Snapshot of the counters a sweep summary reports as deltas."""
+        return {
+            "sessions": self.sessions,
+            "diverged": self.pids_diverged,
+            "pulled": self.pulled,
+            "pushed": self.pushed + self.handed_off,
+            "bytes_pulled": self.bytes_pulled,
+            "bytes_pushed": self.bytes_pushed,
+            "errors": self.errors,
+        }
+
     def failed(self, exc: Exception) -> None:
-        self.last_failure = f"{type(exc).__name__}: {exc}"
+        self.last_failure = describe(exc)
         self.last_failure_at = datetime.now(UTC).isoformat()
 
     def to_dict(self) -> dict[str, Any]:
@@ -325,8 +340,10 @@ class AntiEntropyService:
         obligations: ObligationQueue | None = None,
         clock: Callable[[], float] = time.time,
         backoff: BackoffRetry | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         self._node_id = node_id
+        self._telemetry = telemetry or build_noop_telemetry()
         self._partitioner = partitioner
         self._topologymgr = topologymgr
         self._pool = peer_pool
@@ -398,7 +415,7 @@ class AntiEntropyService:
                 asyncio.create_task(self._run(), name="antientropy-loop")
             )
 
-        logger.info("antientropy.started node=%s", self._node_id)
+        logger.info("ae.started node=%s", self._node_id)
 
     async def stop(self) -> None:
         """Stop the loops, then drain admitted requests; never touches data."""
@@ -432,7 +449,7 @@ class AntiEntropyService:
         started = time.monotonic()
         passes = 0
         copied = (self._stats.pulled, self._stats.bytes_pulled)
-        logger.info("antientropy.join started node=%s", self._node_id)
+        logger.info("ae.join started node=%s", self._node_id)
 
         while True:
             view = await self.tracker.wait_ready()
@@ -441,7 +458,7 @@ class AntiEntropyService:
             if not view.owns:
                 # The view predates this node's entry in the ring.
                 logger.debug(
-                    "antientropy.join waiting for a view that places node=%s",
+                    "ae.join waiting for a view that places node=%s",
                     self._node_id,
                 )
                 await stale.wait()
@@ -453,8 +470,7 @@ class AntiEntropyService:
 
             if not failed and not stale.is_set():
                 logger.info(
-                    "antientropy.join synced node=%s passes=%d pulled=%d (%s) "
-                    "elapsed=%.2fs",
+                    "ae.join synced node=%s passes=%d pulled=%d (%s) " "elapsed=%.2fs",
                     self._node_id,
                     passes,
                     self._stats.pulled - copied[0],
@@ -476,7 +492,7 @@ class AntiEntropyService:
 
         fallback = _fallback_sources(view, primaries, result.skipped)
         logger.debug(
-            "antientropy.join pass sources=%d pids=%d failed=%d fallback=%d",
+            "ae.join pass sources=%d pids=%d failed=%d fallback=%d",
             len(primaries),
             sum(len(pids) for pids in primaries.values()),
             len(result.failed),
@@ -501,7 +517,7 @@ class AntiEntropyService:
         started = time.monotonic()
         passes = 0
         copied = (self._stats.handed_off, self._stats.bytes_pushed)
-        logger.info("antientropy.drain started node=%s", self._node_id)
+        logger.info("ae.drain started node=%s", self._node_id)
 
         while True:
             view = await self.tracker.wait_ready()
@@ -510,7 +526,7 @@ class AntiEntropyService:
             if view.owns:
                 # The view predates this node's DRAINING phase.
                 logger.debug(
-                    "antientropy.drain waiting for a view without node=%s",
+                    "ae.drain waiting for a view without node=%s",
                     self._node_id,
                 )
                 await stale.wait()
@@ -522,7 +538,7 @@ class AntiEntropyService:
 
             if done:
                 logger.info(
-                    "antientropy.drain handed off node=%s passes=%d pushed=%d (%s) "
+                    "ae.drain handed off node=%s passes=%d pushed=%d (%s) "
                     "elapsed=%.2fs",
                     self._node_id,
                     passes,
@@ -589,7 +605,7 @@ class AntiEntropyService:
             except Exception as exc:  # the loop must outlive any bug
                 self._stats.errors += 1
                 self._stats.failed(exc)
-                logger.exception("antientropy.sweep failed")
+                logger.exception("ae.sweep failed")
                 await _pause(self._config.min_interval, stale)
 
     async def sweep(self, view: ReplicaView, stale: asyncio.Event) -> bool:
@@ -607,6 +623,8 @@ class AntiEntropyService:
         # A random first delay de-synchronises nodes that all rebuilt their
         # view at the same moment after a ring change.
         delay = random.uniform(0.0, interval)
+        started = time.monotonic()
+        before = self._stats.progress()
 
         for unit in units:
             await _pause(delay, stale)
@@ -615,14 +633,44 @@ class AntiEntropyService:
 
             if stale.is_set():
                 self._stats.view_changes += 1
+                self._sweep_done("interrupted", len(units), before, started)
                 return False
 
             await self.run_unit(unit, view, stale)
             delay = self._jittered(interval)
 
         self._stats.sweeps += 1
+        self._sweep_done("complete", len(units), before, started)
 
         return True
+
+    def _sweep_done(
+        self, outcome: str, units: int, before: dict[str, int], started: float
+    ) -> None:
+        """Count the sweep and summarise what it did.
+
+        A sweep that copied nothing and met no error is the steady state: it is
+        logged at DEBUG so that INFO only shows sweeps that repaired data.
+        """
+        self._telemetry.ae_sweeps_total.add(1, attributes={"outcome": outcome})
+        after = self._stats.progress()
+        delta = {name: after[name] - before[name] for name in after}
+        busy = delta["pulled"] or delta["pushed"] or delta["errors"]
+        logger.log(
+            logging.INFO if busy else logging.DEBUG,
+            "ae.sweep %s units=%d sessions=%d diverged=%d pulled=%d (%s) "
+            "pushed=%d (%s) errors=%d in %.2fs",
+            outcome,
+            units,
+            delta["sessions"],
+            delta["diverged"],
+            delta["pulled"],
+            human_bytes(delta["bytes_pulled"]),
+            delta["pushed"],
+            human_bytes(delta["bytes_pushed"]),
+            delta["errors"],
+            time.monotonic() - started,
+        )
 
     async def run_unit(
         self, unit: Unit, view: ReplicaView, stale: asyncio.Event
@@ -636,8 +684,8 @@ class AntiEntropyService:
             return
 
         sync = self._session(unit.peer, view, stale, self._cutoff_ms())
-        await self._guard(unit.peer, sync.sync_roots(unit.pids))
-        self._stats.merge(sync.tally, handoff=False)
+        outcome = await self._guard(unit.peer, sync.sync_roots(unit.pids))
+        self._settle("sweep", sync.tally, outcome)
 
     async def _handoff(
         self, unit: Unit, view: ReplicaView, stale: asyncio.Event
@@ -707,8 +755,8 @@ class AntiEntropyService:
 
             sync = self._session(peer, view, stale, cutoff_ms, goal)
             started = time.monotonic()
-            ok = await self._guard(peer, sync.sync_roots(pids))
-            self._stats.merge(sync.tally, handoff=True)
+            outcome = await self._guard(peer, sync.sync_roots(pids))
+            ok = self._settle(goal or "handoff", sync.tally, outcome)
 
             if goal is not None:
                 _log_session(goal, peer, len(pids), ok, sync.tally, started)
@@ -735,7 +783,7 @@ class AntiEntropyService:
                 self._stats.errors += 1
                 self._stats.failed(exc)
                 self.obligations.backlog = True
-                logger.exception("antientropy.delivery failed")
+                logger.exception("ae.delivery failed")
                 await asyncio.sleep(self._retry_delay)
 
     async def _deliver_step(self, view: ReplicaView) -> None:
@@ -804,6 +852,12 @@ class AntiEntropyService:
         if obsolete:
             await self.local.remove_obligations(obsolete)
             self._stats.obligations_dropped += len(obsolete)
+            self._obligation_event("dropped", len(obsolete))
+            logger.debug(
+                "ae.obligations dropped count=%d (version gone or target no "
+                "longer a replica)",
+                len(obsolete),
+            )
 
     def _owed(self, obligation: ObligationKey, view: ReplicaView) -> bool:
         pid = obligation.key.pid.value
@@ -832,6 +886,9 @@ class AntiEntropyService:
                 return
 
         self._backoff.succeeded(target)
+        logger.debug(
+            "ae.obligations delivered target=%s count=%d", target, len(obligations)
+        )
 
     def _park(self, target: str, count: int) -> None:
         """Leave obligations of an unreachable target in META for later."""
@@ -840,6 +897,12 @@ class AntiEntropyService:
 
         self.obligations.backlog = True
         self._stats.obligations_deferred += count
+        self._obligation_event("deferred", count)
+        logger.debug(
+            "ae.obligations deferred target=%s count=%d (peer unreachable)",
+            target,
+            count,
+        )
 
     async def _push_obligations(
         self,
@@ -863,6 +926,7 @@ class AntiEntropyService:
 
             await self.local.remove_obligations(chunk)
             self._stats.obligations_delivered += len(chunk)
+            self._obligation_event("delivered", len(chunk))
 
         return True
 
@@ -895,26 +959,49 @@ class AntiEntropyService:
     def _now_ms(self) -> int:
         return int(self._clock() * 1000)
 
-    async def _guard(self, peer: str, work: Coroutine[Any, Any, None]) -> bool:
-        """Run one session; turn its failure into backoff and counters."""
+    async def _guard(self, peer: str, work: Coroutine[Any, Any, None]) -> str:
+        """Run one session; turn its failure into backoff and counters.
+
+        Return the session outcome: ``ok``, ``view_changed``, ``budget_spent``,
+        ``deferred`` or ``failed``.
+        """
         try:
             await work
         except ViewChangedError:
             self._stats.view_changes += 1
-            return False
+            return "view_changed"
         except BudgetSpentError as exc:
             self._stats.budget_stops += 1
-            logger.info("antientropy.budget spent peer=%s: %s", peer, exc)
-            return False
+            logger.info("ae.budget spent peer=%s: %s", peer, exc)
+            return "budget_spent"
         except _SESSION_ERRORS as exc:
-            self._failed(peer, exc)
-            return False
+            return self._failed(peer, exc)
 
         self._backoff.succeeded(peer)
 
-        return True
+        return "ok"
 
-    def _failed(self, peer: str, exc: Exception) -> None:
+    def _settle(self, goal: str, tally: SessionTally, outcome: str) -> bool:
+        """Account one finished session; return whether it completed."""
+        self._stats.merge(tally, handoff=goal != "sweep")
+        metrics = self._telemetry
+        metrics.ae_sessions_total.add(1, attributes={"goal": goal, "outcome": outcome})
+
+        for direction, versions, size in (
+            ("pull", tally.pulled, tally.pulled_bytes),
+            ("push", tally.pushed, tally.pushed_bytes),
+        ):
+            if versions:
+                attributes = {"direction": direction}
+                metrics.ae_versions_total.add(versions, attributes=attributes)
+                metrics.ae_bytes_total.add(size, attributes=attributes)
+
+        return outcome == "ok"
+
+    def _obligation_event(self, event: str, count: int) -> None:
+        self._telemetry.obligations_total.add(count, attributes={"event": event})
+
+    def _failed(self, peer: str, exc: Exception) -> str:
         self._stats.failed(exc)
 
         if isinstance(exc, AntiEntropyRejectError):
@@ -922,17 +1009,18 @@ class AntiEntropyService:
             if exc.retry_after > 0:
                 self._backoff.defer(peer, exc.retry_after)
                 logger.debug(
-                    "antientropy.session deferred peer=%s code=%s retry_after=%.2fs",
+                    "ae.session deferred peer=%s code=%s retry_after=%.2fs",
                     peer,
                     exc.code,
                     exc.retry_after,
                 )
-                return
+                return "deferred"
         else:
             self._stats.errors += 1
 
         self._backoff.failed(peer)
-        logger.warning("antientropy.session failed peer=%s: %s", peer, exc)
+        logger.warning("ae.session failed peer=%s: %s", peer, describe(exc))
+        return "failed"
 
     async def _eligible(self, peer: str) -> bool:
         """Alive, non-deferred peers in a phase that takes part in sessions."""
@@ -1066,7 +1154,7 @@ def _log_session(
     goal: str, peer: str, pids: int, ok: bool, tally: SessionTally, started: float
 ) -> None:
     logger.info(
-        "antientropy.%s session %s peer=%s pids=%d diverged=%d "
+        "ae.%s session %s peer=%s pids=%d diverged=%d "
         "pulled=%d (%s) pushed=%d (%s) in %.2fs",
         goal,
         "done" if ok else "stopped",
@@ -1083,14 +1171,10 @@ def _log_session(
 
 def _log_incomplete(goal: str, passes: int, stale: asyncio.Event, retry: float) -> None:
     if stale.is_set():
-        logger.debug(
-            "antientropy.%s pass=%d interrupted by a view change", goal, passes
-        )
+        logger.debug("ae.%s pass=%d interrupted by a view change", goal, passes)
         return
 
-    logger.debug(
-        "antientropy.%s pass=%d incomplete, retrying in %.2fs", goal, passes, retry
-    )
+    logger.debug("ae.%s pass=%d incomplete, retrying in %.2fs", goal, passes, retry)
 
 
 async def _pause(delay: float, stale: asyncio.Event) -> None:

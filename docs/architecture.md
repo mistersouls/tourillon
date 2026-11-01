@@ -518,11 +518,13 @@ and paginated.
 ## 10. Wire protocol
 
 ```
-Envelope := header(32 bytes) || kind(UTF-8) || payload
-header   := >B H B 16s I B 7s
-            proto_version | schema_id | mode | correlation_id | payload_len | kind_len | reserved
+Envelope := header(32 bytes) || kind(UTF-8) || context || payload
+header   := >B H B 16s I B B 6s
+            proto_version | schema_id | mode | correlation_id | payload_len | kind_len | context_len | reserved
 mode     := 0 RPC | 1 fire-and-forget
 ```
+
+- `context` is an opaque byte string of at most 32 bytes (`MAX_ENVELOPE_CONTEXT`). The transport never interprets it: the sender's `EnvelopeClient` fills it from a provider, and the receiver hands it to the telemetry port. An empty context costs nothing, so the frame is the same as without one. `replay_envelope()` does not echo the request context.
 
 - `kind` is lowercase `domain.action`, regex-validated; responses are `<kind>.accept` / `<kind>.reject`; transport-level problems use `transport.error`.
 - Payloads are serialized by the injected `Serializer`; MsgPack is the default and declares its own `schema_id`.
@@ -585,7 +587,36 @@ Configuration and node state are persisted through the `Persistence` port, TOML 
 
 ## 13. Observability
 
-Telemetry goes through the `Telemetry` / `TelemetryProvider` ports, implemented by the OpenTelemetry adapter in `tourillon/infra/adapter/telemetry/`. The peer pool, transport and gossip paths are instrumented. Logging uses `tourillon.core.log.logger` with lazy `%s` formatting and node/correlation context on request paths.
+Telemetry goes through the `Telemetry` / `TelemetryProvider` ports, implemented by the OpenTelemetry adapter in `tourillon/infra/adapter/telemetry/`; the no-op implementation is used when telemetry is disabled.
+
+### Logs
+
+Logging uses `tourillon.core.log.logger` with lazy `%s` formatting. Messages are prefixed by subsystem (`node.phase`, `gossip.`, `topology.`, `ae.`, `store.`, `replication.`, `probe`) and carry `key=value` context; exceptions are rendered with `describe(exc)` so that message-less errors (timeouts) still show their type. Levels follow one rule:
+
+| Level | Used for |
+| --- | --- |
+| `ERROR` | The node cannot do its job: startup or bind failure, a failed drain, a handler crash (with traceback). |
+| `WARNING` | A degradation an operator should look at: a replica or quorum failure, a peer unreachable (first failure of a streak only), a saturated pool, an obligation that cannot be recorded. |
+| `INFO` | State changes: listeners bound, phase transitions, owned tokens, ring and replica-view changes, join/drain progress, a sweep that copied data, a peer that recovered. |
+| `DEBUG` | Steady-state and per-request detail: each envelope, refusals returned to the caller, idle sweeps, repeated probe failures, pool churn. |
+
+A healthy idle node therefore stays quiet at `INFO` after startup.
+
+### Metrics
+
+All names carry the `tourillon_` prefix. Labels are low-cardinality on purpose: no key, peer or correlation id is ever a label.
+
+| Area | Metrics (labels) |
+| --- | --- |
+| Transport | `connections_accepted_total`, `connections_closed_total`, `dispatched_total`, `unknown_kind_total`, `protocol_errors_total`, `in_flight_current` (`endpoint`, `kind`, `mode`) |
+| Peer pool | `pool_connections_total`, `pool_evictions_total`, `pool_promotions_total`, `pool_acquire_errors_total` (`reason`: `timeout`/`connect`), `pool_size_permanent`, `pool_size_overflow` |
+| Store | `kv_requests_total`, `kv_request_duration_seconds` (`op`, `outcome`: `ok` or the error code), `replication_failures_total` (`op`), `read_repairs_total` (`outcome`), `obligations_total` (`event`: `recorded`/`delivered`/`deferred`/`dropped`) |
+| Anti-entropy | `ae_sessions_total` (`goal`, `outcome`), `ae_versions_total`, `ae_bytes_total` (`direction`: `pull`/`push`), `ae_sweeps_total` (`outcome`: `complete`/`interrupted`) |
+| Gossip | `gossip_push_attempt_total`, `gossip_push_error_total`, `gossip_ae_cycle_total`, `gossip_ae_diverged`, `gossip_failed_announcements_total`, `gossip_hot_queue_size`, `gossip_last_ae_at` |
+
+### Traces
+
+Spans are kept to the request boundaries: `transport.envelope` (a handler failure is recorded on this span), `gossip.push` and `gossip.ae_ping_pong`. Trace context crosses nodes through the envelope `context`: peer clients ask `Telemetry.inject_context()` for the current span, and the receiving session wraps `transport.envelope` in `Telemetry.extract_context()`, so a replica's spans join the coordinator's trace. The OpenTelemetry adapter writes 26 bytes (format `0x01`, trace id, span id, trace flags) and only for a sampled span; with tracing off nothing is sent. There is deliberately no connection span (a pooled connection lives for hours; connections are covered by metrics), and an envelope without readable context starts a new trace rather than nesting under whatever span is current. Join and drain run in a fresh context so the loops they start (gossip, anti-entropy, listeners) never inherit the triggering request's span. Client connections (`tourctl`) send no context.
 
 ---
 

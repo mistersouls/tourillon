@@ -36,8 +36,11 @@ class _FakeEnvelopeClient:
         tls_ctx: ssl.SSLContext,
         fd: object | None = None,
         logger: object | None = None,
+        *,
+        context: object | None = None,
     ) -> None:
         self.bind = bind
+        self.context = context
         self.tls_ctx = tls_ctx
         self.fd = fd
         self.logger = logger
@@ -225,6 +228,7 @@ async def test_acquire_creates_and_reuses_client(
 
     assert first is second
     assert _connect_calls(first) == 1
+    assert first.context == telemetry.inject_context
 
 
 @pytest.mark.tourillon
@@ -395,8 +399,12 @@ async def test_acquire_applies_connection_timeout(
         tls_ctx: ssl.SSLContext,
         fd: object | None = None,
         logger: object | None = None,
+        *,
+        context: object | None = None,
     ) -> _FakeEnvelopeClient:
-        client = _FakeEnvelopeClient(bind=bind, tls_ctx=tls_ctx, fd=fd, logger=logger)
+        client = _FakeEnvelopeClient(
+            bind=bind, tls_ctx=tls_ctx, fd=fd, logger=logger, context=context
+        )
         client.connect_delay = 0.1
         return client
 
