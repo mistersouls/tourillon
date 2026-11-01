@@ -28,16 +28,21 @@ size of the difference, not the size of the data:
    merge them against the local ones;
 5. ``push`` what the peer lacks; ``fetch`` and apply what this node lacks.
 
-Two modes share this code:
+The direction of every copy follows target ownership (``ReplicaView``),
+never a caller-chosen mode:
 
-- *replica mode*: both nodes replicate the pids; the exchange is two-way;
-- *handoff mode*: this node holds versions of pids it no longer replicates
-  (a write behind a transfer cursor, a hint delivered as the ring moved, a
-  late topology view); it only pushes them to the current replicas and never
-  pulls. Nothing is deleted: storage reclamation belongs to the GC.
+- versions are pulled only for pids this node replicates;
+- versions are pushed only for pids the peer replicates.
 
-Only versions older than the grace cutoff are compared; younger ones are
-still travelling through the write path and the hint replayer.
+Two nodes that both replicate a pid therefore exchange both ways; a node
+holding versions of a pid it does not replicate (a handoff write, a node
+draining, a late topology view) only pushes them; a joining node catching
+up from a node that is leaving that pid only pulls. Nothing is deleted:
+storage reclamation belongs to the GC.
+
+Only versions older than the cutoff are compared; younger ones are still
+travelling through the write path and its replication obligations. Join
+and drain goals use the current time as cutoff.
 
 The session stops as soon as the replica view goes stale (the ring moved)
 or its budget is spent; what is left is found again by a later cycle
@@ -112,26 +117,27 @@ class PeerSync:
     def __init__(
         self,
         local: LocalStore,
+        peer: str,
         call: Call,
         view: ReplicaView,
         stale: asyncio.Event,
         limits: SessionLimits,
         cutoff_ms: int,
-        *,
-        push_only: bool = False,
     ) -> None:
         self._local = local
+        self._peer = peer
         self._call = call
         self._view = view
         self._stale = stale
         self._limits = limits
+
         # Pages and batches are clamped to what one envelope holds; anything
         # beyond is paginated, never refused.
         self._page = min(limits.keys_per_request, MAX_PAGE_LIMIT)
         self._batch_bytes = min(limits.max_batch_bytes, MAX_BATCH_BYTES)
         self._cutoff_ms = cutoff_ms
-        self._push_only = push_only
         self.tally = SessionTally()
+
         # Differing pids where this node holds versions at or past the cutoff
         # bucket: those versions were not compared yet, so the pid is not
         # fully reconciled even when the session succeeds.
@@ -269,7 +275,7 @@ class PeerSync:
                 scope, pid, cursor, window_stop, set(page.keys)
             )
 
-            if missing and not self._push_only:
+            if missing and self._view.is_replica(pid):
                 await self._pull(scope, pid, sorted(missing))
 
             cursor = page.cursor
@@ -292,7 +298,7 @@ class PeerSync:
                 else:
                     extra.append(key)
 
-            if extra:
+            if extra and self._view.is_replica(pid, self._peer):
                 await self._push(scope, pid, extra)
 
         return theirs

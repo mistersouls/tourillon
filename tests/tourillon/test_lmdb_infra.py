@@ -18,18 +18,17 @@ import pytest
 
 from tourillon.core.config import StorageConfig
 from tourillon.core.models.storageschema import (
-    Hint,
     Key,
     Keyspace,
     KVPair,
     KVRef,
+    ObligationKey,
     Pid,
     Record,
     Tag,
     TagKind,
     Value,
 )
-from tourillon.core.storage.group import PartitionGroupHint
 from tourillon.core.storage.session import GroupSessionManager
 from tourillon.infra.storage.lmdb_session import (
     LmdbConfig,
@@ -68,64 +67,6 @@ def _log_kv(key: Key, value: Value) -> KVPair:
 def _provider(tmp_path, group: int = 0) -> LmdbSessionProvider:
     config = LmdbConfig(path=tmp_path / str(group), map_size=8 * 1024 * 1024)
     return LmdbSessionProvider(config=config, group=group)
-
-
-@pytest.mark.tourillon
-async def test_owned_exists_uses_key_presence_without_reading_logs(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    provider = _provider(tmp_path)
-    key, value, tag = _record(1, 1)
-    try:
-        async with provider.session(write=True) as session:
-            await session.put(_tag_kv(key, tag))
-            assert not await session.exists(
-                KVRef(key.to_bytes(Keyspace.LOGS), Keyspace.LOGS)
-            )
-            await session.put(_log_kv(key, value))
-        original_get = LmdbTransaction.get
-
-        def metadata_get(self, ref: KVRef) -> KVPair | None:
-            assert ref.keyspace is not Keyspace.LOGS
-            return original_get(self, ref)
-
-        monkeypatch.setattr(LmdbTransaction, "get", metadata_get)
-        async with GroupSessionManager(provider).session() as session:
-            assert await session.exists(key)
-            assert not await session.exists(_record(1, 2)[0])
-    finally:
-        await provider.close()
-
-
-@pytest.mark.tourillon
-async def test_group_batches_owned_checks_and_writes_without_loading_values(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    provider = _provider(tmp_path)
-    group = PartitionGroupHint(GroupSessionManager(provider))
-    records = [
-        Record(key=key, value=value, tag=tag)
-        for key, value, tag in (_record(1, 1), _record(1, 2, TagKind.TOMBSTONE))
-    ]
-    key, value, tag = _record(1, 3)
-    missing = Record(key=key, value=value, tag=tag)
-    try:
-        assert await group.promote(records) == ([True, True], 2)
-        original_get = LmdbTransaction.get
-
-        def metadata_get(self, ref: KVRef) -> KVPair | None:
-            assert ref.keyspace is not Keyspace.LOGS
-            return original_get(self, ref)
-
-        monkeypatch.setattr(LmdbTransaction, "get", metadata_get)
-        assert await group.promote(records + [missing], writable=False) == (
-            [True, True, False],
-            0,
-        )
-        assert await group.promote(records) == ([True, True], 0)
-        assert await group.promote([]) == ([], 0)
-    finally:
-        await provider.close()
 
 
 @pytest.mark.tourillon
@@ -200,7 +141,7 @@ async def test_lmdb_session_iter_last_and_abort_paths(tmp_path) -> None:
     provider = _provider(tmp_path)
     key1, value1, tag1 = _record(1, 1, TagKind.LIVE)
     key2, value2, tag2 = _record(1, 2, TagKind.TOMBSTONE)
-    key3, value3, tag3 = _record(1, 3, TagKind.HINT)
+    key3, value3, tag3 = _record(1, 3, TagKind.STALE)
 
     try:
         async with provider.session(write=True) as session:
@@ -245,12 +186,12 @@ async def test_lmdb_session_iter_last_and_abort_paths(tmp_path) -> None:
                 key1.to_bytes(Keyspace.TAGS),
             ]
 
-            last_non_hint = await session.last(
+            last_owned = await session.last(
                 Keyspace.TAGS,
                 prefix=Pid(1),
-                predicate=lambda kv: Tag.from_bytes(kv.value).kind != TagKind.HINT,
+                predicate=lambda kv: Tag.from_bytes(kv.value).kind != TagKind.STALE,
             )
-            assert last_non_hint == _tag_kv(key2, tag2)
+            assert last_owned == _tag_kv(key2, tag2)
 
         with pytest.raises(RuntimeError, match="boom"):
             async with provider.session(write=True) as session:
@@ -323,28 +264,26 @@ async def test_lmdb_storage_caches_providers_reports_latest_hlc_and_closes(
 
 
 @pytest.mark.tourillon
-async def test_latest_hlc_restores_pending_obligation_clock_after_restart(
+async def test_latest_hlc_restores_the_clock_of_versions_held_for_obligations(
     tmp_path,
 ) -> None:
     config = StorageConfig(data_dir=str(tmp_path), group_size="8Mi")
     storage = LMDBStorage(config)
-    key, value, tag = _record(1, 1)
-    record = Record(key=key, value=value, tag=Tag.hint(tag))
-    timestamps = [
-        HLCTimestamp(wall_ms=1000, counter=5, node_id="keeper"),
-        HLCTimestamp(wall_ms=2000, counter=7, node_id="keeper"),
+    records = [
+        Record(key=k, value=v, tag=t) for k, v, t in (_record(1, 1), _record(1, 4))
     ]
     try:
-        hints = PartitionGroupHint(
-            GroupSessionManager(await storage.session_provider_for(0))
-        )
-        for intent, hlc in zip(("z-target", "a-target"), timestamps, strict=True):
-            await hints.put(Hint(record=record, intent=intent, hlc=hlc))
+        manager = GroupSessionManager(await storage.session_provider_for(0))
+        async with manager.session(write=True) as session:
+            await session.put_many(records)
+            await session.put_obligations(
+                [ObligationKey("peer", record.key) for record in records]
+            )
     finally:
         await storage.close()
     reopened = LMDBStorage(config)
     try:
-        assert await reopened.latest_hlc(1) == timestamps[-1]
+        assert await reopened.latest_hlc(1) == records[-1].key.ts
     finally:
         await reopened.close()
 

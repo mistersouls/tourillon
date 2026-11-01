@@ -12,12 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Data anti-entropy: a background loop that heals diverged replicas.
+"""Data anti-entropy: the one mechanism that copies versions between nodes.
 
-Why: the write path, hinted handoff and partition transfers each leave
-narrow gaps (a write landing behind a transfer cursor, a hint delivered while
-the ring moves, a node that applied a topology late). Anti-entropy closes
-them by comparing digests, independently of how the gap appeared.
+Versions are immutable, so replicating them is only ever "make node N hold
+version V". Every producer of such a need goes through this service:
+
+- the write path and read repair record a durable *replication obligation*
+  (META) when a replica missed a version or a handoff stands in for it; the
+  obligation is then scheduled in a bounded in-memory hotqueue and pushed by
+  the *delivery worker*;
+- the *sweep* compares digests with every co-replica and hands off the
+  versions of partitions this node stores but no longer replicates;
+- the *join goal* pulls, from the nodes serving them today, every partition
+  a JOINING node will own; the *drain goal* pushes every version a DRAINING
+  node stores to the replicas that replace it.
+
+The direction of every copy follows target ownership (see ``ReplicaView``):
+callers never choose between push and pull.
+
+Priorities
+----------
+
+Obligations are explicit, cheap and urgent; the sweep is a safety net. The
+delivery worker runs on its own task and the sweep waits for the hotqueue to
+be idle before each unit. Obligations that do not fit in the hotqueue, or
+that were persisted before a restart, are reloaded from META once it drains,
+still ahead of the sweep. Obligations of a peer that cannot be reached now
+stay in META and are retried after its backoff.
 
 How a sweep is organised
 ------------------------
@@ -31,8 +52,8 @@ spaced evenly over the period (``sweep_period / len(plan)``, at least
   pair initiates (a hash of the sorted pair decides), so a pair is compared
   once per sweep, not twice;
 - *handoff units*: the pid space cut into slices of ``pids_per_cycle``; for
-  every pid of the slice this node stores but no longer replicates, its
-  versions are pushed (one way) to the current replicas.
+  every pid of the slice this node stores but does not replicate, its
+  versions are pushed to the target replicas.
 
 Work per node is therefore flat in the cluster size: a larger cluster means
 fewer partitions per node, not more requests.
@@ -40,8 +61,8 @@ fewer partitions per node, not more requests.
 Storm safety
 ------------
 
-- one session at a time per node as initiator; the responder serves at most
-  ``concurrency`` requests and refuses the rest with ``busy``;
+- one sweep session at a time per node as initiator; the responder serves at
+  most ``concurrency`` requests and refuses the rest with ``busy``;
 - every refusal carrying ``retry_after`` defers that peer; transport
   failures defer it with exponential backoff;
 - randomised start and spacing, so nodes never fall into step after a ring
@@ -51,11 +72,11 @@ Storm safety
 Ring changes
 ------------
 
-The replica view is rebuilt by ``ViewTracker`` after the ring settles. A
-change sets the view's stale signal: the running session stops at its next
-request, the sweep is abandoned and a new plan is drawn on the new view.
-Nothing is lost by stopping: the digests still differ, so the next sweep
-finds the same work again.
+The replica view is rebuilt by ``ViewTracker`` after the ring or an owner's
+phase settles. A change sets the view's stale signal: the running session
+stops at its next request, the sweep is abandoned and a new plan is drawn on
+the new view. Nothing is lost by stopping: the digests still differ and the
+obligations are still in META, so the work is found again.
 """
 
 import asyncio
@@ -63,12 +84,14 @@ import contextlib
 import hashlib
 import random
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from itertools import groupby
 from typing import Any
 
 from tourillon.core.ae.local import LocalStore
+from tourillon.core.ae.obligations import ObligationQueue
 from tourillon.core.ae.responder import AntiEntropyResponder
 from tourillon.core.ae.sync import (
     BudgetSpentError,
@@ -83,9 +106,17 @@ from tourillon.core.ae.view import ReplicaView
 from tourillon.core.exceptions import AntiEntropyRejectError
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.log import logger
+from tourillon.core.models.antientropy import (
+    MAX_BATCH_BYTES,
+    MAX_PAGE_LIMIT,
+    PushRequest,
+    Scope,
+    record_size,
+)
 from tourillon.core.models.config import AntiEntropyConfig
 from tourillon.core.models.member import MemberPhase
 from tourillon.core.models.retry import BackoffRetry
+from tourillon.core.models.storageschema import Key, Keyspace, ObligationKey, Record
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports.storage import Storage
@@ -94,7 +125,7 @@ from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT
 from tourlib.envelope import Envelope, build_envelope
 from tourlib.exceptions import ProtocolError
 
-# Errors that end one session without stopping the loop.
+# Errors that end one session or one delivery without stopping the loops.
 _SESSION_ERRORS = (
     AntiEntropyRejectError,
     ProtocolError,
@@ -105,6 +136,19 @@ _SESSION_ERRORS = (
     KeyError,
     TypeError,
 )
+
+# Phases of the peers a session or a delivery may target. A JOINING node is
+# being filled and a DRAINING one still serves the comparison of what it
+# hands off.
+_SESSION_PHASES = frozenset(
+    {MemberPhase.JOINING, MemberPhase.READY, MemberPhase.DRAINING}
+)
+
+# Phases of the nodes a joining node catches up from.
+_SOURCE_PHASES = frozenset({MemberPhase.READY, MemberPhase.DRAINING})
+
+# Pids walked between two event-loop yields when scanning the whole map.
+_YIELD_EVERY = 4096
 
 
 @dataclass
@@ -123,6 +167,11 @@ class AntiEntropyStats:
     view_changes: int = 0
     budget_stops: int = 0
     errors: int = 0
+    obligations_delivered: int = 0
+    obligations_dropped: int = 0
+    obligations_deferred: int = 0
+    join_passes: int = 0
+    drain_passes: int = 0
     rejects: dict[str, int] = field(default_factory=dict)
     last_failure: str | None = None
     last_failure_at: str | None = None
@@ -156,6 +205,11 @@ class AntiEntropyStats:
             "view_changes": self.view_changes,
             "budget_stops": self.budget_stops,
             "errors": self.errors,
+            "obligations_delivered": self.obligations_delivered,
+            "obligations_dropped": self.obligations_dropped,
+            "obligations_deferred": self.obligations_deferred,
+            "join_passes": self.join_passes,
+            "drain_passes": self.drain_passes,
             "rejects": dict(self.rejects),
             "last_failure": self.last_failure,
             "last_failure_at": self.last_failure_at,
@@ -198,6 +252,20 @@ class Unit:
     peer: str | None
     pids: tuple[int, ...] = ()
     span: tuple[int, int] = (0, 0)
+
+
+@dataclass
+class Exchange:
+    """Outcome of sessions with several peers over their pids.
+
+    - ``reached[pid]``: peers that completed a session covering ``pid``;
+    - ``skipped``: peers that are down or not taking part, not retried;
+    - ``failed``: peers to retry (deferred, refused, budget, view change).
+    """
+
+    reached: dict[int, int] = field(default_factory=dict)
+    skipped: set[str] = field(default_factory=set)
+    failed: set[str] = field(default_factory=set)
 
 
 def initiates(node_id: str, peer: str) -> bool:
@@ -247,6 +315,7 @@ class AntiEntropyService:
         replication_factor: int,
         config: AntiEntropyConfig,
         *,
+        obligations: ObligationQueue | None = None,
         clock: Callable[[], float] = time.time,
         backoff: BackoffRetry | None = None,
     ) -> None:
@@ -258,6 +327,7 @@ class AntiEntropyService:
         self._config = config
         self._clock = clock
         self.local = LocalStore(storage, partitioner)
+        self.obligations = obligations or ObligationQueue(config.hotqueue_size)
 
         self.tracker = ViewTracker(
             node_id, topologymgr, partitioner, replication_factor, config.settle_delay
@@ -272,7 +342,10 @@ class AntiEntropyService:
         # orphan partition is only pushed again once it or its replicas change.
         self._handed: dict[int, tuple[bytes, bytes]] = {}
         self._stats = AntiEntropyStats()
-        self._task: asyncio.Task[None] | None = None
+        self._tasks: list[asyncio.Task[None]] = []
+        self._batch = min(config.keys_per_request, MAX_PAGE_LIMIT)
+        self._batch_bytes = min(config.max_batch_bytes, MAX_BATCH_BYTES)
+        self._retry_delay = max(1.0, config.min_interval)
 
     @property
     def stats(self) -> AntiEntropyStats:
@@ -280,7 +353,7 @@ class AntiEntropyService:
 
     @property
     def running(self) -> bool:
-        return self._task is not None and not self._task.done()
+        return any(not task.done() for task in self._tasks)
 
     def to_dict(self) -> dict[str, Any]:
         view = self.tracker.view
@@ -290,30 +363,162 @@ class AntiEntropyService:
             "serial": None if view is None else view.serial,
             "served_applied": self.responder.applied,
             "served_rejected": self.responder.rejected,
+            "hotqueue": self.obligations.to_dict(),
             **self._stats.to_dict(),
         }
 
     async def start(self) -> None:
-        """Start the view tracker, the responder and the sweep loop."""
-        if not self._config.enabled or self.running:
+        """Start the view tracker, the responder, delivery and the sweep.
+
+        Delivery always runs; ``enabled`` only governs the periodic sweep.
+        """
+        if self.running:
             return
 
         self.tracker.start()
         self.responder.start()
-        self._task = asyncio.create_task(self._run(), name="antientropy-loop")
+        self._tasks = [
+            asyncio.create_task(self._deliver_loop(), name="antientropy-delivery")
+        ]
+
+        if self._config.enabled:
+            self._tasks.append(
+                asyncio.create_task(self._run(), name="antientropy-loop")
+            )
+
         logger.info("antientropy.started node=%s", self._node_id)
 
     async def stop(self) -> None:
-        """Stop sweeping, then drain admitted requests; never touches data."""
-        task, self._task = self._task, None
+        """Stop the loops, then drain admitted requests; never touches data."""
+        tasks, self._tasks = self._tasks, []
 
-        if task is not None:
+        for task in tasks:
             task.cancel()
+
+        for task in tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
         await self.responder.stop()
         await self.tracker.stop()
+
+    # -- join and drain goals ------------------------------------------------
+
+    async def wait_joined(self) -> None:
+        """Return once every partition this node will own is caught up.
+
+        Each owned pid is copied from a single primary source
+        (``ReplicaView.primary_source``): joiners replacing as many nodes
+        pair one to one with them, so the load spreads instead of every
+        joiner reading every replica. Only when a primary is down does the
+        pid fall back to its other sources, so a join cannot hang on a dead
+        node. Writes that land meanwhile reach this node as obligations;
+        versions held only by a staying replica are left to the sweep.
+        Refused or interrupted sessions are retried, on the new view if the
+        ring moved.
+        """
+        while True:
+            view = await self.tracker.wait_ready()
+            stale = self.tracker.stale_signal()
+
+            if not view.owns:
+                # The view predates this node's entry in the ring.
+                await stale.wait()
+                continue
+
+            failed = await self._join_pass(view, stale)
+            self._stats.join_passes += 1
+
+            if not failed and not stale.is_set():
+                logger.info("antientropy.join synced node=%s", self._node_id)
+                return
+
+            await _pause(self._retry_delay, stale)
+
+    async def _join_pass(self, view: ReplicaView, stale: asyncio.Event) -> bool:
+        primaries = await self._join_sources(view)
+        cutoff_ms = self._now_ms()
+        result = await self._exchange(
+            primaries, view, stale, cutoff_ms, _SOURCE_PHASES, settled=True
+        )
+        failed = bool(result.failed)
+
+        fallback = _fallback_sources(view, primaries, result.skipped)
+        if fallback:
+            again = await self._exchange(
+                fallback, view, stale, cutoff_ms, _SOURCE_PHASES, settled=True
+            )
+            failed = failed or bool(again.failed)
+
+        return failed
+
+    async def drain(self) -> None:
+        """Return once every stored version reached the replicas replacing us.
+
+        Called while this node is DRAINING, so it replicates nothing in the
+        target view and every stored pid is handed off. A pid is done when
+        every live target replica completed a session for it, and at least
+        one did.
+        """
+        while True:
+            view = await self.tracker.wait_ready()
+            stale = self.tracker.stale_signal()
+
+            if view.owns:
+                # The view predates this node's DRAINING phase.
+                await stale.wait()
+                continue
+
+            done = await self._drain_pass(view, stale)
+            self._stats.drain_passes += 1
+
+            if done:
+                logger.info("antientropy.drain handed off node=%s", self._node_id)
+                return
+
+            await _pause(self._retry_delay, stale)
+
+    @staticmethod
+    async def _join_sources(view: ReplicaView) -> dict[str, list[int]]:
+        sources: dict[str, list[int]] = {}
+
+        for pid in range(len(view.replicas)):
+            if pid % _YIELD_EVERY == 0:
+                await asyncio.sleep(0)
+
+            if not view.is_replica(pid):
+                continue
+
+            primary = view.primary_source(pid)
+            if primary is not None:
+                sources.setdefault(primary, []).append(pid)
+
+        return sources
+
+    async def _drain_pass(self, view: ReplicaView, stale: asyncio.Event) -> bool:
+        cutoff_ms = self._now_ms()
+        complete = True
+        after: int | None = None
+
+        while True:
+            roots, after = await self.local.root_page(
+                after, self._config.pids_per_cycle
+            )
+            pids = [pid for pid, _ in roots]
+            result = await self._exchange(
+                _targets(view, pids),
+                view,
+                stale,
+                cutoff_ms,
+                _SESSION_PHASES,
+                settled=True,
+            )
+            complete = complete and _handed_all(view, pids, result)
+
+            if after is None or stale.is_set():
+                return complete and not stale.is_set()
+
+    # -- sweep ---------------------------------------------------------------
 
     async def _run(self) -> None:
         while True:
@@ -348,6 +553,8 @@ class AntiEntropyService:
 
         for unit in units:
             await _pause(delay, stale)
+            # Obligations go first: the sweep only finds what they missed.
+            await self.obligations.wait_idle()
 
             if stale.is_set():
                 self._stats.view_changes += 1
@@ -371,45 +578,35 @@ class AntiEntropyService:
             self._stats.skipped += 1
             return
 
-        sync = self._session(unit.peer, view, stale)
+        sync = self._session(unit.peer, view, stale, self._cutoff_ms())
         await self._guard(unit.peer, sync.sync_roots(unit.pids))
         self._stats.merge(sync.tally, handoff=False)
 
     async def _handoff(
         self, unit: Unit, view: ReplicaView, stale: asyncio.Event
     ) -> None:
-        """Push versions of partitions this node no longer replicates.
+        """Push versions of partitions this node does not replicate.
 
-        One way only: the replicas own these partitions now, so nothing is
-        pulled, and the local copy is left for the GC.
+        Direction follows ownership: the peers replicate these pids and this
+        node does not, so versions only flow towards them. The local copy is
+        left for the GC.
         """
-        marks, targets = await self._orphans(unit.span, view)
-        reached: dict[int, int] = {}
-
-        for peer, pids in sorted(targets.items()):
-            if not await self._eligible(peer):
-                self._stats.skipped += 1
-                continue
-
-            sync = self._session(peer, view, stale, push_only=True)
-            ok = await self._guard(peer, sync.sync_roots(pids))
-            self._stats.merge(sync.tally, handoff=True)
-
-            if ok:
-                _count_reached(reached, pids, sync.recent)
+        marks = await self._orphans(unit.span, view)
+        result = await self._exchange(
+            _targets(view, marks), view, stale, self._cutoff_ms(), _SESSION_PHASES
+        )
 
         for pid, mark in marks.items():
-            if reached.get(pid, 0) == len(view.replicas[pid]):
+            if result.reached.get(pid, 0) == len(view.replicas[pid]):
                 self._handed[pid] = mark
 
     async def _orphans(
         self, span: tuple[int, int], view: ReplicaView
-    ) -> tuple[dict[int, tuple[bytes, bytes]], dict[str, list[int]]]:
-        """Find stored pids of ``span`` this node does not replicate, by target."""
+    ) -> dict[int, tuple[bytes, bytes]]:
+        """Find stored pids of ``span`` this node does not replicate."""
         lo, hi = span
         roots, _ = await self.local.root_page(lo - 1 if lo else None, hi - lo)
         marks: dict[int, tuple[bytes, bytes]] = {}
-        targets: dict[str, list[int]] = {}
 
         for pid, cell in roots:
             if pid >= hi or view.is_replica(pid) or not view.replicas[pid]:
@@ -417,23 +614,200 @@ class AntiEntropyService:
 
             mark = (view.view_hash((pid,)), cell.to_bytes())
 
-            if self._handed.get(pid) == mark:
-                continue
+            if self._handed.get(pid) != mark:
+                marks[pid] = mark
 
-            marks[pid] = mark
+        return marks
 
-            for peer in view.replicas[pid]:
-                targets.setdefault(peer, []).append(pid)
-
-        return marks, targets
-
-    def _session(
+    async def _exchange(
         self,
-        peer: str,
+        targets: dict[str, list[int]],
         view: ReplicaView,
         stale: asyncio.Event,
+        cutoff_ms: int,
+        phases: frozenset[MemberPhase],
         *,
-        push_only: bool = False,
+        settled: bool = False,
+    ) -> Exchange:
+        """Run one session per peer over its pids.
+
+        ``settled`` counts a pid as reached even with versions past the
+        cutoff: goals use the current time as cutoff, so nothing is left.
+        """
+        result = Exchange()
+
+        for peer, pids in sorted(targets.items()):
+            if not await self._reachable(peer, phases):
+                result.skipped.add(peer)
+                self._stats.skipped += 1
+                continue
+
+            if self._backoff.deferred(peer):
+                result.failed.add(peer)
+                self._stats.skipped += 1
+                continue
+
+            sync = self._session(peer, view, stale, cutoff_ms)
+            ok = await self._guard(peer, sync.sync_roots(pids))
+            self._stats.merge(sync.tally, handoff=True)
+
+            if not ok:
+                result.failed.add(peer)
+                continue
+
+            _count_reached(result.reached, pids, set() if settled else sync.recent)
+
+        return result
+
+    # -- obligation delivery -------------------------------------------------
+
+    async def _deliver_loop(self) -> None:
+        while True:
+            view = await self.tracker.wait_ready()
+
+            try:
+                await self._deliver_step(view)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # the loop must outlive any bug
+                self._stats.errors += 1
+                self._stats.failed(exc)
+                self.obligations.backlog = True
+                logger.exception("antientropy.delivery failed")
+                await asyncio.sleep(self._retry_delay)
+
+    async def _deliver_step(self, view: ReplicaView) -> None:
+        queue = self.obligations
+
+        if len(queue):
+            batch = queue.take(self._batch)
+            try:
+                await self.deliver(batch, view)
+            finally:
+                queue.settle(len(batch))
+            return
+
+        if queue.backlog:
+            await self._reload()
+
+        if not len(queue):
+            await queue.wait(self._retry_delay if queue.backlog else None)
+
+    async def _reload(self) -> None:
+        """Schedule the obligations persisted in META, as many as fit.
+
+        Obligations of deferred peers stay in META; the backlog flag stays
+        raised so they are reloaded once their backoff expires.
+        """
+        queue = self.obligations
+        queue.backlog = False
+        pending = False
+
+        for group in range(self._partitioner.total_groups):
+            pending = await self._reload_group(group) or pending
+
+            if queue.backlog:
+                return
+
+        queue.backlog = pending
+
+    async def _reload_group(self, group: int) -> bool:
+        after: bytes | None = None
+        pending = False
+
+        while True:
+            page, after = await self.local.obligation_page(group, after, self._batch)
+            ready = [ob for ob in page if not self._backoff.deferred(ob.target)]
+            pending = pending or len(ready) < len(page)
+            self.obligations.submit(ready)
+
+            if after is None or self.obligations.backlog:
+                return pending
+
+    async def deliver(self, batch: Sequence[ObligationKey], view: ReplicaView) -> None:
+        """Push the versions of ``batch`` to their targets, then forget them.
+
+        An obligation is dropped without a copy when the version is gone or
+        no longer owned, or when its target no longer replicates the pid in
+        the target view: the sweep and the drain then cover that version.
+        """
+        owed = {ob for ob in batch if self._owed(ob, view)}
+        records = await self.local.records([ob.key for ob in owed])
+        obsolete = [ob for ob in batch if ob not in owed or ob.key not in records]
+        ready = sorted((ob for ob in owed if ob.key in records), key=_delivery_order)
+
+        for target, group in groupby(ready, key=lambda ob: ob.target):
+            await self._deliver_to(target, list(group), records, view)
+
+        if obsolete:
+            await self.local.remove_obligations(obsolete)
+            self._stats.obligations_dropped += len(obsolete)
+
+    def _owed(self, obligation: ObligationKey, view: ReplicaView) -> bool:
+        pid = obligation.key.pid.value
+        return (
+            obligation.target != self._node_id
+            and view.covers((pid,))
+            and view.is_replica(pid, obligation.target)
+        )
+
+    async def _deliver_to(
+        self,
+        target: str,
+        obligations: list[ObligationKey],
+        records: dict[Key, Record],
+        view: ReplicaView,
+    ) -> None:
+        if not await self._eligible(target):
+            self._park(target, len(obligations))
+            return
+
+        for pid, group in groupby(obligations, key=lambda ob: ob.key.pid.value):
+            if not await self._push_obligations(
+                target, pid, list(group), records, view
+            ):
+                self.obligations.backlog = True
+                return
+
+        self._backoff.succeeded(target)
+
+    def _park(self, target: str, count: int) -> None:
+        """Leave obligations of an unreachable target in META for later."""
+        if not self._backoff.deferred(target):
+            self._backoff.defer(target, self._retry_delay)
+
+        self.obligations.backlog = True
+        self._stats.obligations_deferred += count
+
+    async def _push_obligations(
+        self,
+        target: str,
+        pid: int,
+        obligations: list[ObligationKey],
+        records: dict[Key, Record],
+        view: ReplicaView,
+    ) -> bool:
+        call = self._caller(target)
+        scope = Scope((pid,), view.view_hash((pid,)))
+
+        for chunk in _chunks(obligations, records, self._batch_bytes):
+            request = PushRequest(scope, tuple(records[ob.key] for ob in chunk))
+
+            try:
+                await call("antientropy.push", request.to_dict())
+            except _SESSION_ERRORS as exc:
+                self._failed(target, exc)
+                return False
+
+            await self.local.remove_obligations(chunk)
+            self._stats.obligations_delivered += len(chunk)
+
+        return True
+
+    # -- sessions and peers --------------------------------------------------
+
+    def _session(
+        self, peer: str, view: ReplicaView, stale: asyncio.Event, cutoff_ms: int
     ) -> PeerSync:
         self._stats.sessions += 1
 
@@ -444,17 +818,15 @@ class AntiEntropyService:
             max_keys_scanned=self._config.max_keys_per_cycle,
         )
 
-        cutoff_ms = int((self._clock() - self._config.grace) * 1000)
-
         return PeerSync(
-            self.local,
-            self._caller(peer),
-            view,
-            stale,
-            limits,
-            cutoff_ms,
-            push_only=push_only,
+            self.local, peer, self._caller(peer), view, stale, limits, cutoff_ms
         )
+
+    def _cutoff_ms(self) -> int:
+        return int((self._clock() - self._config.grace) * 1000)
+
+    def _now_ms(self) -> int:
+        return int(self._clock() * 1000)
 
     async def _guard(self, peer: str, work: Coroutine[Any, Any, None]) -> bool:
         """Run one session; turn its failure into backoff and counters."""
@@ -490,13 +862,16 @@ class AntiEntropyService:
         logger.warning("antientropy.session failed peer=%s: %s", peer, exc)
 
     async def _eligible(self, peer: str) -> bool:
-        """Only READY, alive, non-deferred peers take part in sessions."""
+        """Alive, non-deferred peers in a phase that takes part in sessions."""
         if self._backoff.deferred(peer):
             return False
 
+        return await self._reachable(peer, _SESSION_PHASES)
+
+    async def _reachable(self, peer: str, phases: frozenset[MemberPhase]) -> bool:
         member = (await self._topologymgr.snapshot()).registry.get(peer)
 
-        if member is None or member.phase is not MemberPhase.READY:
+        if member is None or member.phase not in phases:
             return False
 
         fd = self._pool.failure_detector(peer)
@@ -535,6 +910,71 @@ class AntiEntropyService:
     def _jittered(self, delay: float) -> float:
         jitter = self._config.jitter
         return max(0.0, delay * (1 + random.uniform(-jitter, jitter)))
+
+
+def _targets(view: ReplicaView, pids: Iterable[int]) -> dict[str, list[int]]:
+    """Group ``pids`` by target replica."""
+    targets: dict[str, list[int]] = {}
+
+    for pid in pids:
+        for peer in view.replicas[pid]:
+            targets.setdefault(peer, []).append(pid)
+
+    return targets
+
+
+def _handed_all(view: ReplicaView, pids: Iterable[int], result: Exchange) -> bool:
+    """Every pid reached each live target replica, and at least one."""
+    for pid in pids:
+        needed = [p for p in view.replicas[pid] if p not in result.skipped]
+
+        if not needed or result.reached.get(pid, 0) < len(needed):
+            return False
+
+    return True
+
+
+def _delivery_order(obligation: ObligationKey) -> tuple[str, bytes]:
+    return obligation.target, obligation.key.to_bytes(Keyspace.TAGS)
+
+
+def _chunks(
+    obligations: list[ObligationKey], records: dict[Key, Record], max_bytes: int
+) -> list[list[ObligationKey]]:
+    """Split obligations into push batches of at most ``max_bytes`` of records."""
+    chunks: list[list[ObligationKey]] = []
+    current: list[ObligationKey] = []
+    size = 0
+
+    for obligation in obligations:
+        cost = record_size(records[obligation.key])
+
+        if current and size + cost > max_bytes:
+            chunks.append(current)
+            current, size = [], 0
+
+        current.append(obligation)
+        size += cost
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def _fallback_sources(
+    view: ReplicaView, primaries: dict[str, list[int]], down: set[str]
+) -> dict[str, list[int]]:
+    """Route the pids of unreachable primaries to their other sources."""
+    fallback: dict[str, list[int]] = {}
+
+    for primary in down:
+        for pid in primaries.get(primary, ()):
+            for peer in view.sources_of(pid):
+                if peer not in (primary, view.node_id):
+                    fallback.setdefault(peer, []).append(pid)
+
+    return fallback
 
 
 def _count_reached(reached: dict[int, int], pids: list[int], recent: set[int]) -> None:

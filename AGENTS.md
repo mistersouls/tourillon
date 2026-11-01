@@ -20,9 +20,9 @@ Design pillars actually implemented today:
 - **Preference lists** computed by walking the ring from a partition's successor vnode.
 - **Per-request quorums** (`quorum_read` / `quorum_write` integers), not named consistency levels.
 - **Hybrid logical clocks (HLC)** for last-writer-wins conflict resolution with deterministic tie-breaks.
-- **Hinted handoff** when a preferred replica is not writable, replayed later by a background replayer.
+- **Durable replication obligations** (handoff, failed replica writes, read repair) persisted in `META` and delivered by anti-entropy.
 - **Gossip** membership with a phi-accrual failure detector.
-- **Streaming partition transfers** when the ring changes.
+- **Anti-entropy** as the single copy mechanism: obligation delivery, digest sweeps, and the join/drain goals that converge data onto the target placement.
 - **Mandatory mTLS** on every socket, peer and client alike.
 
 > **Originality rule — important.**
@@ -37,7 +37,7 @@ Design pillars actually implemented today:
 | Path | Role |
 | --- | --- |
 | `tourillon/` | Node runtime (the server). Ships the `tourillon` CLI. |
-| `tourillon/core/` | Domain logic: ring, partitioning, placement, gossip, probe, store, transfer, transports, models, ports. **No third-party backend code here.** |
+| `tourillon/core/` | Domain logic: ring, partitioning, placement, gossip, probe, store, anti-entropy (`ae/`), transports, models, ports. **No third-party backend code here.** |
 | `tourillon/infra/` | Concrete adapters: LMDB storage, OpenTelemetry telemetry. |
 | `tourillon/bootstrap/` | Composition root: `deps.py` wiring, `main.py` CLI, `usecases/` commands, `handlers/` envelope handlers. |
 | `tourlib/` | Shared library: envelope framing, transport, wire models, ports (`Serializer`, `Persistence`, `MtlsCrypto`) and their adapters. Used by **all** other packages. |
@@ -188,7 +188,7 @@ Rules:
 4. the registry entry in `tourclient/core/services/registry.py` (including `supported_endpoints`).
 
 Current endpoint matrix: `probe` → client+peer, `kv` → client+peer, `node` → peer, `inspect` → peer.
-Purely internal kinds (`gossip.*`, `replication.*`, `transfer.*`) intentionally have **no** client service.
+Purely internal kinds (`gossip.*`, `replication.*`, `antientropy.*`) intentionally have **no** client service.
 
 ### Storage
 
@@ -269,6 +269,6 @@ Both CLIs use **cyclopts** (not click/typer/argparse).
 | Change membership or failure detection | `tourillon/core/gossip/`, `tourillon/core/probe/` |
 | Change ring / partition math | `tourillon/core/spaces/`, `tourillon/core/partition/partitioner.py` |
 | Change startup / shutdown / join | `tourillon/core/services/lifecycle.py`, `tourillon/core/manager.py` |
-| Change rebalancing | `tourillon/core/transfer/`, `tourillon/core/services/transfer.py` |
+| Change join/drain data movement | `tourillon/core/ae/`, `tourillon/core/services/antientropy.py` |
 | Add a storage capability | `tourillon/core/ports/storage.py` → `tourillon/infra/storage/` → `bootstrap/deps.py` |
 | Add a CLI command | `tourctl/bootstrap/usecases/` + `tourctl/core/` (or `tourillon/bootstrap/usecases/`) |

@@ -27,12 +27,15 @@ from tourillon.core.spaces.vnode import VNode
 from tourlib.models.version import Address
 
 # Phases ineligible to appear in any preference list (primary or handoff).
-_EXCLUDED_PHASES = frozenset(
-    {MemberPhase.IDLE, MemberPhase.JOINING, MemberPhase.FAILED}
-)
+_EXCLUDED_PHASES = frozenset({MemberPhase.IDLE, MemberPhase.FAILED})
 
-# Phases that always require a handoff target regardless of fd state.
-_ALWAYS_HANDOFF_PHASES = frozenset({MemberPhase.DRAINING, MemberPhase.PAUSED})
+# Phases that always require a handoff target regardless of fd state. A
+# JOINING owner is in the ring but neither readable nor writable until its
+# synchronization goals are met; its handoff is the next READY node, usually
+# the owner it displaces.
+_ALWAYS_HANDOFF_PHASES = frozenset(
+    {MemberPhase.JOINING, MemberPhase.DRAINING, MemberPhase.PAUSED}
+)
 
 
 @dataclass(frozen=True)
@@ -146,7 +149,7 @@ class SimplePlacementStrategy:
                     extra={"node_id": vnode.node_id, "token": vnode.token},
                 )
                 continue
-            # PAUSED and DRAINING members are under handoff themselves.
+            # JOINING, PAUSED and DRAINING members are under handoff themselves.
             if member.phase != MemberPhase.READY:
                 continue
             if member.node_id in seen:

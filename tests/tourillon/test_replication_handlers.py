@@ -38,14 +38,6 @@ class _StoreSpy:
         self.hint_requests: list[tuple[Record, str]] = []
         self.read_error: StoreOperationError | None = None
         self.write_error: StoreOperationError | None = None
-        self.exists_requests: list[Key] = []
-        self.owned = False
-
-    async def exists(self, key: Key) -> bool:
-        if self.read_error is not None:
-            raise self.read_error
-        self.exists_requests.append(key)
-        return self.owned
 
     async def read(self, request: PartitionAddress) -> Record | None:
         if self.read_error is not None:
@@ -70,62 +62,6 @@ class _ManagerStub:
     def __init__(self) -> None:
         self.serializer = MsgPackSerializer()
         self.store = _StoreSpy()
-
-
-@pytest.mark.tourillon
-@pytest.mark.parametrize("owned", [False, True])
-async def test_exists_handler_returns_only_presence_and_preserves_envelope(
-    monkeypatch: pytest.MonkeyPatch, owned: bool
-) -> None:
-    manager = _ManagerStub()
-    manager.store.owned = owned
-    monkeypatch.setattr(replication_handler, "get_manager", lambda: manager)
-    key = _record().key
-    request = make_envelope(
-        kind="replication.exists",
-        payload=manager.serializer.encode({"key": key.to_dict()}),
-    )
-    responses = [response async for response in replication_handler.exists(request)]
-    assert len(responses) == 1
-    response = responses[0]
-    assert response.kind == "replication.exists.accept"
-    assert manager.serializer.decode(response.payload) == {"owned": owned}
-    assert manager.store.exists_requests == [key]
-    assert response.correlation_id == request.correlation_id
-    assert response.proto_version == request.proto_version
-    assert response.schema_id == request.schema_id
-    assert response.mode == request.mode
-
-
-@pytest.mark.tourillon
-async def test_exists_handler_returns_domain_rejection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = _ManagerStub()
-    manager.store.read_error = _replication_error("exists")
-    monkeypatch.setattr(replication_handler, "get_manager", lambda: manager)
-    request = make_envelope(
-        kind="replication.exists",
-        payload=manager.serializer.encode({"key": _record().key.to_dict()}),
-    )
-    responses = [response async for response in replication_handler.exists(request)]
-    assert responses[0].kind == "replication.exists.reject"
-    assert manager.serializer.decode(responses[0].payload)["operation"] == "exists"
-    assert manager.store.exists_requests == []
-
-
-@pytest.mark.tourillon
-async def test_exists_handler_rejects_missing_version_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = _ManagerStub()
-    monkeypatch.setattr(replication_handler, "get_manager", lambda: manager)
-    request = make_envelope(
-        kind="replication.exists", payload=manager.serializer.encode({})
-    )
-    with pytest.raises(KeyError, match="key"):
-        _ = [response async for response in replication_handler.exists(request)]
-    assert manager.store.exists_requests == []
 
 
 def _record() -> Record:
@@ -154,8 +90,7 @@ async def test_hint_handler_passes_required_intent_and_preserves_envelope(
 ) -> None:
     manager = _ManagerStub()
     monkeypatch.setattr(replication_handler, "get_manager", lambda: manager)
-    original = _record()
-    record = Record(key=original.key, value=original.value, tag=Tag.hint(original.tag))
+    record = _record()
     request = make_envelope(
         kind="replication.hint",
         payload=manager.serializer.encode(

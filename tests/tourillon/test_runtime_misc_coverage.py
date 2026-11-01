@@ -350,7 +350,6 @@ async def test_manager_start_stop_inspect_join_and_serve_forever(
     assert manager.seeds is None
     assert manager.serializer is not None
     assert manager.gossip is manager._gossip  # noqa: SLF001
-    assert manager.transfer is manager._transfer  # noqa: SLF001
     assert manager.telemetry is manager._telemetry  # noqa: SLF001
     assert manager.store is manager._store  # noqa: SLF001
 

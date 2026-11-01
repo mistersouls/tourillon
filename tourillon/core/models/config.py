@@ -603,6 +603,10 @@ def _ae_int(document: Mapping[str, Any], name: str, default: int, minimum: int) 
 class AntiEntropyConfig:
     """Data anti-entropy runtime options (``[placement.anti_entropy]``).
 
+    - ``enabled``: run the periodic background sweep. Obligation delivery and
+      the join/drain synchronisation goals always run: anti-entropy is the
+      only mechanism that copies versions between nodes.
+
     - ``sweep_period``: target time, in seconds, for this node to compare every
       partition it shares with every co-replica once. Cycles are spread evenly
       over it, so the per-node request rate stays flat whatever the cluster
@@ -612,7 +616,8 @@ class AntiEntropyConfig:
     - ``jitter``: relative random spread applied to every delay (0 to 1), so
       nodes never synchronise their cycles.
     - ``grace``: versions written less than this many seconds ago are ignored;
-      they are still in flight through the normal write path and hints.
+      they are still in flight through the write path and its obligations.
+      Join and drain goals ignore it: they compare everything written so far.
     - ``settle_delay``: wait after a ring change before resuming, so a burst of
       membership updates triggers one replica-map rebuild, not many.
     - ``concurrency``: anti-entropy requests this node serves at once as
@@ -631,6 +636,9 @@ class AntiEntropyConfig:
     - ``max_keys_per_cycle``: version keys one cycle may list while
       descending (local and remote), bounding the scan cost of a cycle even
       when nothing needs copying.
+    - ``hotqueue_size``: replication obligations scheduled in memory at
+      once. Obligations are durable in META before they are queued; the
+      ones that do not fit are reloaded from META once the queue drains.
     """
 
     enabled: bool = True
@@ -645,6 +653,7 @@ class AntiEntropyConfig:
     max_batch_bytes: int = 4 * 1024 * 1024
     max_repairs_per_cycle: int = 10_000
     max_keys_per_cycle: int = 1_000_000
+    hotqueue_size: int = 4096
 
     def to_document(self) -> dict[str, Any]:
         return {
@@ -660,6 +669,7 @@ class AntiEntropyConfig:
             "max_batch_bytes": self.max_batch_bytes,
             "max_repairs_per_cycle": self.max_repairs_per_cycle,
             "max_keys_per_cycle": self.max_keys_per_cycle,
+            "hotqueue_size": self.hotqueue_size,
         }
 
     @classmethod
@@ -682,6 +692,7 @@ class AntiEntropyConfig:
             max_batch_bytes=_ae_int(document, "max_batch_bytes", 4 * 1024 * 1024, 1),
             max_repairs_per_cycle=_ae_int(document, "max_repairs_per_cycle", 10_000, 1),
             max_keys_per_cycle=_ae_int(document, "max_keys_per_cycle", 1_000_000, 1),
+            hotqueue_size=_ae_int(document, "hotqueue_size", 4096, 1),
         )
 
 

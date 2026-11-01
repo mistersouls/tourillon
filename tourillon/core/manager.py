@@ -18,6 +18,7 @@ import signal
 import ssl
 from collections.abc import AsyncIterator
 
+from tourillon.core.ae.obligations import ObligationQueue
 from tourillon.core.config import TourillonConfig
 from tourillon.core.gossip.gossiper import GossipStats
 from tourillon.core.gossip.topology import TopologyManager
@@ -34,7 +35,6 @@ from tourillon.core.services.gossip import GossipService
 from tourillon.core.services.inspector import NodeInspector
 from tourillon.core.services.lifecycle import NodeLifecycle
 from tourillon.core.services.store import StoreService
-from tourillon.core.services.transfer import TransferService
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourlib.models.inspect import NodeInfo, NodeInspectRequest
@@ -86,6 +86,7 @@ class Manager:
             partitioner=self._partitioner,
             peer_pool=self._peer_pool,
         )
+        self._obligations = ObligationQueue(config.placement.anti_entropy.hotqueue_size)
         self._store = StoreService(
             node_id=config.node.id,
             storage=self._storage,
@@ -96,6 +97,7 @@ class Manager:
             peer_pool=self._peer_pool,
             read_repair=config.placement.read_repair,
             repair=config.placement.repair,
+            obligations=self._obligations,
         )
         self._lifecycle = NodeLifecycle(
             placement_strategy=self._placement_strategy,
@@ -113,6 +115,7 @@ class Manager:
             storage=self._storage,
             telemetry=self._telemetry,
             store=self._store,
+            obligations=self._obligations,
         )
         self._inspector = NodeInspector(
             node_id=self._config.node.id,
@@ -125,12 +128,6 @@ class Manager:
             node_id=self._config.node.id,
             topologymgr=self._topologymgr,
             relay=self._lifecycle.gossiper.relay,
-        )
-        self._transfer = TransferService(
-            topologymgr=self._topologymgr,
-            serializer=serializer,
-            storage=self._storage,
-            partitioner=self._partitioner,
         )
         self._serializer = serializer
 
@@ -153,11 +150,6 @@ class Manager:
     def gossip(self) -> GossipService:
         """Get the gossip service."""
         return self._gossip
-
-    @property
-    def transfer(self) -> TransferService:
-        """Get the transfer service."""
-        return self._transfer
 
     @property
     def telemetry(self) -> Telemetry:

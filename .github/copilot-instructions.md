@@ -7,7 +7,7 @@ Path-scoped rules live in [`.github/instructions/`](instructions/). Reusable tas
 
 ## Project in one paragraph
 
-Tourillon is a leaderless, peer-to-peer distributed key-value database in Python 3.14+. Nodes are identical peers arranged on a consistent-hash ring of virtual nodes; keys map to partitions, partitions to preference lists, and requests are coordinated by whichever node receives them. Replication uses per-request quorums, hybrid logical clocks for conflict resolution, hinted handoff for unavailable replicas, gossip for membership, and streaming transfers for rebalancing. Every socket is mTLS-authenticated.
+Tourillon is a leaderless, peer-to-peer distributed key-value database in Python 3.14+. Nodes are identical peers arranged on a consistent-hash ring of virtual nodes; keys map to partitions, partitions to preference lists, and requests are coordinated by whichever node receives them. Replication uses per-request quorums, hybrid logical clocks for conflict resolution, durable replication obligations for missed replicas, gossip for membership, and anti-entropy as the single mechanism that copies data, including on join and drain. Every socket is mTLS-authenticated.
 
 ## Hard rules
 

@@ -18,7 +18,6 @@ import ssl
 from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -46,8 +45,6 @@ from tourillon.core.probe.detector import FailureDetectorProvider
 from tourillon.core.services.lifecycle import NodeLifecycle
 from tourillon.core.services.store import StoreService
 from tourillon.core.spaces.hashspace import HashSpace
-from tourillon.core.spaces.ring import Ring
-from tourillon.core.spaces.vnode import VNode
 from tourillon.core.telemetry import build_noop_telemetry
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourlib.adapter import MsgPackSerializer
@@ -544,8 +541,8 @@ async def test_stop_cancels_active_join_and_stops_components(tmp_path: Path) -> 
     async def stop_client() -> None:
         seen.append("client")
 
-    async def stop_hint_replayer() -> None:
-        seen.append("hint")
+    async def stop_antientropy() -> None:
+        seen.append("antientropy")
 
     async def stop_gossiper() -> None:
         seen.append("gossiper")
@@ -554,13 +551,13 @@ async def test_stop_cancels_active_join_and_stops_components(tmp_path: Path) -> 
         seen.append("peer")
 
     lifecycle._stop_client = stop_client  # type: ignore[method-assign]  # noqa: SLF001
-    lifecycle._hint_replayer.stop = stop_hint_replayer  # type: ignore[method-assign]  # noqa: SLF001
+    lifecycle._antientropy.stop = stop_antientropy  # type: ignore[method-assign]  # noqa: SLF001
     lifecycle._gossiper.stop = stop_gossiper  # type: ignore[method-assign]  # noqa: SLF001
     lifecycle._stop_peer = stop_peer  # type: ignore[method-assign]  # noqa: SLF001
 
     await lifecycle.stop()
 
-    assert seen == ["client", "hint", "cancelled", "gossiper", "peer"]
+    assert seen == ["client", "cancelled", "antientropy", "gossiper", "peer"]
 
 
 @pytest.mark.tourillon
@@ -743,15 +740,15 @@ async def test_start_ready_publish_state_and_sync_success_paths(
     async def start_client() -> None:
         calls.append("client")
 
-    async def start_hint_replayer() -> None:
-        calls.append("hint")
+    async def start_antientropy() -> None:
+        calls.append("antientropy")
 
     lifecycle._peer_pool.start = peer_pool_start  # type: ignore[method-assign]  # noqa: SLF001
     lifecycle._sync_full = sync_full  # type: ignore[method-assign]  # noqa: SLF001
     lifecycle._gossiper.start = gossiper_start  # type: ignore[method-assign]  # noqa: SLF001
     lifecycle._publish_state = publish_state  # type: ignore[method-assign]  # noqa: SLF001
     lifecycle._start_client = start_client  # type: ignore[method-assign]  # noqa: SLF001
-    lifecycle._hint_replayer.start = start_hint_replayer  # type: ignore[method-assign]  # noqa: SLF001
+    lifecycle._antientropy.start = start_antientropy  # type: ignore[method-assign]  # noqa: SLF001
 
     await lifecycle._start_ready(ready_state)
     assert calls == [
@@ -760,7 +757,7 @@ async def test_start_ready_publish_state_and_sync_success_paths(
         "gossiper",
         "publish:ready",
         "client",
-        "hint",
+        "antientropy",
     ]
 
     calls.clear()
@@ -771,7 +768,7 @@ async def test_start_ready_publish_state_and_sync_success_paths(
         tokens=("0x1",),
     )
     await lifecycle._start_ready(ready_no_seeds)
-    assert calls == ["pool", "gossiper", "publish:ready", "client", "hint"]
+    assert calls == ["pool", "gossiper", "publish:ready", "client", "antientropy"]
 
 
 @pytest.mark.tourillon
@@ -821,63 +818,6 @@ async def test_publish_state_and_sync_full_success_increment_counters(
     assert lifecycle._gossip_stats.bootstrap_ok_total == 2
 
 
-class _TransferRunnerStub:
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        self.run_result: asyncio.Future[tuple[list[str], list[str]]] = (
-            loop.create_future()
-        )
-        self.wait_result: asyncio.Future[tuple[list[str], list[str]]] = (
-            loop.create_future()
-        )
-        self.calls: list[tuple[str, ...]] = []
-        self.cancelled = False
-
-    async def run(self, current: Ring, target: Ring) -> tuple[list[str], list[str]]:
-        self.calls.append(("run", current.serial(), target.serial()))
-        self.started.set()
-        return await self.run_result
-
-    async def apply(self, current: Ring, target: Ring) -> None:
-        self.calls.append(("apply", current.serial(), target.serial()))
-
-    async def wait(self) -> tuple[list[str], list[str]]:
-        self.calls.append(("wait",))
-        return await self.wait_result
-
-    async def cancel(self) -> None:
-        self.cancelled = True
-
-
-class _RingTopologyStub:
-    def __init__(self, ring: Ring) -> None:
-        self._ring = ring
-        self.changes: asyncio.Queue[Ring] = asyncio.Queue()
-
-    async def snapshot(self) -> SimpleNamespace:
-        return SimpleNamespace(ring=self._ring)
-
-    async def wait_for_ring_change(self, serial: str) -> Ring:
-        _ = serial
-        return await self.changes.get()
-
-
-def _joining_lifecycle(
-    tmp_path: Path, ring: Ring
-) -> tuple[NodeLifecycle, _TransferRunnerStub, _RingTopologyStub]:
-    lifecycle = _build_lifecycle(
-        config=_build_config(tmp_path, node_id="node-a"),
-        persistence=_DocumentStatePersistence(
-            {"node": {"node_id": "node-a", "phase": "joining", "epoch": 1}}
-        ),
-    )
-    runner, topology = _TransferRunnerStub(), _RingTopologyStub(ring)
-    lifecycle._transfer_runner = runner  # type: ignore[assignment]  # noqa: SLF001
-    lifecycle._topologymgr = topology  # type: ignore[assignment]  # noqa: SLF001
-    return lifecycle, runner, topology
-
-
 _JOINING = Member(
     node_id="node-a",
     peer_address="127.0.0.1:7001",
@@ -887,69 +827,11 @@ _JOINING = Member(
 )
 
 
-@pytest.mark.tourillon
-@pytest.mark.asyncio
-async def test_run_transfers_returns_the_results_once_transfers_settle(
-    tmp_path: Path,
-) -> None:
-    ring = Ring([VNode(token=0, node_id="node-b")])
-    lifecycle, runner, _ = _joining_lifecycle(tmp_path, ring)
-    runner.run_result.set_result((["r1"], []))
-
-    assert await lifecycle._run_transfers(_JOINING) == (["r1"], [])  # noqa: SLF001
-    assert runner.calls == [
-        ("run", ring.serial(), ring.add_vnodes(_JOINING.vnodes).serial())
-    ]
-    assert runner.cancelled is False
-
-
-@pytest.mark.tourillon
-@pytest.mark.asyncio
-async def test_run_transfers_replans_on_ring_change_and_awaits_the_new_plan(
-    tmp_path: Path,
-) -> None:
-    ring = Ring([VNode(token=0, node_id="node-b")])
-    changed = ring.add_vnodes([VNode(token=64, node_id="node-c")])
-    lifecycle, runner, topology = _joining_lifecycle(tmp_path, ring)
-    # The first plan settles while the ring changes: its results are stale.
-    runner.run_result.set_result((["stale"], []))
-    runner.wait_result.set_result((["r1", "r2"], ["r3"]))
-    topology.changes.put_nowait(changed)
-
-    assert await lifecycle._run_transfers(_JOINING) == (
-        ["r1", "r2"],
-        ["r3"],
-    )  # noqa: SLF001
-    assert runner.calls[1:] == [
-        ("apply", changed.serial(), changed.add_vnodes(_JOINING.vnodes).serial()),
-        ("wait",),
-    ]
-
-
-@pytest.mark.tourillon
-@pytest.mark.asyncio
-async def test_run_transfers_cancels_the_transfers_when_the_join_is_cancelled(
-    tmp_path: Path,
-) -> None:
-    lifecycle, runner, _ = _joining_lifecycle(
-        tmp_path, Ring([VNode(token=0, node_id="node-b")])
-    )
-
-    task = asyncio.create_task(lifecycle._run_transfers(_JOINING))  # noqa: SLF001
-    for _ in range(5):
-        await asyncio.sleep(0)
-    task.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert runner.cancelled is True
-
-
 class _JoinStubs:
     def __init__(
         self,
         events: list[str],
-        outcomes: list[tuple[list[str], list[str]]],
+        outcomes: list[bool],
         synced: list[bool],
     ) -> None:
         self.events = events
@@ -966,7 +848,7 @@ class _JoinStubs:
     async def sync_full(self, _state: NodeState) -> bool:
         return self.synced.pop(0)
 
-    async def run_transfers(self, _member: Member) -> tuple[list[str], list[str]]:
+    async def sync_data(self) -> bool:
         return self.outcomes.pop(0)
 
     async def transition_to(self, _state: NodeState, phase: MemberPhase) -> NodeState:
@@ -975,8 +857,8 @@ class _JoinStubs:
     async def start_client(self) -> None:
         self.events.append("client")
 
-    async def start_hint_replayer(self) -> None:
-        self.events.append("hint")
+    async def stop_antientropy(self) -> None:
+        self.events.append("antientropy-stopped")
 
     async def stop_gossiper(self) -> None:
         self.events.append("gossiper-stopped")
@@ -987,43 +869,120 @@ class _JoinStubs:
         lifecycle._gossiper.stop = self.stop_gossiper  # type: ignore[method-assign]  # noqa: SLF001
         lifecycle._publish_state = self.publish_state  # type: ignore[method-assign]  # noqa: SLF001
         lifecycle._sync_full = self.sync_full  # type: ignore[method-assign]  # noqa: SLF001
-        lifecycle._run_transfers = self.run_transfers  # type: ignore[method-assign]  # noqa: SLF001
+        lifecycle._sync_data = self.sync_data  # type: ignore[method-assign]  # noqa: SLF001
         lifecycle._transition_to = self.transition_to  # type: ignore[method-assign]  # noqa: SLF001
         lifecycle._start_client = self.start_client  # type: ignore[method-assign]  # noqa: SLF001
-        lifecycle._hint_replayer.start = self.start_hint_replayer  # type: ignore[method-assign]  # noqa: SLF001
+        lifecycle._antientropy.stop = self.stop_antientropy  # type: ignore[method-assign]  # noqa: SLF001
 
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
-async def test_perform_join_moves_to_ready_or_failed_from_the_transfer_results(
+async def test_perform_join_moves_to_ready_or_failed_from_the_sync_goal(
     tmp_path: Path,
 ) -> None:
-    lifecycle, _, _ = _joining_lifecycle(
-        tmp_path, Ring([VNode(token=0, node_id="node-b")])
+    lifecycle = _build_lifecycle(
+        config=_build_config(tmp_path, node_id="node-a"),
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "node-a", "phase": "joining", "epoch": 1}}
+        ),
     )
     state = NodeState(
         node_id="node-a", phase=MemberPhase.JOINING, epoch=1, tokens=("0x80",)
     )
     events: list[str] = []
-    outcomes: list[tuple[list[str], list[str]]] = [(["r1"], []), (["r1"], ["r2"])]
+    outcomes = [True, False]
     synced = [True, True, False]
 
     stubs = _JoinStubs(events, outcomes, synced)
     stubs.apply(lifecycle)
 
     await lifecycle._perform_join(state)  # noqa: SLF001
-    assert events == ["publish:joining", "client", "publish:ready", "hint"]
+    # JOINING is announced again once the bootstrap revealed the peers.
+    assert events == [
+        "publish:joining",
+        "publish:joining",
+        "client",
+        "publish:ready",
+    ]
 
     events.clear()
     await lifecycle._perform_join(state)  # noqa: SLF001
-    assert events == ["publish:joining", "publish:failed", "gossiper-stopped"]
+    assert events == [
+        "publish:joining",
+        "publish:joining",
+        "publish:failed",
+        "antientropy-stopped",
+        "gossiper-stopped",
+    ]
 
     events.clear()
-    await lifecycle._perform_join(
-        state
-    )  # membership sync failed: no transfer at all  # noqa: SLF001
-    assert events == ["publish:joining", "publish:failed", "gossiper-stopped"]
+    # Membership sync failed: the data goal is never awaited.
+    await lifecycle._perform_join(state)  # noqa: SLF001
+    assert events == [
+        "publish:joining",
+        "publish:failed",
+        "antientropy-stopped",
+        "gossiper-stopped",
+    ]
     assert outcomes == []
+
+
+class _JoinAntiEntropy:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[str] = []
+
+    async def start(self) -> None:
+        self.calls.append("start")
+
+    async def wait_joined(self) -> None:
+        self.calls.append("wait_joined")
+        if self.error is not None:
+            raise self.error
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("error", [None, RuntimeError("source unavailable")])
+async def test_sync_data_starts_antientropy_and_awaits_the_join_goal(
+    tmp_path: Path, caplog, error: Exception | None
+) -> None:
+    lifecycle = _build_lifecycle(
+        config=_build_config(tmp_path, node_id="node-a"),
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "node-a", "phase": "joining", "epoch": 1}}
+        ),
+    )
+    antientropy = _JoinAntiEntropy(error)
+    lifecycle._antientropy = antientropy  # type: ignore[assignment]  # noqa: SLF001
+
+    assert await lifecycle._sync_data() is (error is None)  # noqa: SLF001
+    assert antientropy.calls == ["start", "wait_joined"]
+    assert ("source unavailable" in caplog.text) is (error is not None)
+
+
+class _DrainAntiEntropy:
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+        self.pending = False
+        self.waiting = asyncio.Event()
+        self.satisfied = asyncio.Event()
+        self.drain_error: RuntimeError | None = None
+
+    async def start(self) -> None:
+        self.started = True
+        self.stopped = False
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+    async def drain(self) -> None:
+        self.waiting.set()
+        if self.drain_error is not None:
+            raise self.drain_error
+        if self.pending:
+            await self.satisfied.wait()
+            self.pending = False
 
 
 class _DrainStore:
@@ -1043,40 +1002,6 @@ class _DrainStore:
 
     async def stop_read_repairs(self) -> None:
         self.repairs_stopped = True
-
-
-class _DrainHints:
-    def __init__(self) -> None:
-        self.local_paused = False
-        self.local_drained = False
-        self.pending = False
-        self.started = False
-        self.stopped = False
-        self.waiting = asyncio.Event()
-        self.satisfied = asyncio.Event()
-        self.wait_error: RuntimeError | None = None
-
-    def pause_local_writes(self) -> None:
-        self.local_paused = True
-
-    async def drain_local_writes(self) -> None:
-        assert self.local_paused
-        self.local_drained = True
-
-    async def start(self) -> None:
-        self.started = True
-        self.stopped = False
-
-    async def stop(self) -> None:
-        self.stopped = True
-
-    async def wait(self) -> None:
-        self.waiting.set()
-        if self.wait_error is not None:
-            raise self.wait_error
-        if self.pending:
-            await self.satisfied.wait()
-            self.pending = False
 
 
 async def _draining_lifecycle(tmp_path: Path):
@@ -1110,20 +1035,19 @@ async def _draining_lifecycle(tmp_path: Path):
         ),
     ):
         await lifecycle._topologymgr.apply_member(member)
-    store, hints, runner = _DrainStore(), _DrainHints(), _TransferRunnerStub()
+    store, antientropy = _DrainStore(), _DrainAntiEntropy()
     lifecycle._store = store  # type: ignore[assignment]
-    lifecycle._hint_replayer = hints  # type: ignore[assignment]
-    lifecycle._transfer_runner = runner  # type: ignore[assignment]
-    return lifecycle, store, hints, runner
+    lifecycle._antientropy = antientropy  # type: ignore[assignment]
+    return lifecycle, store, antientropy
 
 
 @pytest.mark.tourillon
-async def test_drain_waits_repairs_transfers_and_hint_satisfaction(
+async def test_drain_waits_repairs_then_the_antientropy_handoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lifecycle, store, hints, runner = await _draining_lifecycle(tmp_path)
-    hints.pending = True
+    lifecycle, store, antientropy = await _draining_lifecycle(tmp_path)
+    antientropy.pending = True
     client_stopped = asyncio.Event()
 
     async def stop_client() -> None:
@@ -1133,48 +1057,35 @@ async def test_drain_waits_repairs_transfers_and_hint_satisfaction(
 
     monkeypatch.setattr(lifecycle, "_stop_client", stop_client)
     await lifecycle.drain()
-    assert hints.started
     try:
         await asyncio.wait_for(store.waiting.wait(), 1)
         assert store.paused
-        assert hints.local_paused
         assert store.readable
         assert not client_stopped.is_set()
-        assert (await lifecycle._load_state()).phase == MemberPhase.DRAINING
-        assert not runner.calls
-        assert hints.started
-        assert not hints.stopped
+        assert not antientropy.waiting.is_set()
         assert not store.repairs_stopped
         with pytest.raises(DrainError, match="already in progress"):
             await lifecycle.drain()
         with pytest.raises(JoinError, match="Drain operation"):
             await lifecycle.join(["seed:9000"])
         store.settled.set()
-        await asyncio.wait_for(runner.started.wait(), 1)
-        assert hints.local_drained
-        assert not hints.stopped
-        assert not store.repairs_stopped
-        assert not client_stopped.is_set()
-        runner.run_result.set_result((["range"], []))
-        await asyncio.wait_for(hints.waiting.wait(), 1)
+        await asyncio.wait_for(antientropy.waiting.wait(), 1)
+        assert antientropy.started
         assert (await lifecycle._load_state()).phase == MemberPhase.DRAINING
         assert not lifecycle._drain_task.done()
-        assert not hints.stopped
-        assert store.repairs_stopped
+        assert not store.repairs_stopped
         assert not client_stopped.is_set()
         assert store.readable
-        hints.satisfied.set()
+        antientropy.satisfied.set()
         await asyncio.wait_for(lifecycle._drain_task, 1)
-        assert runner.calls[0][2] == Ring([VNode(token=0, node_id="node-b")]).serial()
         state = await lifecycle._load_state()
         assert state.phase == MemberPhase.IDLE
         assert state.epoch == 4
         assert state.seeds == ("127.0.0.1:7002",)
         topology = await lifecycle._topologymgr.snapshot()
         assert {vnode.node_id for vnode in topology.ring} == {"node-b"}
-        assert hints.stopped
-        assert not hints.pending
-        assert hints.started
+        assert antientropy.stopped
+        assert not antientropy.pending
         assert store.repairs_stopped
         assert client_stopped.is_set()
         assert not store.readable
@@ -1183,40 +1094,21 @@ async def test_drain_waits_repairs_transfers_and_hint_satisfaction(
 
 
 @pytest.mark.tourillon
-async def test_drain_does_not_schedule_drain_when_replayer_start_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    lifecycle, _, hints, runner = await _draining_lifecycle(tmp_path)
-
-    async def fail_start() -> None:
-        raise RuntimeError("replayer unavailable")
-
-    monkeypatch.setattr(hints, "start", fail_start)
-    try:
-        with pytest.raises(RuntimeError, match="replayer unavailable"):
-            await lifecycle.drain()
-        assert not lifecycle.is_draining()
-        assert not runner.calls
-        assert (await lifecycle._load_state()).phase is MemberPhase.DRAINING
-    finally:
-        await lifecycle.stop()
-
-
-@pytest.mark.tourillon
-async def test_failed_transfer_stays_draining_and_can_be_retried(
+async def test_failed_handoff_stays_draining_and_can_be_retried(
     tmp_path: Path, caplog
 ) -> None:
-    lifecycle, store, hints, runner = await _draining_lifecycle(tmp_path)
+    lifecycle, store, antientropy = await _draining_lifecycle(tmp_path)
     store.settled.set()
-    runner.run_result.set_result(([], ["failed-range"]))
+    antientropy.drain_error = RuntimeError("handoff interrupted")
     await lifecycle.drain()
     await asyncio.wait_for(lifecycle._drain_task, 1)
     assert (await lifecycle._load_state()).phase == MemberPhase.DRAINING
     assert "Drain failed" in caplog.text
-    assert not hints.stopped
+    assert "handoff interrupted" in caplog.text
+    assert not antientropy.stopped
     assert not store.repairs_stopped
-    runner.run_result = asyncio.get_running_loop().create_future()
-    runner.run_result.set_result((["range"], []))
+    assert store.readable
+    antientropy.drain_error = None
     await lifecycle.drain()
     await asyncio.wait_for(lifecycle._drain_task, 1)
     assert (await lifecycle._load_state()).phase == MemberPhase.IDLE
@@ -1224,17 +1116,22 @@ async def test_failed_transfer_stays_draining_and_can_be_retried(
 
 
 @pytest.mark.tourillon
-async def test_failed_hint_wait_never_publishes_idle(tmp_path: Path, caplog) -> None:
-    lifecycle, store, hints, runner = await _draining_lifecycle(tmp_path)
+async def test_antientropy_start_failure_never_publishes_idle(
+    tmp_path: Path, caplog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle, store, antientropy = await _draining_lifecycle(tmp_path)
     store.settled.set()
-    runner.run_result.set_result((["range"], []))
-    hints.wait_error = RuntimeError("hint storage unavailable")
+
+    async def fail_start() -> None:
+        raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr(antientropy, "start", fail_start)
     try:
         await lifecycle.drain()
         await asyncio.wait_for(lifecycle._drain_task, 1)
         assert (await lifecycle._load_state()).phase is MemberPhase.DRAINING
-        assert "hint storage unavailable" in caplog.text
-        assert not hints.stopped
+        assert "storage unavailable" in caplog.text
+        assert not antientropy.waiting.is_set()
         assert store.readable
     finally:
         await lifecycle.stop()
@@ -1244,20 +1141,19 @@ async def test_failed_hint_wait_never_publishes_idle(tmp_path: Path, caplog) -> 
 async def test_shutdown_cancels_waiting_drain_without_publishing_idle(
     tmp_path: Path,
 ) -> None:
-    lifecycle, store, hints, runner = await _draining_lifecycle(tmp_path)
+    lifecycle, store, antientropy = await _draining_lifecycle(tmp_path)
     store.settled.set()
-    hints.pending = True
-    runner.run_result.set_result((["range"], []))
+    antientropy.pending = True
     try:
         await lifecycle.drain()
-        await asyncio.wait_for(hints.waiting.wait(), 1)
+        await asyncio.wait_for(antientropy.waiting.wait(), 1)
         drain_task = lifecycle._drain_task
         assert not drain_task.done()
     finally:
         await lifecycle.stop()
     assert drain_task.cancelled()
-    assert hints.stopped
-    assert hints.pending
+    assert antientropy.stopped
+    assert antientropy.pending
     assert (await lifecycle._load_state()).phase is MemberPhase.DRAINING
 
 
@@ -1292,7 +1188,7 @@ async def test_last_node_cannot_silently_discard_its_ranges(tmp_path: Path) -> N
 
 @pytest.mark.tourillon
 async def test_stop_during_drain_preserves_draining_for_restart(tmp_path: Path) -> None:
-    lifecycle, store, _, _ = await _draining_lifecycle(tmp_path)
+    lifecycle, store, _ = await _draining_lifecycle(tmp_path)
     await lifecycle.drain()
     await asyncio.wait_for(store.waiting.wait(), 1)
     await lifecycle.stop()
@@ -1304,7 +1200,7 @@ async def test_stop_during_drain_preserves_draining_for_restart(tmp_path: Path) 
 async def test_drained_idle_restart_does_not_bootstrap_ready(
     tmp_path: Path, monkeypatch
 ) -> None:
-    lifecycle, _, hints, _ = await _draining_lifecycle(tmp_path)
+    lifecycle, _, antientropy = await _draining_lifecycle(tmp_path)
     state = await lifecycle._load_state()
     state = await lifecycle._transition_to(
         state, MemberPhase.DRAINING, with_seeds=["127.0.0.1:7002"]
@@ -1320,7 +1216,7 @@ async def test_drained_idle_restart_does_not_bootstrap_ready(
     await lifecycle.start()
     assert (await lifecycle._load_state()).phase == MemberPhase.IDLE
     assert not lifecycle.is_draining()
-    assert not hints.started
+    assert not antientropy.started
     assert not lifecycle._client_started
 
 
@@ -1364,7 +1260,7 @@ async def test_idle_with_persisted_seeds_joins_only_on_explicit_command(
 async def test_restart_resumes_previously_requested_drain(
     tmp_path: Path, monkeypatch
 ) -> None:
-    lifecycle, store, hints, runner = await _draining_lifecycle(tmp_path)
+    lifecycle, store, antientropy = await _draining_lifecycle(tmp_path)
     state = await lifecycle._load_state()
     await lifecycle._transition_to(state, MemberPhase.DRAINING)
 
@@ -1376,17 +1272,17 @@ async def test_restart_resumes_previously_requested_drain(
     monkeypatch.setattr(lifecycle._peer_pool, "start", noop)
     monkeypatch.setattr(lifecycle._gossiper, "start", noop)
     store.settled.set()
-    runner.run_result.set_result(([], []))
     await lifecycle.start()
-    assert hints.started
     await asyncio.wait_for(lifecycle._drain_task, 1)
+    assert antientropy.started
+    assert antientropy.stopped
     assert (await lifecycle._load_state()).phase == MemberPhase.IDLE
     await lifecycle.stop()
 
 
 @pytest.mark.tourillon
 async def test_stop_without_drain_never_enters_draining(tmp_path: Path) -> None:
-    lifecycle, _, _, _ = await _draining_lifecycle(tmp_path)
+    lifecycle, _, _ = await _draining_lifecycle(tmp_path)
     await lifecycle.stop()
     assert (await lifecycle._load_state()).phase == MemberPhase.READY
 
@@ -1435,34 +1331,3 @@ def test_drain_seeds_skips_ineligible_peers_and_bounds_fallback() -> None:
     ]
     assert NodeLifecycle._drain_seeds(state, []) == list(state.seeds[:5])
     assert NodeLifecycle._drain_seeds(NodeState(node_id="node-a"), []) == []
-
-
-@pytest.mark.tourillon
-async def test_departure_replans_with_local_tokens_removed(tmp_path: Path) -> None:
-    ring = Ring([VNode(token=0, node_id="node-b"), *_JOINING.vnodes])
-    changed = ring.add_vnodes([VNode(token=64, node_id="node-c")])
-    lifecycle, runner, topology = _joining_lifecycle(tmp_path, ring)
-    runner.run_result.set_result((["stale"], []))
-    runner.wait_result.set_result((["new-plan"], []))
-    topology.changes.put_nowait(changed)
-    assert await lifecycle._run_transfers(_JOINING, draining=True) == (
-        ["new-plan"],
-        [],
-    )
-    assert runner.calls == [
-        ("run", ring.serial(), ring.drop_nodes({"node-a"}).serial()),
-        ("apply", changed.serial(), changed.drop_nodes({"node-a"}).serial()),
-        ("wait",),
-    ]
-
-
-@pytest.mark.tourillon
-async def test_drain_cannot_complete_after_all_other_nodes_drain(
-    tmp_path: Path,
-) -> None:
-    ring = Ring([VNode(token=0, node_id="node-b"), *_JOINING.vnodes])
-    lifecycle, runner, topology = _joining_lifecycle(tmp_path, ring)
-    topology.changes.put_nowait(ring.drop_nodes({"node-b"}))
-    with pytest.raises(DrainError, match="another node"):
-        await lifecycle._run_transfers(_JOINING, draining=True)
-    assert runner.cancelled

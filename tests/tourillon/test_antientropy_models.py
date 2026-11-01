@@ -212,6 +212,7 @@ def test_anti_entropy_config_round_trips_through_placement() -> None:
         max_batch_bytes=1 << 30,
         max_repairs_per_cycle=5,
         max_keys_per_cycle=7,
+        hotqueue_size=3,
     )
 
     placement = PlacementConfig(anti_entropy=config)
@@ -230,6 +231,7 @@ def test_anti_entropy_config_round_trips_through_placement() -> None:
         {"concurrency": 0},
         {"keys_per_request": True},
         {"max_keys_per_cycle": 0},
+        {"hotqueue_size": 0},
     ],
 )
 def test_anti_entropy_config_rejects_invalid_values(document: dict[str, Any]) -> None:

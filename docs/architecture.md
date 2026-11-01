@@ -2,7 +2,7 @@
 
 Deep reference for contributors and AI agents. Complements [`AGENTS.md`](../AGENTS.md), which holds the working rules.
 
-> Tourillon draws on general distributed-systems literature. It is not a reimplementation of any specific product, and no such product is named anywhere in this repository. Mechanisms are described here in neutral terms: ring, partition, group, preference list, quorum, handoff, anti-entropy, transfer.
+> Tourillon draws on general distributed-systems literature. It is not a reimplementation of any specific product, and no such product is named anywhere in this repository. Mechanisms are described here in neutral terms: ring, partition, group, preference list, quorum, handoff, anti-entropy, replication obligation.
 
 ---
 
@@ -48,7 +48,7 @@ infra/       LMDB storage, OpenTelemetry telemetry
 4. `Manager` builds the node services (section 3).
 5. `Manager.serve_forever()` installs `SIGINT`/`SIGTERM` handlers, starts the node, and waits.
 
-Shutdown is ordered: `NodeLifecycle.stop()` (client server → drain task → hint replayer → join task → gossip → peer server), then peer pool, storage, telemetry. A failing step is logged and the remaining steps still run.
+Shutdown is ordered: `NodeLifecycle.stop()` (client server → drain and join tasks → anti-entropy → gossip → peer server), then peer pool, storage, telemetry. A failing step is logged and the remaining steps still run.
 
 Shutdown signals do not initiate a drain. Only an explicit `tourctl node drain`
 request transitions a `READY` or `PAUSED` node to `DRAINING`. The command acknowledges
@@ -56,24 +56,23 @@ initiation, not completion: use `tourctl node inspect` on the peer endpoint to
 observe the final `IDLE` phase. New writes (including replicated writes) are refused,
 but reads and their background read repairs remain available throughout
 `DRAINING`. Admitted mutations and a snapshot of detached writes and read repairs
-settle before owned ranges are pushed to their replacement replicas.
-The barrier does not include reads or keep expanding for newly scheduled repairs,
-so continuous reads cannot prevent transfers from starting.
-Hint replay and read repair continue during transfers. After transfer success,
-new read repairs are disabled and existing background writes settle. Hint replay
-continues until every persisted obligation is satisfied, then stops.
-The node remains `DRAINING` until transfers, background writes and hints settle.
-Ring changes trigger transfer replanning.
+settle before anti-entropy hands the stored partitions to their replacement
+replicas (§8). The barrier does not include reads or keep expanding for newly
+scheduled repairs, so continuous reads cannot prevent the handoff from starting.
+Obligation delivery and read repair continue meanwhile. Once the handoff goal
+is reached, new read repairs are disabled and existing background writes settle.
+The node remains `DRAINING` until then; ring changes make anti-entropy redo the
+affected partitions on the new view.
 
 Read routing treats `readable` and `handoff` independently: a readable owner
 and its handoff are both queried, with duplicate destinations queried only once.
 They represent one logical replica for the read quorum. Before that preference
 can satisfy an early quorum, both requests must settle; at the response deadline,
 one successful response is sufficient. Version selection includes both sources,
-including hinted tombstones. Write routing continues to prefer the handoff.
+including tombstones held by the handoff. Write routing continues to prefer the handoff.
 
 A failed drain stays `DRAINING` and can be retried with `node drain`; a restart
-resumes a persisted drain. After successful transfers the client listener closes,
+resumes a persisted drain. After a successful handoff the client listener closes,
 then completion publishes `IDLE`, removing the node from the ring without
 terminating the process or deleting
 its local data. The peer
@@ -89,7 +88,7 @@ seeds; selection stops as soon as this bound is reached.
 
 | Server | Bind | Dispatcher | Traffic |
 | --- | --- | --- | --- |
-| Peer | `servers.peer.bind` | `peer_dispatcher()` | `gossip.*`, `replication.*`, `transfer.*`, `node.*`, `probe.*`, `inspect` |
+| Peer | `servers.peer.bind` | `peer_dispatcher()` | `gossip.*`, `replication.*`, `antientropy.*`, `node.*`, `probe.*`, `inspect` |
 | Client | `servers.client.bind` | `client_dispatcher()` | `kv.*`, `probe.*` |
 
 The peer server starts first; the client server only opens once the node has joined and reached `READY`, so clients are never routed to a node that cannot serve them.
@@ -109,10 +108,10 @@ The peer server starts first; the client server only opens once the node has joi
 | `PeerPool` | Pooled mTLS `EnvelopeClient` connections to peers |
 | `SimplePlacementStrategy` | Preference lists honouring the replication factor |
 | `StoreService` | KV coordination: placement, replication, quorum, conflicts |
-| `NodeLifecycle` | Startup, join, transfers, servers, shutdown |
+| `NodeLifecycle` | Startup, join and drain goals, servers, shutdown |
 | `GossipService` / `Gossiper` | Membership dissemination and anti-entropy |
-| `AntiEntropyService` | Data anti-entropy: background digest comparison between replicas |
-| `TransferService` | Peer-facing partition transfer endpoint |
+| `AntiEntropyService` | The only mechanism copying versions between nodes: obligation delivery, sweep, join and drain goals |
+| `ObligationQueue` | Bounded in-memory hotqueue of durable replication obligations, shared by the store and anti-entropy |
 | `NodeInspector` | Paginated introspection for `node.inspect` |
 | `HLCClock` | Hybrid logical clock, restored from storage at boot |
 | `FailureDetectorProvider` | Per-peer phi-accrual detectors |
@@ -124,7 +123,7 @@ The peer server starts first; the client server only opens once the node has joi
 - The hash space is 128-bit.
 - The partitioner derives, from a key hash: a **partition id**, the **partition range**, and the **group** that owns it on disk.
 - `pshift` controls the number of partitions (`2**pshift`), `gshift` the number of storage groups (`2**gshift`). The running defaults are `pshift=17`, `gshift=2`.
-- Partitions are the unit of **placement and transfer**; groups are the unit of **storage isolation** (one LMDB environment and one session provider per group).
+- Partitions are the unit of **placement and anti-entropy**; groups are the unit of **storage isolation** (one LMDB environment and one session provider per group).
 
 A node contributes **vnodes** (tokens) to the ring according to its size class:
 
@@ -145,7 +144,7 @@ A node contributes **vnodes** (tokens) to the ring according to its size class:
 
 Eligibility and roles:
 
-- Only members in `READY`, `PAUSED` or `DRAINING` are on the ring. `IDLE`, `JOINING` and `FAILED` members are skipped.
+- Members in `JOINING`, `READY`, `PAUSED` or `DRAINING` are on the ring. `IDLE` and `FAILED` members are skipped.
 - Each preference entry carries independent `readable` and `writable` owner
   capabilities, plus an optional `handoff` node id.
 - Failure detection is **local and advisory**. Two nodes may legitimately disagree about a peer's liveness; the protocol must tolerate it.
@@ -153,13 +152,17 @@ Eligibility and roles:
 | Owner phase | `readable` | `writable` | Seek a handoff |
 | --- | --- | --- | --- |
 | `READY` | true | true | Only when suspected by the local failure detector |
+| `JOINING` | false | false | Always |
 | `DRAINING` | true | false | Always |
 | `PAUSED` | false | false | Always |
 
 An absent failure detector is treated as alive. Suspicion does not change
 `readable` or `writable`: it only requests a substitute. Handoff candidates must
 be `READY`, considered alive, outside the selected owners, and distinct from
-handoffs already assigned in this preference list.
+handoffs already assigned in this preference list. A `JOINING` owner is the
+target owner of its partitions but serves no ordinary request until its
+lifecycle reaches `READY`: reads go to its handoff (usually the owner it
+displaces) and writes reach it through an obligation held by that handoff.
 
 Consumers must use these fields independently:
 
@@ -169,10 +172,9 @@ Consumers must use these fields independently:
   delivery obligation for the owner. Without a handoff, they target the owner only when
   `writable`. Otherwise this preference has no write target.
 
-Repair routing is unchanged for now: explicit write repair retains its
-handoff-or-readable-owner selection, and background read repair targets
-readable owners without a handoff. Applying `writable` to repairs is a
-separate decision.
+Explicit write repair retains its handoff-or-readable-owner selection.
+Background read repair never writes to a laggard itself: it asks a node that
+holds the winning version to record an obligation for the laggard (see §6).
 
 `handoff=None` can mean no substitute was needed or none was available; never
 infer writability from it or from `readable`. In particular, a known `DRAINING`
@@ -190,9 +192,11 @@ lag behind phase changes.
 2. A `Version` record is stamped with an HLC timestamp from the local `HLCClock`.
 3. The preference list is resolved for the key.
 4. `replication.write` is fanned out to the targets in parallel; the local replica is applied directly.
-5. A handoff receives the version and an independent delivery obligation whose
-   `intent` identifies the owner. The version retains its `LIVE` or `TOMBSTONE`
-   tag; the obligation is persisted in `META` atomically with the version.
+5. A handoff receives the version through `replication.hint` with an `intent`
+   naming the owner. It stores the plain `LIVE` or `TOMBSTONE` version and a
+   replication obligation for the owner in `META`, in one transaction.
+   When a direct replica write fails, the coordinator records the same
+   obligation locally (see *Replication obligations* below).
 6. The coordinator verifies `quorum_write` acknowledgements before accepting; request models default omitted values to 1, including deletes and write repair.
 
 Deletes are **tombstones**, never physical removals, so a delete can win over a concurrent write by timestamp.
@@ -200,12 +204,12 @@ Deletes are **tombstones**, never physical removals, so a delete can win over a 
 ### Read (`kv.get`)
 
 1. The preference list is resolved and `replication.read` is collected from the readable targets plus the local replica.
-2. Visible versions are filtered; delivery obligations do not change a version's
-   `LIVE` or `TOMBSTONE` nature.
+2. Only `LIVE` and `TOMBSTONE` versions are visible; obligations never change
+   a version's tag.
 3. A winner is selected by a **total order**: replica count, then HLC timestamp, then namespace, key, data, and quorum marker as deterministic tie-breaks.
 4. The `quorum_read` response count is verified; request models default omitted values to 1. An empty replica response counts toward this quorum.
 5. A tombstone winner is returned to the caller as "absent".
-6. Replicas that answered with a missing or older version are healed in the background (**read repair**), bounded by a semaphore and deduplicated per address and node. Repair never blocks the answer.
+6. Replicas that answered with a missing or older version are healed in the background (**read repair**), bounded by a semaphore and deduplicated per address and node. Read repair is a producer of obligations: the coordinator records one locally when it holds the winner, otherwise it sends `replication.hint` to a node that answered with the winner, with the laggard as `intent`. Anti-entropy delivers it. Repair never blocks the answer.
 
 > The ordering function must be a total order and identical on every node. If two nodes order the same candidate set differently, replicas diverge permanently.
 
@@ -215,110 +219,45 @@ A write that misses its requested `quorum_write` is **not rolled back**: the ver
 
 1. The client hands the handle back through `kv.repair`.
 2. The receiving node decodes it, recomputes the partition id from the address and refuses a mismatch or an implausibly distant timestamp — all local, before any RPC.
-3. `replication.lookup` asks each replica whether it holds that exact version; a copy surviving only as a hint can serve as the source but never counts as its owner's durability.
+3. `replication.lookup` asks each replica whether it holds that exact version; a copy held by a stand-in can serve as the source but never counts as its owner's durability.
 4. Missing owners receive the version, and the requested quorum is verified again — so a repair may itself report a quorum failure, with the same handle, and be retried.
 
 The handle makes a partial write resumable instead of pushing the operator towards a second write under a new timestamp.
 
-### Hint persistence (write path)
+### Replication obligations
 
-New coordinated writes persist hints as separate delivery obligations:
+An obligation states that one node must eventually hold one exact version.
+It is the single form of replication debt: the write path (handoff and failed
+replica writes) and read repair produce it, anti-entropy consumes it.
 
 ```text
-META key   := MetaKind.HINT | length(intent) | intent | hlc_hint
-META value := Key.to_bytes(Keyspace.TAGS)
+META key   := MetaKind.OBLIGATION | u16 len(target) | target | Key.to_bytes(Keyspace.TAGS)
+META value := empty
 ```
 
-`intent` names the historical intended owner according to the emitter's local
-placement view; it is not a claim that ownership can never change. The actual
-network target is resolved from the current placement when replaying.
+- The version itself is stored as a plain `LIVE` or `TOMBSTONE` record. There
+  is no hint tag, no staging and no activation: a version is either present
+  or absent, and the digests count it as soon as it is stored.
+- `GroupSession.put_obligations` writes the obligation in the same
+  transaction as the version (`StoreService._oblige`). Recording the same
+  obligation twice is a no-op. An obligation never targets the local node.
+- Only then is it submitted to the `ObligationQueue`, a bounded in-memory
+  hotqueue (`hotqueue_size`, 4096 by default). An obligation that does not
+  fit stays in `META`; the queue raises its `backlog` flag, and delivery
+  reloads `META` once the queue drains. The flag starts raised, so
+  obligations left by a previous run are reloaded at startup.
+- Incoming `replication.hint` requests are refused while the node is
+  draining or paused, like other replica writes.
 
-The emitter sends a record tagged `HINT` through `replication.hint`, with
-required `record` and `intent` request fields, and no obligation HLC.
-Responses use `replication.hint.accept` or `replication.hint.reject`.
-`replication.write` carries only a normal record, without an intent.
-The hint tag retains only the original
-kind and payload, without a node id. The storing node generates
-`hlc_hint` from its own clock and constructs the local `Hint(record, intent, hlc)`.
-Incoming writes remain refused during `DRAINING`. The version's own HLC never
-changes. Distinct obligations may reference the same version, even for the same
-intent; receiving the record again creates a new local obligation.
-Startup clock restoration includes persisted obligation timestamps, preventing
-their identities from being reused after a restart with a regressed wall clock.
-
-`PartitionGroupHint.put()` commits `TAGS`, `LOGS` and the `META`
-reference in one write transaction, preserving `TagKind.HINT` in `TAGS`.
-`PartitionGroupStore.put()` does not modify obligations. Transfer streams select only `LIVE`
-and `TOMBSTONE` records and skip hints.
-
-Recording a new obligation preserves an existing `LIVE` or `TOMBSTONE` tag.
-The existing tag alone determines whether the version is already owned, relying
-on atomic TAGS and LOGS persistence. An owned version's value is neither checked
-nor rewritten. The META obligation is always recorded.
-
-Replay scans bounded `META` pages and resolves the current owners for each
-version. Each replay window contains at most `batch_size` records and is further
-capped using the maximum value size against a 64 MiB value budget by default
-(four maximum-size values). This conservative cap also applies to small values.
-It bounds payloads per window, not total process memory: decoding, the scan page
-and network serialization require additional memory.
-Metadata pages and their referenced TAGS/LOGS reads use batches rather than one
-executor job per entry.
-
-Within a window, up to four destination workers run concurrently by default.
-Each destination is assigned to one worker, which processes its records
-sequentially and rechecks backoff before each attempt. The number of tasks is
-bounded by the worker limit, not the number of obligations or replicas.
-A slow destination does not prevent other workers from delivering to healthy
-destinations in the window; subsequent windows and groups still await the
-current window. Cancellation awaits all workers and leaves unconfirmed debt.
-
-A missing referenced TAGS or LOGS entry is logged and skipped so later
-obligations can progress; its obligation remains pending and still blocks IDLE.
-Malformed obligation keys, references, tags and values are likewise logged and
-skipped individually without deleting their obligations. Storage access failures
-still propagate to the replay loop.
-If the recorded intent is still an owner, replay writes only to that
-node. If it is no longer an owner, replay asks every current owner for
-`replication.exists`, carrying the exact version key. The response is only
-`{"owned": bool}`: an owned copy requires both a `LIVE` or `TOMBSTONE` tag and
-the exact `LOGS` key. The check does not retrieve the value; a `HINT` or `STAGING`
-copy does not count. `replication.exists.accept` and `.reject` are peer-only
-responses, like the other internal replication operations.
-
-Only owners missing the version receive its original `LIVE` or `TOMBSTONE`
-record, with its unchanged timestamp. Handoff destinations are not used. An
-owner that is not writable may confirm an existing copy but receives no write.
-If the hint holder is itself a current owner, replay uses
-`PartitionGroupHint.promote()` without a dependency on `StoreService` or
-`PartitionGroupStore`. Like staging activation, promotion checks existing copies
-and batches missing versions in one short write transaction, without modifying
-META obligations. Read-only confirmation uses a read transaction and never loads
-LOGS values. `PartitionGroupStore` retains only ordinary version operations and
-does not access META. No session
-is held across network
-calls. The lifecycle pauses
-local replay writes during drain and waits for admitted local deliveries before
-transfers; existing owned copies may still be confirmed while draining.
-
-Replay deletes the exact obligation only after all required owners confirm
-their copies and a fresh placement lookup returns the same owner set as before
-delivery. Empty owner sets, failed checks, failed writes and changed owner sets
-leave the obligation pending. Retries retain the original intent and identity;
-backoff is tracked per actual destination. This stability check uses the local
-view, not a globally synchronized topology.
-
-Satisfaction batches idempotent deletes of exact obligation keys without reading
-their references first. It does not modify the stored tag or `LOGS` value. A local normal
-write can promote a hinted copy when the hint holder is now a writable owner;
-successful delivery alone does not confer ownership.
-
-During drain, replay runs alongside transfers. Once transfers succeed and
-background writes settle, `HintReplayer.wait()` waits until no persisted hint
-obligations remain, before replay stops and the node becomes `IDLE`. An
-required owner that remains unavailable keeps the node `DRAINING`.
-Moving pending obligations to a different hint holder is not implemented.
-Staging, repair and read repair policies are unchanged.
+Delivery (`AntiEntropyService.deliver`) takes bounded batches from the queue
+and pushes the versions through `antientropy.push`, grouped per target and
+partition. An obligation is removed once its target accepted the version.
+It is dropped without a copy when the version is gone, or when its target no
+longer replicates the partition in the current target view: the sweep and
+the drain goal cover that version instead. Obligations of a target that is
+suspected, unknown or refusing stay in `META`, the target is backed off and
+the backlog is reloaded later. Obligations take priority over the periodic
+sweep: a sweep unit waits until the queue is idle.
 
 ---
 
@@ -332,7 +271,7 @@ Gossip kinds:
 | `gossip.ping` → `gossip.pong` | Liveness and round-trip sampling |
 | `gossip.digest` → streamed `gossip.delta` | Anti-entropy reconciliation of divergent views |
 
-`Gossiper` runs two loops: a **hot loop** for recent changes and an **anti-entropy loop** for convergence. `TopologyManager` applies accepted updates to the registry, rebuilds the ring, and signals waiters so join-time transfer planning can replan on topology change.
+`Gossiper` runs two loops: a **hot loop** for recent changes and an **anti-entropy loop** for convergence. `TopologyManager` applies accepted updates to the registry, rebuilds the ring, and bumps a generation counter that wakes anti-entropy's view tracker. A phase change between two ring phases (for example `JOINING` → `READY`) changes ownership without changing the vnodes, and counts as a change too.
 
 Every `gossip.push` carries a `hop_limit` (`gossip.hop_limit`, 3 by default). A responder that accepts at least one *newer* member relays exactly those members once more through `Gossiper.relay` with `hop_limit - 1`, skipping the sender and the members themselves; a budget of zero ends the epidemic. Relays run as background tasks (the push handler never waits on them), at most 64 are in flight, and a member is only relayed when it was newer locally, so duplicates die out on their own. `wanted` members of a `gossip.delta` (known by the initiator with a newer epoch, or unknown to the responder) are pulled back with `hop_limit = 1`. All gossip requests hold their pooled connection through `PeerPool.lease`.
 
@@ -348,40 +287,53 @@ Invariants:
 
 ---
 
-## 8. Partition transfers
+## 8. Join and drain
 
-When the ring changes, data must move. `TransferService` exposes the peer-facing endpoint:
+There is no dedicated transfer protocol. Placement states the target owner of
+every partition and anti-entropy converges the data towards it.
 
-| Operation | Meaning |
-| --- | --- |
-| `transfer.init` | Open or resume a session; returns staged resume keys |
-| `transfer.claim` | Stream a bounded window of records to the puller |
-| `transfer.chunk` | Stage a pushed chunk |
-| `transfer.commit` | Atomically activate staged data |
+**Join.** The node publishes `JOINING`: its vnodes enter the ring, so it is a
+target replica of the partitions it gains, but it is neither readable nor
+writable. Writes for those partitions go to a stand-in that records an
+obligation for it. The lifecycle starts anti-entropy and waits for
+`AntiEntropyService.wait_joined()`: every partition the node will own is
+copied from a single **primary source** (`ReplicaView.primary_source`), among
+the nodes serving it today (`ReplicaView.sources`, which skips `JOINING`
+members). Entering and leaving replicas of a partition are paired in sorted
+order, so joiners replacing as many nodes each copy from a distinct one; an
+unpaired joiner picks a current source by hash to spread the load. Only when
+the primary is down does the partition fall back to its other sources, so a
+join cannot hang on a dead node. A version held only by a staying replica is
+left to the sweep. Refused or interrupted sessions are retried on the current
+view.
+Only then does the node move to `READY` and open its client server. If
+membership sync or the goal fails, the node becomes `FAILED`.
 
-The `core/transfer/` package splits this into a planner (what must move), a runner (drive sessions to completion), a streamer/receiver (move bytes), and an applicator (write into storage).
-
-Required properties: **resumable** (a serial/window protocol lets an interrupted transfer continue), **idempotent** (a retried chunk neither duplicates nor drops records), and **isolated** (staged data is invisible to reads until commit).
-
-During join, `NodeLifecycle` watches for ring changes and replans transfers until the topology settles, then promotes the node to `READY` and opens the client server.
+**Drain.** The node publishes `DRAINING`: it leaves the target placement
+(`ReplicaView.replicas` skips `DRAINING` members) while still serving reads.
+Once admitted writes settle, `AntiEntropyService.drain()` pushes every stored
+partition to the replicas replacing it; a partition is done when every live
+target replica completed a session for it. Read repairs then stop, the node
+becomes unreadable, closes its client server and publishes `IDLE`. A failure
+leaves the node `DRAINING`; the drain can be requested again, and resumes on
+restart.
 
 ---
 
 ## 9. Data anti-entropy
 
-Writes, hinted handoff and transfers each leave narrow gaps where a replica
-can miss a version for good: a write landing behind a transfer cursor, a hint
-delivered while the ring moves, a node applying a topology update late and
-accepting a write for a partition it no longer replicates. Read repair only
-heals what is read. `AntiEntropyService` (`tourillon/core/services/antientropy.py`,
-with its implementation components in `tourillon/core/ae/`)
-closes these gaps proactively by comparing digests between replicas, whatever
-caused the divergence.
+`AntiEntropyService` (`tourillon/core/services/antientropy.py`, with its
+components in `tourillon/core/ae/`) is the only mechanism that copies
+versions between nodes. It delivers obligations (§6), fills joining nodes and
+empties draining ones (§8), and its periodic sweep compares digests between
+replicas to find whatever the obligations missed, such as a node applying a
+topology update late and accepting a write for a partition it no longer
+replicates.
 
 ### Digests
 
 Every group maintains digest cells in its `META` keyspace, updated in the same
-transaction as the data (`GroupSession.update_tags` / `_flush`):
+transaction as the data (`GroupSession.put_many` / `flush`):
 
 | Key | Cell |
 | --- | --- |
@@ -391,7 +343,8 @@ transaction as the data (`GroupSession.update_tags` / `_flush`):
 A cell is `(count, xor of blake2b(tags key))`: order-independent, cheap to
 update incrementally, and two equal cells mean the same set of versions with
 overwhelming probability. Only owned versions (`LIVE`, `TOMBSTONE`) are
-counted; staged transfer copies and hint copies are not. Since a version is
+counted; obligations live under their own `META` prefix and are never
+folded into a digest. Since a version is
 immutable and identified by its TAGS key (pid, address, HLC), comparing *sets
 of keys* is enough: a value never needs comparing.
 
@@ -410,23 +363,27 @@ One session compares a slice of partitions with one peer
 4. `antientropy.keys` — for each differing bucket, list version keys page by
    page and merge them against the local keys of the same window.
 5. `antientropy.push` the versions the peer lacks; `antientropy.fetch` and
-   apply the ones this node lacks (`put_many`, which also promotes a local
-   staged or hint copy into an owned one).
+   apply the ones this node lacks (`put_many`, which never rewrites an
+   existing version).
 
 The cost follows the size of the difference, not the size of the data: in
 the steady state a session is one `roots` round-trip that returns nothing.
 
 **Grace.** Versions younger than `grace` seconds (wall clock of the HLC) are
-never compared: they are still travelling through the write path and the hint
-replayer, and copying them would only race with those.
+never compared by the sweep: they are still travelling through the write
+path and obligation delivery, and copying them would only race with those.
+The join and drain goals use the current time as cutoff instead.
 
-**Repairs are direct copies.** Missing versions are pushed or fetched directly,
-not turned into hint obligations. The copy is idempotent (an existing version
+**Sweep repairs are direct copies.** Missing versions are pushed or fetched
+directly, not turned into obligations. The copy is idempotent (an existing version
 is never rewritten), adds no durable state to replay, and bounded per session;
 the data and its digests *are* the progress state, so a session stopped half
 way loses nothing — the next sweep finds the rest because digests still differ.
 
 ### Replica mode and handoff mode
+
+The direction of every copy follows ownership; callers never choose between
+push, pull or both.
 
 - **Replica mode** — for every co-replica `peer`, the pids both replicate
   (`ReplicaView.shared[peer]`) are compared two ways. Only one node of each
@@ -434,7 +391,7 @@ way loses nothing — the next sweep finds the rest because digests still differ
   compared once per sweep, not twice.
 - **Handoff mode** — this node scans its own non-empty roots
   (`root_page`), keeps the pids it does **not** replicate in the current view,
-  and pushes their versions one way to every current replica (`push_only`). It
+  and pushes their versions one way to every current replica. It
   never pulls and never deletes: the local copy stays until the GC reclaims it.
   When every replica was reached and the pid held no version still inside the
   grace window, the pid is marked with `(view hash, local root)` and skipped
@@ -444,19 +401,22 @@ way loses nothing — the next sweep finds the rest because digests still differ
   exchange).
 
 A version written on a pid it does not hash to is logged as foreign by the
-responder; it is still accepted, since refusing it would lose data.
+responder; it is still accepted, since refusing it would lose data. A
+responder serves reads of any partition (a joining node pulls from a node it
+displaces) but refuses an `antientropy.push` for a partition it does not
+replicate with `not_replica`.
 
 ### Agreeing on replicas without agreeing on the ring
 
 `ViewTracker` rebuilds a `ReplicaView` (the replica tuple of every pid, built
-off the hot path and yielding every 4096 pids) whenever the ring changes,
+off the hot path and yielding every 4096 pids) whenever the ring or a ring member's phase changes,
 after `settle_delay` so a burst of updates causes one rebuild. Every request
 carries a `Scope`: its pids plus a 16-byte hash of the replica tuples the
 sender computed for them. The responder recomputes it and refuses with
 `stale_view` on mismatch, so both sides always reason about the same
 replicas without needing identical rings — only the scoped pids must agree.
 
-A ring change sets the view's *stale* signal (`wait_for_ring_change`): the
+A topology change sets the view's *stale* signal (`TopologyManager.wait_for_change`): the
 running session stops at its next request (`ViewChangedError`), the sweep is
 abandoned, and a new plan is drawn on the rebuilt view.
 
@@ -484,15 +444,15 @@ caps the rate.
   rest immediately with `busy` + `retry_after`, instead of queueing.
 - Rejects carrying `retry_after` (`busy`, `not_ready`, `stale_view`) defer the
   peer for that long; transport failures and other rejects defer it with
-  exponential backoff. Peers that are not `READY` or are suspected by the
-  failure detector are skipped.
+  exponential backoff. Peers that are not `JOINING`, `READY` or `DRAINING`,
+  or are suspected by the failure detector, are skipped.
 - Per-session budgets: `max_keys_per_cycle` keys listed and
   `max_repairs_per_cycle` versions copied (`BudgetSpentError`).
 - Writes go through small transactions (`APPLY_BATCH` = 64 records, 8 MiB) and
   every scan yields to the event loop, so client `kv.put/get/delete` are never
   blocked behind a long anti-entropy transaction.
-- The service starts only once the node is `READY` and stops before drain and
-  shutdown; a stop waits for the requests already admitted.
+- The service runs while the node is `JOINING`, `READY` or `DRAINING`, and
+  stops on shutdown; a stop waits for the requests already admitted.
 
 ### Envelope bounds and pagination
 
@@ -514,7 +474,7 @@ A maximal record (16 MiB value) always fits one batch on its own.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `true` | run the loop and serve requests |
+| `enabled` | `true` | run the periodic sweep (obligation delivery and the join/drain goals always run) |
 | `sweep_period` | `600` | seconds to compare every unit once |
 | `min_interval` | `1` | floor between two units |
 | `jitter` | `0.2` | relative spread of every delay |
@@ -526,6 +486,7 @@ A maximal record (16 MiB value) always fits one batch on its own.
 | `max_batch_bytes` | `4 MiB` | payload of one push or fetch |
 | `max_repairs_per_cycle` | `10000` | versions copied by one session |
 | `max_keys_per_cycle` | `1000000` | keys listed by one session |
+| `hotqueue_size` | `4096` | obligations scheduled in memory at once; the rest wait in `META` |
 
 Values are only bounded below; anything an envelope cannot carry is clamped
 and paginated.
@@ -537,6 +498,11 @@ and paginated.
   anti-entropy would resurrect it; the GC must therefore collect consistently
   across replicas (for example only versions older than a horizon well beyond
   `grace` plus a sweep). The GC is not implemented yet.
+- **Unreachable joins and drains.** A join skips sources that are down, so a
+  version held only by a dead node arrives later through the sweep. A drain
+  cannot finish while no live replica replaces the node.
+- **Orphaned obligations.** A read-repair obligation recorded on a node after
+  its drain finished stays in `META` until delivery drops it as obsolete.
 - **Handoff restart.** A budget stop on a very large orphan partition
   restarts its descent from the beginning on the next sweep (copies already
   made are not redone, only rescanned).
@@ -576,7 +542,7 @@ Handlers are async generators registered once per kind on the peer or client dis
 | `node` | peer | `node.join` / `node.drain` |
 | `inspect` | peer | `node.inspect` → paginated `node.info` |
 
-`gossip.*`, `replication.*`, `transfer.*` and `antientropy.*` are internal to the cluster and deliberately have no client service.
+`gossip.*`, `replication.*` and `antientropy.*` are internal to the cluster and deliberately have no client service.
 
 `tourctl` builds on those services with cyclopts commands (`probe ping`, `node inspect`, `node join`, `node drain`, `put`, `get`, `delete`, `repair`). Commands stay thin; rendering and error mapping live in `tourctl/core/`, which translates configuration, TLS/connectivity and protocol failures into actionable `SystemExit` messages instead of tracebacks.
 
@@ -597,32 +563,18 @@ Storage ──session_provider_for(group)──▶ SessionProvider ──session
 
 `core/storage/session.py` provides a typed `GroupSession` through
 `GroupSessionManager.session(write=...)`. Its `read` and `get_many` methods
-read exact versions; `get` reads the latest version and `tags` loads only tags.
-`exists_many` checks owned tags and value presence in a single batch without
-loading values. `stage_many` writes transfer versions without hiding active
-copies; retries may replace the staging source.
-`put_many` inserts versions and promotes non-owned copies without rewriting
-existing values. `update_tags` maintains the per-bucket count/XOR digest
-across ownership changes, including duplicate keys and repeated flushes.
-Tag updates reject incomplete versions before changing any tag or digest.
-The caller retains responsibility for placement, transfer authorization and
-hint obligations. The manager flushes digests before committing the underlying
-transaction; errors roll back records and digests together.
-Store operations use managed sessions directly, without a separate store facade.
-`PartitionGroupStaging` and `PartitionGroupHint` remain separate workflows:
-the former owns transfer bounds, resumes and source authorization; the latter
-owns delivery obligations and acknowledgements. Both receive a
-`GroupSessionManager` and delegate record writes to its typed session.
-Each staging activation page selects its tags and restores exactly one wrapper
-with `update_tags` in the same write transaction, so another writer cannot
-change its source or ownership between selection and activation.
-`GroupSession` does not expose its underlying raw session. `tag_page` returns
-typed tags and a physical continuation cursor, while `load_records` fetches
-only selected values. `last_staged_keys` reads durable transfer progress.
-`put_hint_obligation`, `has_hints`, `hint_page` and `remove_hint_obligations`
-encapsulate delivery metadata without allowing arbitrary META writes.
-Paged scans log and skip unreadable entries while still advancing their
-cursor; no transaction stays open while the caller consumes a page.
+read exact versions and `get` reads the latest version. `put` and `put_many`
+insert `LIVE` or `TOMBSTONE` versions without ever rewriting an existing one,
+and fold only newly inserted versions into the per-bucket count/XOR digest.
+`put_obligations`, `has_obligations`, `obligation_page` and
+`remove_obligations` encapsulate replication obligations without allowing
+arbitrary `META` writes. `roots`, `root_page`, `bucket_page` and `owned_keys`
+serve anti-entropy. The caller retains responsibility for placement. The
+manager flushes digests before committing the underlying transaction; errors
+roll back records, obligations and digests together. `GroupSession` does not
+expose its underlying raw session. Paged scans log and skip unreadable
+entries while still advancing their cursor; no transaction stays open while
+the caller consumes a page.
 
 Configuration and node state are persisted through the `Persistence` port, TOML by default, with per-path locking and atomic replace.
 
@@ -642,4 +594,4 @@ The following are design decisions that have **not** been settled yet; see [`bac
 - Consistency is expressed as raw per-request quorum integers; there is no named consistency-level API.
 - Data anti-entropy heals replicas proactively (§9), but the version GC that bounds storage is not implemented, and its consistency constraint with anti-entropy is not enforced yet.
 - Placement has no failure-domain (anti-affinity) awareness.
-- Steady-state rebalancing is not implemented; transfers are driven by joins and explicit departures.
+- Ownership only changes through joins and explicit drains; there is no automatic rebalancing of vnodes.

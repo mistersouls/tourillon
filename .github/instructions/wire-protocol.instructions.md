@@ -84,7 +84,7 @@ class XService:
 
 - Register it in `tourclient/core/services/registry.py` with an accurate `supported_endpoints` frozenset.
 - `client` endpoint = user-facing API; `peer` endpoint = operator/internal access. Current matrix: `probe` client+peer, `kv` client+peer, `node` peer, `inspect` peer.
-- Internal kinds (`gossip.*`, `replication.*`, `transfer.*`) deliberately have **no** client service. Do not add one without a stated reason.
+- Internal kinds (`gossip.*`, `replication.*`, `antientropy.*`) deliberately have **no** client service. Do not add one without a stated reason.
 - Always check the response kind before decoding. Map `.reject` to `RequestRejectedError` and unexpected kinds to `ResponseError`.
 - Paginated calls (`node.inspect`) must make progress: validate the cursor advances and bound the loop.
 

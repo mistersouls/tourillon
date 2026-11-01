@@ -24,7 +24,10 @@ Every request is checked against the local replica view first:
 
 - ``not_ready``: the service is stopped or the ring is settling;
 - ``stale_view``: the requester computed other replicas for these pids;
-- ``not_replica``: this node does not replicate one of them.
+- ``not_replica``: a ``push`` names a partition this node does not
+  replicate in its target view. Reads are served for any partition: a node
+  that holds versions of a pid it is leaving, or a source a joining node
+  catches up from, must still answer the comparison.
 
 Only then is storage touched, and only for the partitions named.
 """
@@ -126,7 +129,7 @@ class AntiEntropyResponder:
             return FetchResponse(tuple(records), max(1, consumed))
 
     async def push(self, request: PushRequest) -> int:
-        async with self._admit(request.scope):
+        async with self._admit(request.scope, write=True):
             records = [r for r in request.records if r.tag.kind in OWNED_KINDS]
 
             for record in records:
@@ -143,14 +146,14 @@ class AntiEntropyResponder:
             return await work()
 
     @contextlib.asynccontextmanager
-    async def _admit(self, scope: Scope) -> AsyncIterator[None]:
+    async def _admit(self, scope: Scope, *, write: bool = False) -> AsyncIterator[None]:
         if self._active >= self._slots:
             self.rejected += 1
             raise AntiEntropyRejectError(
                 AntiEntropyRejectError.BUSY, "responder at capacity", BUSY_RETRY_AFTER
             )
 
-        self._check(scope)
+        self._check(scope, write)
         self._active += 1
         self._idle.clear()
 
@@ -161,7 +164,7 @@ class AntiEntropyResponder:
             if not self._active:
                 self._idle.set()
 
-    def _check(self, scope: Scope) -> None:
+    def _check(self, scope: Scope, write: bool) -> None:
         view = self._tracker.view
 
         if not self._running or view is None:
@@ -186,7 +189,7 @@ class AntiEntropyResponder:
                 self._tracker.settle_delay,
             )
 
-        if not all(view.is_replica(pid) for pid in scope.pids):
+        if write and not all(view.is_replica(pid) for pid in scope.pids):
             self.rejected += 1
             raise AntiEntropyRejectError(
                 AntiEntropyRejectError.NOT_REPLICA, "not a replica of every partition"

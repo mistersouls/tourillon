@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from tourillon.core.ae.obligations import ObligationQueue
 from tourillon.core.exceptions import (
     InvalidQuorumError,
     InvalidRepairTokenError,
@@ -40,9 +41,9 @@ from tourillon.core.models.repair import (
     encode_token,
 )
 from tourillon.core.models.storageschema import (
-    Hint,
     Key,
     Keyspace,
+    ObligationKey,
     PartitionAddress,
     Pid,
     Record,
@@ -54,7 +55,6 @@ from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import PlacementStrategy, Preference
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports.storage import Storage
-from tourillon.core.storage.group import PartitionGroupHint
 from tourillon.core.storage.session import GroupSessionManager
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT, MAX_CLOCK_SKEW_MS, MAX_QUORUM
 from tourlib.envelope import build_envelope
@@ -64,8 +64,7 @@ from tourlib.port import Serializer
 
 REPLICATION_RESPONSE_DELAY = 0.05
 
-# Tag kinds a replica holds on its own behalf, as opposed to a hint it owes
-# to another node.
+# Tag kinds of a stored version: there is no other way to hold one.
 _OWNED_KINDS = frozenset({TagKind.LIVE, TagKind.TOMBSTONE})
 
 
@@ -74,7 +73,7 @@ class ReplicationStats:
     """Counters for replication anomalies that are tolerated rather than raised."""
 
     foreign_writes: int = 0
-    hints_recorded: int = 0
+    obligations_recorded: int = 0
     read_repairs_repaired: int = 0
     read_repairs_failed: int = 0
     read_repairs_skipped: int = 0
@@ -95,6 +94,7 @@ class StoreService:
         response_delay: float = REPLICATION_RESPONSE_DELAY,
         read_repair: ReadRepairConfig | None = None,
         repair: RepairConfig | None = None,
+        obligations: ObligationQueue | None = None,
     ) -> None:
         self._node_id = node_id
         self._storage = storage
@@ -115,6 +115,7 @@ class StoreService:
         self._accepting_reads = True
         self._accepting_read_repairs = True
         self._mutations: set[asyncio.Future[None]] = set()
+        self._obligations = obligations
 
     def pause(self, *, readable: bool = True) -> None:
         """Refuse writes while draining, retaining reads until IDLE."""
@@ -276,30 +277,43 @@ class StoreService:
         """Answer whether this node holds one exact version."""
         return await self._local_read_at(key)
 
-    async def exists(self, key: Key) -> bool:
-        group = self._partitioner.group_for(key.pid.value)
-        provider = await self._storage.session_provider_for(group)
-        async with GroupSessionManager(provider).session() as session:
-            return await session.exists(key)
-
     async def write(self, record: Record) -> Record:
         with self._operation("replication.write"):
             return await self._write(record)
 
     async def hint(self, record: Record, intent: str) -> Record:
-        if record.tag.kind is not TagKind.HINT:
-            raise ValueError("hint requires a HINT record")
+        """Hold a version on behalf of ``intent`` and owe it a copy.
+
+        The version is stored as is (LIVE or TOMBSTONE) and a replication
+        obligation towards ``intent`` is persisted in the same transaction;
+        anti-entropy delivers it.
+        """
+        if record.tag.kind not in _OWNED_KINDS:
+            raise ValueError("hint requires a LIVE or TOMBSTONE record")
         with self._operation("replication.hint"):
-            await self._hint(record, intent)
+            await self._oblige(record, (intent,))
         return record
 
-    async def _hint(self, record: Record, intent: str) -> None:
-        hint = Hint(record=record, intent=intent, hlc=self._clock.tick())
+    async def _oblige(self, record: Record, targets: Iterable[str]) -> None:
+        """Store ``record`` and the obligations to copy it to ``targets``.
+
+        Both land in one write transaction, so an obligation never refers to
+        a version this node does not hold. The hotqueue is told only once
+        they are durable; if it is full, the obligation waits in META.
+        """
+        obligations = [
+            ObligationKey(target=target, key=record.key)
+            for target in dict.fromkeys(targets)
+            if target != self._node_id
+        ]
         group = self._partitioner.group_for(record.key.pid.value)
         provider = await self._storage.session_provider_for(group)
-        hints = PartitionGroupHint(GroupSessionManager(provider))
-        await hints.put(hint)
-        self._stats.hints_recorded += 1
+        async with GroupSessionManager(provider).session(write=True) as session:
+            await session.put(record)
+            await session.put_obligations(obligations)
+        self._stats.obligations_recorded += len(obligations)
+        if self._obligations is not None:
+            self._obligations.submit(obligations)
 
     async def _write(self, record: Record) -> Record:
         """Apply a replicated write received from a peer.
@@ -367,7 +381,7 @@ class StoreService:
             self._stats.repairs_rejected += 1
             raise VersionNotFoundError(token)
 
-        holders = self._repair_holders(answers)
+        holders = self._repair_holders(answers, fanout)
         missing = [
             (target, hinted) for owner, target, hinted in fanout if owner not in holders
         ]
@@ -437,8 +451,8 @@ class StoreService:
 
         Returns `(owner, target, hinted)`: `owner` is who must end up holding
         the version, `target` is who is reachable on its behalf. They differ
-        while a handoff stands in, and the distinction is what keeps a hint
-        from counting as the owner's durability.
+        while a handoff stands in, and the distinction is what keeps a copy
+        held on the owner's behalf from counting as the owner's durability.
         """
         fanout: list[tuple[str, str, str | None]] = []
         for entry in preferences:
@@ -474,42 +488,35 @@ class StoreService:
         return answers, errors
 
     @staticmethod
-    def _repair_holders(answers: Mapping[str, Record | None]) -> set[str]:
-        """Replicas that hold the version on their own behalf.
+    def _repair_holders(
+        answers: Mapping[str, Record | None],
+        fanout: Sequence[tuple[str, str, str | None]],
+    ) -> set[str]:
+        """Replicas that hold the version themselves.
 
-        A hint held by a stand-in is a debt, not durability: the owner still
+        A copy held by a stand-in is a debt, not durability: the owner still
         does not have the version, so it stays a repair target.
         """
+        direct = {owner for owner, target, _ in fanout if owner == target}
         return {
             owner
             for owner, record in answers.items()
-            if record is not None and record.tag.kind in _OWNED_KINDS
+            if owner in direct
+            and record is not None
+            and record.tag.kind in _OWNED_KINDS
         }
 
     @staticmethod
     def _repair_source(records: Iterable[Record | None]) -> Record | None:
-        """Pick the record to copy, preferring one nobody owes to anyone else.
+        """Pick the record to copy: any stored copy is a faithful one.
 
-        A stand-in's hint is still a faithful copy of the version, so it is
-        usable as a source once the hint wrapper is removed — otherwise a
-        version that only survives as a hint could never be repaired.
+        A stand-in's copy is usable too, otherwise a version that only
+        survives on a handoff could never be repaired.
         """
-        hinted: Record | None = None
         for record in records:
-            if record is None:
-                continue
-            if record.tag.kind in _OWNED_KINDS:
+            if record is not None and record.tag.kind in _OWNED_KINDS:
                 return record
-            if hinted is None and record.tag.kind is TagKind.HINT:
-                hinted = record
-        if hinted is None:
-            return None
-        try:
-            return Record(
-                key=hinted.key, value=hinted.value, tag=Tag.unhint(hinted.tag)
-            )
-        except ValueError:
-            return None
+        return None
 
     async def _read_at_from_target(
         self, target_node_id: str, key: Key
@@ -654,6 +661,7 @@ class StoreService:
         targets = self._repair_targets(answers, preferences, record)
         if not targets:
             return
+        holder = self._repair_holder(answers, record)
         if (
             self._read_repair.sample_rate < 1.0
             and random.random() >= self._read_repair.sample_rate
@@ -663,17 +671,29 @@ class StoreService:
             self._stats.read_repairs_skipped += len(targets)
             return
         for node_id in targets:
-            self._start_repair(node_id, record)
+            self._start_repair(node_id, record, holder)
+
+    def _repair_holder(
+        self, answers: Mapping[str, Record | None], winner: Record
+    ) -> str:
+        """Pick the node that owes the laggards a copy: this one if it can.
+
+        Read repair does not copy anything itself. It records an obligation
+        on a node that holds the elected version, and anti-entropy delivers
+        it like any other.
+        """
+        holders = sorted(
+            node_id
+            for node_id, record in answers.items()
+            if record is not None and record.key == winner.key
+        )
+        return self._node_id if self._node_id in holders else holders[0]
 
     @staticmethod
     def _winning_record(
         records: Iterable[Record | None], winner: Version
     ) -> Record | None:
-        """Return the record the elected version came from, never a hinted one.
-
-        A hint is data owed to another node. Replaying it as a plain write
-        would plant it on a replica that does not own the address.
-        """
+        """Return the stored record the elected version came from."""
         for record in records:
             if record is None:
                 continue
@@ -690,9 +710,10 @@ class StoreService:
         """Select the replicas that own the address and are behind the winner.
 
         A replica standing in through handoff is skipped: it does not own the
-        address, and the hint replayer is what makes the real owner whole.
+        address, and the obligation it holds makes the real owner whole.
         Replicas that failed or timed out are absent from `answers` entirely,
-        and are covered by hints rather than by repair.
+        and are covered by the obligations of the write path and by
+        anti-entropy rather than by repair.
         """
         owners = {
             entry.node_id
@@ -706,7 +727,7 @@ class StoreService:
         ]
         return sorted(targets)
 
-    def _start_repair(self, node_id: str, record: Record) -> None:
+    def _start_repair(self, node_id: str, record: Record, holder: str) -> None:
         if not self._accepting_read_repairs:
             self._stats.read_repairs_skipped += 1
             return
@@ -715,15 +736,19 @@ class StoreService:
             # A hot key must not spawn one repair per concurrent read.
             return
         self._repairs_inflight.add(marker)
-        task = asyncio.create_task(self._repair_target(marker, record), name=node_id)
+        task = asyncio.create_task(
+            self._repair_target(marker, record, holder), name=node_id
+        )
         self._pending_writes.add(task)
         task.add_done_callback(self._settle_detached)
 
-    async def _repair_target(self, marker: tuple[bytes, str], record: Record) -> None:
+    async def _repair_target(
+        self, marker: tuple[bytes, str], record: Record, holder: str
+    ) -> None:
         node_id = marker[1]
         try:
             async with self._repair_slots:
-                await self._apply_write(node_id, record)
+                await self._apply_hint(holder, record, node_id)
             self._stats.read_repairs_repaired += 1
         except Exception as exc:
             self._stats.read_repairs_failed += 1
@@ -748,16 +773,14 @@ class StoreService:
         hinted_node_id: str | None,
     ) -> Record:
         if hinted_node_id is not None:
-            return await self._apply_hint(
-                target_node_id, self._hint_record(record), hinted_node_id
-            )
+            return await self._apply_hint(target_node_id, record, hinted_node_id)
         try:
             return await self._apply_write(target_node_id, record)
         except Exception:
             # The placement believed this replica healthy, so nothing else will
-            # notice it missed the write. Materialise the debt locally and let
-            # the replayer deliver it instead of dropping it.
-            await self._record_hint(target_node_id, record)
+            # notice it missed the write. Record the obligation locally and let
+            # anti-entropy deliver it instead of dropping it.
+            await self._record_obligation(target_node_id, record)
             raise
 
     async def _apply_write(self, target_node_id: str, record: Record) -> Record:
@@ -769,7 +792,7 @@ class StoreService:
         self, target_node_id: str, record: Record, intent: str
     ) -> Record:
         if target_node_id == self._node_id:
-            await self._hint(record, intent)
+            await self._oblige(record, (intent,))
             return record
         payload = await self._remote_request(
             "replication.hint",
@@ -778,22 +801,21 @@ class StoreService:
         )
         return Record.from_dict(payload)
 
-    async def _record_hint(self, target_node_id: str, record: Record) -> None:
-        """Store a hint owed to `target_node_id`, never masking the write error.
+    async def _record_obligation(self, target_node_id: str, record: Record) -> None:
+        """Owe `target_node_id` this version, never masking the write error.
 
-        A hint is a handoff to another node, so there is nothing to record when
-        the failing target is this node: our own storage is the thing that just
-        failed. Any error here is swallowed on purpose — the caller re-raises
-        the original replication error, which is what quorum accounting and the
-        client response are built on.
+        There is nothing to record when the failing target is this node: our
+        own storage is the thing that just failed. Any error here is swallowed
+        on purpose — the caller re-raises the original replication error,
+        which is what quorum accounting and the client response are built on.
         """
         if target_node_id == self._node_id:
             return
         try:
-            await self._hint(self._hint_record(record), target_node_id)
+            await self._oblige(record, (target_node_id,))
         except Exception as exc:
             logger.warning(
-                "hint.record failed target=%s key=%s error=%s",
+                "obligation.record failed target=%s key=%s error=%s",
                 target_node_id,
                 record.key,
                 exc,
@@ -906,21 +928,13 @@ class StoreService:
             return await session.read(key)
 
     async def _local_write(self, record: Record) -> Record:
-        if record.tag.kind is TagKind.HINT:
-            raise ValueError("HINT records must use the hint operation")
+        if record.tag.kind not in _OWNED_KINDS:
+            raise ValueError("replicated records must be LIVE or TOMBSTONE")
         group = self._partitioner.group_for(record.key.pid.value)
         session_provider = await self._storage.session_provider_for(group)
         async with GroupSessionManager(session_provider).session(write=True) as session:
             await session.put(record)
         return record
-
-    @staticmethod
-    def _hint_record(record: Record) -> Record:
-        return Record(
-            key=record.key,
-            value=record.value,
-            tag=Tag.hint(record.tag),
-        )
 
     async def _drain_parallel_tasks(
         self,
@@ -1037,11 +1051,7 @@ class StoreService:
     def _visible_versions(self, records: Sequence[Record | None]) -> list[Version]:
         versions: list[Version] = []
         for record in records:
-            if record is None or record.tag.kind not in {
-                TagKind.LIVE,
-                TagKind.TOMBSTONE,
-                TagKind.HINT,
-            }:
+            if record is None or record.tag.kind not in _OWNED_KINDS:
                 continue
             versions.append(self._version_from_record(record))
         return versions
@@ -1050,13 +1060,13 @@ class StoreService:
     def _is_tombstone(
         version: Version | None, records: Sequence[Record | None]
     ) -> bool:
-        """Return True when the elected version is a delete, hinted or not."""
+        """Return True when the elected version is a delete."""
         if version is None:
             return False
         return any(
             record is not None
             and record.key.ts == version.meta.ts
-            and TagKind.TOMBSTONE in (record.tag.kind, record.tag.payload.sub)
+            and record.tag.kind is TagKind.TOMBSTONE
             for record in records
         )
 

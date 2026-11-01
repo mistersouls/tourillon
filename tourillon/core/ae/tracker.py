@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Keep the replica map in step with the ring.
+"""Keep the replica map in step with the ring and its owners' phases.
 
-A ring change invalidates the current view at once: running sessions are
+A ring change, or a ring member changing phase (a JOINING node becoming
+READY, a READY one starting to drain), invalidates the current view at once: running sessions are
 told to stop, and the responder answers ``not_ready`` instead of comparing
 partitions whose replicas may just have moved. The map is rebuilt only after
 ``settle_delay`` without further change, so a burst of membership updates
@@ -45,6 +46,7 @@ class ViewTracker:
         self._rf = replication_factor
         self._settle_delay = settle_delay
         self._view: ReplicaView | None = None
+
         # Set when the current view is invalidated; replaced on each rebuild
         # so every view has its own signal.
         self._stale = asyncio.Event()
@@ -84,19 +86,20 @@ class ViewTracker:
         self._invalidate()
 
     async def _run(self) -> None:
-        serial = await self._rebuild()
+        generation = await self._rebuild()
         while True:
-            await self._topologymgr.wait_for_ring_change(serial)
+            await self._topologymgr.wait_for_change(generation)
             self._invalidate()
             await asyncio.sleep(self._settle_delay)
-            serial = await self._rebuild()
+            generation = await self._rebuild()
 
     def _invalidate(self) -> None:
         self._view = None
         self._ready.clear()
         self._stale.set()
 
-    async def _rebuild(self) -> str:
+    async def _rebuild(self) -> int:
+        generation = self._topologymgr.generation
         topology = await self._topologymgr.snapshot()
         # The ring is immutable: hashing it off-loop is safe and keeps a
         # large ring from stalling client requests.
@@ -114,4 +117,4 @@ class ViewTracker:
             "antientropy.view rebuilt serial=%s peers=%d", serial, len(view.shared)
         )
 
-        return serial
+        return generation

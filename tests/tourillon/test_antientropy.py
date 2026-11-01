@@ -39,13 +39,14 @@ from tourillon.core.ae.sync import (
 from tourillon.core.ae.view import ReplicaView, build_view
 from tourillon.core.exceptions import AntiEntropyRejectError
 from tourillon.core.gossip.topology import TopologyManager
-from tourillon.core.models.antientropy import Scope
+from tourillon.core.models.antientropy import PushRequest, Scope
 from tourillon.core.models.config import AntiEntropyConfig
 from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.models.retry import BackoffRetry
 from tourillon.core.models.storageschema import (
     Key,
     Keyspace,
+    ObligationKey,
     Pid,
     Record,
     Tag,
@@ -381,27 +382,6 @@ async def test_hot_bucket_compares_only_its_eligible_part(cluster: _Cluster) -> 
     assert ("node-b", "antientropy.range") in cluster.network.requests
 
 
-async def test_pulled_versions_promote_a_staged_copy(cluster: _Cluster) -> None:
-    a, b, _ = await _three(cluster)
-    view = _view(a)
-    record = _shared_records(view, "node-b")[0]
-    pid = record.key.pid.value
-    await _write(b, [record])
-
-    manager = GroupSessionManager(
-        await a.local._storage.session_provider_for(PARTITIONER.group_for(pid))
-    )
-
-    async with manager.session(write=True) as session:
-        await session.stage_many([record], "src")
-
-    assert await _owned(a, pid) == set()
-
-    await a.run_unit(Unit("node-b", (pid,)), view, a.tracker.stale_signal())
-
-    assert record.key.to_bytes(Keyspace.TAGS) in await _owned(a, pid)
-
-
 # --- handoff mode ----------------------------------------------------------
 
 
@@ -582,6 +562,7 @@ async def test_scan_budget_counts_listed_keys(cluster: _Cluster) -> None:
 
     sync = PeerSync(
         a.local,
+        "node-b",
         a._caller("node-b"),
         view,
         asyncio.Event(),
@@ -605,6 +586,7 @@ async def test_rpc_refuses_once_stale() -> None:
 
     sync = PeerSync(
         None,  # type: ignore[arg-type]
+        "node-b",
         None,  # type: ignore[arg-type]
         view,
         stale,
@@ -652,15 +634,21 @@ async def test_service_loop_starts_sweeps_and_stops(cluster: _Cluster) -> None:
     assert a.to_dict()["serial"] is None
 
 
-async def test_disabled_service_never_starts(cluster: _Cluster) -> None:
+async def test_disabled_service_delivers_but_never_sweeps(cluster: _Cluster) -> None:
     members = [_member(n) for n in TOKENS]
 
     a = await cluster.node(
-        "node-a", await _topology(*members), AntiEntropyConfig(enabled=False)
+        "node-a",
+        await _topology(*members),
+        AntiEntropyConfig(enabled=False, min_interval=0.01),
     )
 
     await a.start()
-    assert not a.running
+    assert a.running
+    assert [t.get_name() for t in a._tasks] == ["antientropy-delivery"]
+    await asyncio.sleep(0.05)
+    assert a.stats.sweeps == 0
+    assert a.to_dict()["enabled"] is False
 
 
 async def test_loop_survives_a_failing_sweep(
@@ -822,9 +810,13 @@ async def test_responder_rejects_unknown_and_foreign_partitions(
     assert exc.value.code == AntiEntropyRejectError.INVALID
 
     foreign = next(p for p in range(16) if not view.is_replica(p))
+    scope = Scope((foreign,), view.view_hash((foreign,)))
+
+    # Reads of a foreign partition are served: a joining node pulls from it.
+    assert await a.responder.serve(scope, work) is None
 
     with pytest.raises(AntiEntropyRejectError) as exc:
-        await a.responder.serve(Scope((foreign,), view.view_hash((foreign,))), work)
+        await a.responder.push(PushRequest(scope, ()))
 
     assert exc.value.code == AntiEntropyRejectError.NOT_REPLICA
     assert a.responder.rejected == 2
@@ -953,3 +945,352 @@ def test_peer_backoff_honours_hints_and_grows() -> None:
     assert backoff._delay["p"] == 3.0
     backoff.succeeded("p")
     assert not backoff.deferred("p") and "p" not in backoff._delay
+
+
+# --- obligations, join and drain goals ---------------------------------------
+
+
+async def _oblige(
+    service: AntiEntropyService, record: Record, target: str
+) -> ObligationKey:
+    obligation = ObligationKey(target, record.key)
+    group = PARTITIONER.group_for(record.key.pid.value)
+    manager = GroupSessionManager(
+        await service.local._storage.session_provider_for(group)
+    )
+
+    async with manager.session(write=True) as session:
+        await session.put_obligations([obligation])
+
+    return obligation
+
+
+async def test_deliver_pushes_owed_versions_then_forgets_them(
+    cluster: _Cluster,
+) -> None:
+    a, b, _ = await _three(cluster)
+    view = _view(a)
+    record = _shared_records(view, "node-b")[0]
+    pid = record.key.pid.value
+    await _write(a, [record])
+    obligation = await _oblige(a, record, "node-b")
+
+    await a.deliver([obligation], view)
+
+    assert record.key.to_bytes(Keyspace.TAGS) in await _owned(b, pid)
+    assert not await a.local.has_obligations()
+    assert a.stats.obligations_delivered == 1
+    assert ("node-b", "antientropy.push") in cluster.network.requests
+
+
+async def test_deliver_drops_obligations_no_longer_owed(cluster: _Cluster) -> None:
+    a, _, _ = await _three(cluster)
+    view = _view(a)
+    record = _records(1)[0]
+    pid = record.key.pid.value
+    stranger = next(n for n in TOKENS if not view.is_replica(pid, n))
+    await _write(a, [record])
+    foreign = await _oblige(a, record, stranger)
+    missing = await _oblige(a, _shared_records(view, "node-b")[1], "node-b")
+
+    await a.deliver([foreign, missing], view)
+
+    assert not await a.local.has_obligations()
+    assert a.stats.obligations_dropped == 2
+    assert cluster.network.requests == []
+
+
+async def test_deliver_parks_obligations_of_unreachable_targets(
+    cluster: _Cluster,
+) -> None:
+    a, b, _ = await _three(cluster)
+    view = _view(a)
+    record = _shared_records(view, "node-b")[0]
+    await _write(a, [record])
+    obligation = await _oblige(a, record, "node-b")
+    a.obligations.backlog = False
+    a._pool.suspects.add("node-b")  # type: ignore[attr-defined]
+
+    await a.deliver([obligation], view)
+
+    assert await a.local.has_obligations()
+    assert a.obligations.backlog
+    assert a.stats.obligations_deferred == 1
+    assert record.key.to_bytes(Keyspace.TAGS) not in await _owned(
+        b, record.key.pid.value
+    )
+
+
+async def test_deliver_keeps_obligations_when_the_push_fails(
+    cluster: _Cluster,
+) -> None:
+    a, _, _ = await _three(cluster)
+    view = _view(a)
+    record = _shared_records(view, "node-b")[0]
+    await _write(a, [record])
+    obligation = await _oblige(a, record, "node-b")
+    cluster.network.down.add("node-b")
+
+    await a.deliver([obligation], view)
+
+    assert await a.local.has_obligations()
+    assert a.stats.obligations_delivered == 0
+    assert a.stats.errors == 1
+
+
+async def test_delivery_reloads_persisted_obligations_on_start(
+    cluster: _Cluster,
+) -> None:
+    config = AntiEntropyConfig(
+        enabled=False, grace=10.0, settle_delay=0.0, min_interval=0.01
+    )
+    a, b, _ = await _three(cluster, config)
+    view = _view(a)
+    record = _shared_records(view, "node-b")[0]
+    await _write(a, [record])
+    await _oblige(a, record, "node-b")  # left by a previous run: never submitted
+
+    await a.start()
+
+    for _ in range(200):
+        if a.stats.obligations_delivered:
+            break
+        await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(a.obligations.wait_idle(), 1)
+    assert a.stats.obligations_delivered == 1
+    assert not await a.local.has_obligations()
+    assert record.key.to_bytes(Keyspace.TAGS) in await _owned(b, record.key.pid.value)
+    assert a.to_dict()["hotqueue"]["backlog"] is False
+
+
+async def test_sweep_waits_for_queued_obligations(cluster: _Cluster) -> None:
+    config = AntiEntropyConfig(
+        grace=10.0, settle_delay=0.0, sweep_period=0.1, min_interval=0.0, jitter=0.0
+    )
+    a, _, _ = await _three(cluster, config)
+    view = _view(a)
+    a.obligations.submit([ObligationKey("node-b", _records(1)[0].key)])
+
+    sweep = asyncio.create_task(a.sweep(view, a.tracker.stale_signal()))
+    await asyncio.sleep(0.05)
+    assert not sweep.done()
+    assert cluster.network.requests == []
+
+    a.obligations.settle(len(a.obligations.take(10)))
+    assert await asyncio.wait_for(sweep, 2) is True
+
+
+async def test_joining_node_pulls_owned_partitions_before_its_goal(
+    cluster: _Cluster,
+) -> None:
+    members = [
+        _member("node-a"),
+        _member("node-b"),
+        _member("node-c", MemberPhase.JOINING),
+    ]
+    a = await cluster.node("node-a", await _topology(*members))
+    b = await cluster.node("node-b", await _topology(*members))
+    c = await cluster.node("node-c", await _topology(*members))
+    view = _view(c)
+    assert view.owns
+    owned = [r for r in _records(96) if view.is_replica(r.key.pid.value)]
+    assert owned
+    await _write(a, owned)
+    await _write(b, owned)
+
+    await asyncio.wait_for(c.wait_joined(), 5)
+
+    for record in owned:
+        pid = record.key.pid.value
+        assert record.key.to_bytes(Keyspace.TAGS) in await _owned(c, pid)
+
+    assert c.stats.join_passes == 1
+
+
+async def test_join_goal_retries_until_sources_answer(cluster: _Cluster) -> None:
+    members = [
+        _member("node-a"),
+        _member("node-b"),
+        _member("node-c", MemberPhase.JOINING),
+    ]
+    await cluster.node("node-a", await _topology(*members))
+    await cluster.node("node-b", await _topology(*members), serve=False)
+    c = await cluster.node("node-c", await _topology(*members))
+    c._retry_delay = 0.01
+
+    joining = asyncio.create_task(c.wait_joined())
+
+    for _ in range(200):
+        if c.stats.join_passes >= 1:
+            break
+        await asyncio.sleep(0.01)
+
+    assert not joining.done()  # node-b refuses: the goal is not reached
+    cluster.network.nodes["node-b"].responder.start()
+    await asyncio.wait_for(joining, 5)
+    assert c.stats.join_passes >= 2
+
+
+def test_primary_source_pairs_joiners_one_to_one_with_leavers() -> None:
+    view = ReplicaView(
+        node_id="j1",
+        serial="s",
+        replicas=(("j1", "j2", "c"), ("j1", "a", "b"), ("j1", "a"), ("j1",)),
+        sources=(("a", "b", "c"), ("a", "b"), ("a", "b"), ()),
+    )
+
+    # Two joiners replace two nodes: each copies from a distinct one.
+    assert view.primary_source(0) == "a"
+    assert view.primary_source(0, "j2") == "b"
+    # Unpaired joiner: a current source picked by hash, deterministically.
+    assert view.primary_source(1) in {"a", "b"}
+    assert view.primary_source(1) == view.primary_source(1)
+    # One leaver for one joiner.
+    assert view.primary_source(2) == "b"
+    # Nothing serves the pid yet.
+    assert view.primary_source(3) is None
+
+
+def test_unpaired_joiners_spread_over_the_current_sources() -> None:
+    total = 256
+    view = ReplicaView(
+        node_id="j",
+        serial="s",
+        replicas=(("j", "a", "b"),) * total,
+        sources=(("a", "b"),) * total,
+    )
+
+    picked = {view.primary_source(pid) for pid in range(total)}
+
+    assert picked == {"a", "b"}
+
+
+async def _joining_cluster(
+    cluster: _Cluster,
+) -> tuple[AntiEntropyService, AntiEntropyService, AntiEntropyService]:
+    members = [
+        _member("node-a"),
+        _member("node-b"),
+        _member("node-c", MemberPhase.JOINING),
+    ]
+    a = await cluster.node("node-a", await _topology(*members))
+    b = await cluster.node("node-b", await _topology(*members))
+    c = await cluster.node("node-c", await _topology(*members))
+    return a, b, c
+
+
+def _split_by_primary(view: ReplicaView, count: int = 96) -> dict[str, list[Record]]:
+    split: dict[str, list[Record]] = {}
+    for record in _records(count):
+        pid = record.key.pid.value
+        if view.is_replica(pid) and len(view.sources_of(pid)) > 1:
+            primary = view.primary_source(pid)
+            assert primary is not None
+            split.setdefault(primary, []).append(record)
+    return split
+
+
+async def test_joining_node_copies_each_partition_from_its_primary_only(
+    cluster: _Cluster,
+) -> None:
+    a, b, c = await _joining_cluster(cluster)
+    services = {"node-a": a, "node-b": b}
+    split = _split_by_primary(_view(c))
+    assert split
+    elsewhere: list[Record] = []
+
+    for primary, records in split.items():
+        other = next(n for n in services if n != primary)
+        await _write(services[primary], records[1:])
+        # A version only the non-primary source holds is left to the sweep.
+        await _write(services[other], records[:1])
+        elsewhere.append(records[0])
+
+    await asyncio.wait_for(c.wait_joined(), 5)
+
+    for records in split.values():
+        for record in records[1:]:
+            assert record.key.to_bytes(Keyspace.TAGS) in await _owned(
+                c, record.key.pid.value
+            )
+    for record in elsewhere:
+        assert record.key.to_bytes(Keyspace.TAGS) not in await _owned(
+            c, record.key.pid.value
+        )
+
+
+async def test_join_falls_back_to_other_sources_when_the_primary_is_down(
+    cluster: _Cluster,
+) -> None:
+    a, b, c = await _joining_cluster(cluster)
+    view = _view(c)
+    split = _split_by_primary(view)
+    down = sorted(split)[0]
+    alive = "node-b" if down == "node-a" else "node-a"
+    services = {"node-a": a, "node-b": b}
+    await _write(services[alive], split[down])
+    c._pool.suspects.add(down)  # noqa: SLF001
+
+    await asyncio.wait_for(c.wait_joined(), 5)
+
+    for record in split[down]:
+        assert record.key.to_bytes(Keyspace.TAGS) in await _owned(
+            c, record.key.pid.value
+        )
+    assert all(peer != down for peer, _ in cluster.network.requests)
+
+
+async def test_draining_node_hands_every_version_off(cluster: _Cluster) -> None:
+    members = [
+        _member("node-a"),
+        _member("node-b"),
+        _member("node-c", MemberPhase.DRAINING),
+    ]
+    a = await cluster.node("node-a", await _topology(*members))
+    b = await cluster.node("node-b", await _topology(*members))
+    c = await cluster.node("node-c", await _topology(*members))
+    assert not _view(c).owns
+    records = _records(32)
+    await _write(c, records)
+
+    await asyncio.wait_for(c.drain(), 5)
+
+    nodes = {"node-a": a, "node-b": b}
+    view = _view(a)
+
+    for record in records:
+        pid = record.key.pid.value
+        for replica in view.replicas[pid]:
+            assert record.key.to_bytes(Keyspace.TAGS) in await _owned(
+                nodes[replica], pid
+            )
+
+    assert c.stats.drain_passes == 1
+
+
+async def test_drain_goal_is_not_reached_while_a_replica_is_down(
+    cluster: _Cluster,
+) -> None:
+    members = [
+        _member("node-a"),
+        _member("node-b"),
+        _member("node-c", MemberPhase.DRAINING),
+    ]
+    await cluster.node("node-a", await _topology(*members))
+    await cluster.node("node-b", await _topology(*members), serve=False)
+    c = await cluster.node("node-c", await _topology(*members))
+    c._retry_delay = 0.01
+    await _write(c, _records(32))
+
+    draining = asyncio.create_task(c.drain())
+
+    for _ in range(200):
+        if c.stats.drain_passes >= 1:
+            break
+        await asyncio.sleep(0.01)
+
+    assert not draining.done()
+    draining.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await draining

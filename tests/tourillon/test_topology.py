@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+
 import pytest
 
 from tourillon.core.gossip.topology import TopologyManager
@@ -102,7 +104,7 @@ async def test_merge_registry_returns_accepted_count() -> None:
     )
 
     topology = await manager.snapshot()
-    assert accepted == 1
+    assert accepted == 2
     assert len(topology.ring) == 2
 
     assert topology.registry.get("node-a").epoch == 2  # type: ignore[union-attr]
@@ -230,3 +232,43 @@ async def test_ring_reflects_latest_member_state(
     assert [vnode.token for vnode in ring] == [
         int(token, 16) for token in expected_tokens
     ]
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_generation_counts_ring_and_ownership_changes() -> None:
+    manager = TopologyManager()
+    generation = manager.generation
+    joining = Member(
+        node_id="node-a",
+        peer_address="127.0.0.1:7001",
+        epoch=1,
+        phase=MemberPhase.JOINING,
+        tokens=("a",),
+    )
+
+    waiter = asyncio.create_task(manager.wait_for_change(generation))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    assert await manager.apply_member(joining) is True
+    assert await asyncio.wait_for(waiter, 1) == generation + 1
+    assert len((await manager.snapshot()).ring) == 1
+
+    # Same vnodes, new phase: ownership changed although the ring did not.
+    ready = Member(
+        node_id="node-a",
+        peer_address="127.0.0.1:7001",
+        epoch=2,
+        phase=MemberPhase.READY,
+        tokens=("a",),
+    )
+    assert await manager.apply_member(ready) is True
+    assert manager.generation == generation + 2
+
+    # A stale record changes nothing and never wakes a waiter.
+    assert await manager.apply_member(joining) is False
+    assert manager.generation == generation + 2
+    assert (
+        await asyncio.wait_for(manager.wait_for_change(generation), 1) == generation + 2
+    )

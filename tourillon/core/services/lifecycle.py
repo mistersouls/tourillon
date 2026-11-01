@@ -18,6 +18,7 @@ import ssl
 from collections.abc import Iterable
 from pathlib import Path
 
+from tourillon.core.ae.obligations import ObligationQueue
 from tourillon.core.config import TourillonConfig
 from tourillon.core.exceptions import (
     BootstrapError,
@@ -36,11 +37,8 @@ from tourillon.core.partition.placement import PlacementStrategy
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports import Telemetry
 from tourillon.core.ports.storage import Storage
-from tourillon.core.replay.hint import HintReplayer
 from tourillon.core.services.antientropy import AntiEntropyService
 from tourillon.core.services.store import StoreService
-from tourillon.core.spaces.ring import Ring
-from tourillon.core.transfer.runner import TransferRunner
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourillon.core.transports.server import EnvelopeServer
 from tourlib import Serializer, ValidationError
@@ -69,6 +67,7 @@ class NodeLifecycle:
         telemetry: Telemetry,
         store: StoreService,
         placement_strategy: PlacementStrategy,
+        obligations: ObligationQueue | None = None,
     ) -> None:
         self._config = config
         self._persistence = persistence
@@ -80,14 +79,6 @@ class NodeLifecycle:
         self._gossip_stats = gossip_stats
         self._telemetry = telemetry
         self._store = store
-        self._hint_replayer = HintReplayer(
-            storage=storage,
-            peer_pool=peer_pool,
-            serializer=serializer,
-            total_groups=partitioner.total_groups,
-            placement_strategy=placement_strategy,
-            node_id=config.node.id,
-        )
         self._peer_server = EnvelopeServer(
             name="peer",
             dispatcher=peer_dispatcher,
@@ -109,17 +100,10 @@ class NodeLifecycle:
             serializer=serializer,
             telemetry=telemetry,
         )
-        self._transfer_runner = TransferRunner(
-            node_id=config.node.id,
-            replication_factor=config.placement.replication_factor,
-            partitioner=partitioner,
-            peer_pool=peer_pool,
-            serializer=serializer,
-            storage=storage,
-        )
+        self._placement_strategy = placement_strategy
 
-        # Runs only while the node is READY: a joining node is still being
-        # filled by transfers and a draining one hands its data off instead.
+        # The only mechanism that copies versions between nodes: it delivers
+        # obligations, fills a joining node and empties a draining one.
         self._antientropy = AntiEntropyService(
             node_id=config.node.id,
             storage=storage,
@@ -129,6 +113,7 @@ class NodeLifecycle:
             serializer=serializer,
             replication_factor=config.placement.replication_factor,
             config=config.placement.anti_entropy,
+            obligations=obligations,
         )
 
         self._state_file = Path(self._config.storage.data_dir) / NODE_STATE_FILENAME
@@ -177,15 +162,13 @@ class NodeLifecycle:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._drain_task
 
-        await self._antientropy.stop()
-        await self._hint_replayer.stop()
-
         if self.is_joining():
             assert self._join_task is not None
             self._join_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._join_task
 
+        await self._antientropy.stop()
         await self._gossiper.stop()
         await self._stop_peer()
         logger.info("Node lifecycle stopped for '%s'", self._config.node.id)
@@ -251,11 +234,8 @@ class NodeLifecycle:
                     with_seeds=self._drain_seeds(state, topology.registry),
                 )
 
-            await self._antientropy.stop()
             self._store.pause()
-            self._hint_replayer.pause_local_writes()
             await self._publish_state(state)
-            await self._hint_replayer.start()
             self._drain_task = asyncio.create_task(
                 self._perform_drain(state), name="node-drain"
             )
@@ -274,29 +254,27 @@ class NodeLifecycle:
         return seeds or list(state.seeds[:MAX_DRAIN_SEEDS])
 
     async def _perform_drain(self, state: NodeState) -> None:
+        """Wait for anti-entropy to hand every version off, then go IDLE.
+
+        The DRAINING phase already removed this node from the target
+        placement; anti-entropy converges the data towards it.
+        """
         try:
             await self._store.drain()
-            await self._hint_replayer.drain_local_writes()
-            await self._drain_transfers(state)
+            await self._antientropy.start()
+            await self._antientropy.drain()
             await self._store.stop_read_repairs()
-            await self._hint_replayer.wait()
-            await self._hint_replayer.stop()
             self._store.pause(readable=False)
             await self._stop_client()
             idle = await self._transition_to(state, MemberPhase.IDLE)
             await self._publish_state(idle)
+            await self._antientropy.stop()
         except Exception as exc:
             logger.exception(
                 "Drain failed for node '%s'; node remains DRAINING. Reason: %s",
                 state.node_id,
                 exc,
             )
-
-    async def _drain_transfers(self, state: NodeState) -> None:
-        member = await self._publish_state(state)
-        _, failed = await self._run_transfers(member, draining=True)
-        if failed:
-            raise DrainError(f"Data transfer failed for {len(failed)} ranges.")
 
     def _generate_tokens(self) -> tuple[str, ...]:
         count = self._config.node.size.to_value()
@@ -333,105 +311,48 @@ class NodeLifecycle:
             logger.info("  %.18s (%s)", token, idx + 1)
 
     async def _perform_join(self, state: NodeState) -> None:
+        """Enter the ring as JOINING, then wait for the sync goal before READY.
+
+        A JOINING node is neither readable nor writable: writes for the
+        partitions it gains go to stand-ins that owe it the versions, and
+        anti-entropy pulls everything written before it entered the ring.
+        """
         assert state.phase == MemberPhase.JOINING
 
         await self._peer_pool.start()
         await self._gossiper.start()
-        member = await self._publish_state(state)
-        synced = await self._sync_full(state)
-        ready = False
-
-        if synced:
-            logger.info("Re-synced cluster membership successfully")
-            success, failed = await self._run_transfers(member)
-
-            if failed:
-                logger.error(
-                    "Data transfer failed for %d partitions; node will transition to FAILED",
-                    len(failed),
-                )
-                final = await self._transition_to(state, MemberPhase.FAILED)
-            else:
-                logger.info(
-                    "Data transfer completed successfully for %d partitions",
-                    len(success),
-                )
-                final = await self._transition_to(state, MemberPhase.READY)
-                self._store.resume()
-                self._hint_replayer.resume_local_writes()
-                await self._start_client()
-                ready = True
-        else:
-            final = await self._transition_to(state, MemberPhase.FAILED)
-
-        await self._publish_state(final)
-        if not ready:
+        await self._publish_state(state)
+        if not await self._join_cluster(state):
+            failed = await self._transition_to(state, MemberPhase.FAILED)
+            await self._publish_state(failed)
             logger.error("Join operation failed; node transitioned to FAILED phase")
+            await self._antientropy.stop()
             await self._gossiper.stop()
             return
 
-        await self._hint_replayer.start()
+        logger.info("Join synchronisation reached for node '%s'", state.node_id)
+        ready = await self._transition_to(state, MemberPhase.READY)
+        self._store.resume()
+        await self._start_client()
+        await self._publish_state(ready)
+
+    async def _join_cluster(self, state: NodeState) -> bool:
+        if not await self._sync_full(state):
+            return False
+        # JOINING was first announced before any peer was known. Announce it
+        # again so the peers learn this node's ring position now: until then
+        # their views disagree and every anti-entropy request is refused.
+        await self._publish_state(state)
+        return await self._sync_data()
+
+    async def _sync_data(self) -> bool:
         await self._antientropy.start()
-
-    async def _run_transfers(
-        self, member: Member, *, draining: bool = False
-    ) -> tuple[list[str], list[str]]:
-        """Re-plan join or drain transfers on ring changes until they settle.
-
-        Transfers that settled before a re-plan are awaited again, so the
-        result always covers the latest plan. Cancelling the join cancels the
-        transfers: their staged data is kept and resumed by the next attempt.
-        """
-        topology = await self._topologymgr.snapshot()
-        current_ring = topology.ring
-        transfer = asyncio.create_task(
-            self._transfer_runner.run(
-                current_ring, self._transfer_target(current_ring, member, draining)
-            ),
-            name="transfer-run",
-        )
-        ring_change: asyncio.Task[Ring] | None = None
         try:
-            while True:
-                next_ring_change = asyncio.create_task(
-                    self._topologymgr.wait_for_ring_change(current_ring.serial()),
-                    name="wait-for-ring-change",
-                )
-                ring_change = next_ring_change
-                await asyncio.wait(
-                    (transfer, next_ring_change), return_when=asyncio.FIRST_COMPLETED
-                )
-                if not ring_change.done():
-                    return transfer.result()
-
-                current_ring = ring_change.result()
-                logger.info("Ring changed during transfer; updating transfer plan")
-                await self._transfer_runner.apply(
-                    current_ring, self._transfer_target(current_ring, member, draining)
-                )
-                if transfer.done():
-                    transfer = asyncio.create_task(
-                        self._transfer_runner.wait(), name="transfer-wait"
-                    )
-        finally:
-            if ring_change is not None:
-                ring_change.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await ring_change
-            if not transfer.done():
-                transfer.cancel()
-                await self._transfer_runner.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await transfer
-
-    @staticmethod
-    def _transfer_target(current: Ring, member: Member, draining: bool) -> Ring:
-        if not draining:
-            return current.add_vnodes(member.vnodes)
-        target = current.drop_nodes({member.node_id})
-        if not len(target):
-            raise DrainError("Cannot drain without another node on the ring.")
-        return target
+            await self._antientropy.wait_joined()
+        except Exception as exc:
+            logger.exception("Join synchronisation failed: %s", exc)
+            return False
+        return True
 
     async def _publish_state(self, state: NodeState) -> Member:
         member = Member(
@@ -454,9 +375,7 @@ class NodeLifecycle:
         await self._gossiper.start()
         await self._publish_state(ready_state)
         self._store.resume()
-        self._hint_replayer.resume_local_writes()
         await self._start_client()
-        await self._hint_replayer.start()
         await self._antientropy.start()
 
     async def _startup_idle(
@@ -508,7 +427,6 @@ class NodeLifecycle:
     async def _startup_draining(self) -> None:
         await self._start_peer()
         self._store.pause()
-        self._hint_replayer.pause_local_writes()
         state = await self._load_state()
         await self._peer_pool.start()
         if state.seeds and not await self._sync_full(state):
@@ -519,7 +437,6 @@ class NodeLifecycle:
         await self._gossiper.start()
         await self._publish_state(state)
         await self._start_client()
-        await self._hint_replayer.start()
         self._drain_task = asyncio.create_task(
             self._perform_drain(state), name="node-drain"
         )
