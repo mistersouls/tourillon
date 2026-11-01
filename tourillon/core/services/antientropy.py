@@ -100,6 +100,7 @@ from tourillon.core.ae.sync import (
     SessionLimits,
     SessionTally,
     ViewChangedError,
+    human_bytes,
 )
 from tourillon.core.ae.tracker import ViewTracker
 from tourillon.core.ae.view import ReplicaView
@@ -164,6 +165,8 @@ class AntiEntropyStats:
     pulled: int = 0
     pushed: int = 0
     handed_off: int = 0
+    bytes_pulled: int = 0
+    bytes_pushed: int = 0
     view_changes: int = 0
     budget_stops: int = 0
     errors: int = 0
@@ -181,6 +184,8 @@ class AntiEntropyStats:
         self.pids_diverged += tally.pids_diverged
         self.keys_scanned += tally.keys_scanned
         self.pulled += tally.pulled
+        self.bytes_pulled += tally.pulled_bytes
+        self.bytes_pushed += tally.pushed_bytes
 
         if handoff:
             self.handed_off += tally.pushed
@@ -202,6 +207,8 @@ class AntiEntropyStats:
             "pulled": self.pulled,
             "pushed": self.pushed,
             "handed_off": self.handed_off,
+            "bytes_pulled": self.bytes_pulled,
+            "bytes_pushed": self.bytes_pushed,
             "view_changes": self.view_changes,
             "budget_stops": self.budget_stops,
             "errors": self.errors,
@@ -330,7 +337,12 @@ class AntiEntropyService:
         self.obligations = obligations or ObligationQueue(config.hotqueue_size)
 
         self.tracker = ViewTracker(
-            node_id, topologymgr, partitioner, replication_factor, config.settle_delay
+            node_id,
+            topologymgr,
+            partitioner,
+            replication_factor,
+            config.settle_delay,
+            config.settle_quiet,
         )
 
         self.responder = AntiEntropyResponder(
@@ -417,36 +429,62 @@ class AntiEntropyService:
         Refused or interrupted sessions are retried, on the new view if the
         ring moved.
         """
+        started = time.monotonic()
+        passes = 0
+        copied = (self._stats.pulled, self._stats.bytes_pulled)
+        logger.info("antientropy.join started node=%s", self._node_id)
+
         while True:
             view = await self.tracker.wait_ready()
             stale = self.tracker.stale_signal()
 
             if not view.owns:
                 # The view predates this node's entry in the ring.
+                logger.debug(
+                    "antientropy.join waiting for a view that places node=%s",
+                    self._node_id,
+                )
                 await stale.wait()
                 continue
 
             failed = await self._join_pass(view, stale)
             self._stats.join_passes += 1
+            passes += 1
 
             if not failed and not stale.is_set():
-                logger.info("antientropy.join synced node=%s", self._node_id)
+                logger.info(
+                    "antientropy.join synced node=%s passes=%d pulled=%d (%s) "
+                    "elapsed=%.2fs",
+                    self._node_id,
+                    passes,
+                    self._stats.pulled - copied[0],
+                    human_bytes(self._stats.bytes_pulled - copied[1]),
+                    time.monotonic() - started,
+                )
                 return
 
+            _log_incomplete("join", passes, stale, self._retry_delay)
             await _pause(self._retry_delay, stale)
 
     async def _join_pass(self, view: ReplicaView, stale: asyncio.Event) -> bool:
         primaries = await self._join_sources(view)
         cutoff_ms = self._now_ms()
         result = await self._exchange(
-            primaries, view, stale, cutoff_ms, _SOURCE_PHASES, settled=True
+            primaries, view, stale, cutoff_ms, _SOURCE_PHASES, goal="join"
         )
         failed = bool(result.failed)
 
         fallback = _fallback_sources(view, primaries, result.skipped)
+        logger.debug(
+            "antientropy.join pass sources=%d pids=%d failed=%d fallback=%d",
+            len(primaries),
+            sum(len(pids) for pids in primaries.values()),
+            len(result.failed),
+            len(fallback),
+        )
         if fallback:
             again = await self._exchange(
-                fallback, view, stale, cutoff_ms, _SOURCE_PHASES, settled=True
+                fallback, view, stale, cutoff_ms, _SOURCE_PHASES, goal="join"
             )
             failed = failed or bool(again.failed)
 
@@ -460,22 +498,41 @@ class AntiEntropyService:
         every live target replica completed a session for it, and at least
         one did.
         """
+        started = time.monotonic()
+        passes = 0
+        copied = (self._stats.handed_off, self._stats.bytes_pushed)
+        logger.info("antientropy.drain started node=%s", self._node_id)
+
         while True:
             view = await self.tracker.wait_ready()
             stale = self.tracker.stale_signal()
 
             if view.owns:
                 # The view predates this node's DRAINING phase.
+                logger.debug(
+                    "antientropy.drain waiting for a view without node=%s",
+                    self._node_id,
+                )
                 await stale.wait()
                 continue
 
             done = await self._drain_pass(view, stale)
             self._stats.drain_passes += 1
+            passes += 1
 
             if done:
-                logger.info("antientropy.drain handed off node=%s", self._node_id)
+                logger.info(
+                    "antientropy.drain handed off node=%s passes=%d pushed=%d (%s) "
+                    "elapsed=%.2fs",
+                    self._node_id,
+                    passes,
+                    self._stats.handed_off - copied[0],
+                    human_bytes(self._stats.bytes_pushed - copied[1]),
+                    time.monotonic() - started,
+                )
                 return
 
+            _log_incomplete("drain", passes, stale, self._retry_delay)
             await _pause(self._retry_delay, stale)
 
     @staticmethod
@@ -511,7 +568,7 @@ class AntiEntropyService:
                 stale,
                 cutoff_ms,
                 _SESSION_PHASES,
-                settled=True,
+                goal="drain",
             )
             complete = complete and _handed_all(view, pids, result)
 
@@ -627,12 +684,13 @@ class AntiEntropyService:
         cutoff_ms: int,
         phases: frozenset[MemberPhase],
         *,
-        settled: bool = False,
+        goal: str | None = None,
     ) -> Exchange:
         """Run one session per peer over its pids.
 
-        ``settled`` counts a pid as reached even with versions past the
-        cutoff: goals use the current time as cutoff, so nothing is left.
+        A ``goal`` (join or drain) counts a pid as reached even with versions
+        past the cutoff: goals use the current time as cutoff, so nothing is
+        left. Its sessions report their progress at INFO.
         """
         result = Exchange()
 
@@ -647,15 +705,19 @@ class AntiEntropyService:
                 self._stats.skipped += 1
                 continue
 
-            sync = self._session(peer, view, stale, cutoff_ms)
+            sync = self._session(peer, view, stale, cutoff_ms, goal)
+            started = time.monotonic()
             ok = await self._guard(peer, sync.sync_roots(pids))
             self._stats.merge(sync.tally, handoff=True)
+
+            if goal is not None:
+                _log_session(goal, peer, len(pids), ok, sync.tally, started)
 
             if not ok:
                 result.failed.add(peer)
                 continue
 
-            _count_reached(result.reached, pids, set() if settled else sync.recent)
+            _count_reached(result.reached, pids, sync.recent if goal is None else set())
 
         return result
 
@@ -807,7 +869,12 @@ class AntiEntropyService:
     # -- sessions and peers --------------------------------------------------
 
     def _session(
-        self, peer: str, view: ReplicaView, stale: asyncio.Event, cutoff_ms: int
+        self,
+        peer: str,
+        view: ReplicaView,
+        stale: asyncio.Event,
+        cutoff_ms: int,
+        goal: str | None = None,
     ) -> PeerSync:
         self._stats.sessions += 1
 
@@ -819,7 +886,7 @@ class AntiEntropyService:
         )
 
         return PeerSync(
-            self.local, peer, self._caller(peer), view, stale, limits, cutoff_ms
+            self.local, peer, self._caller(peer), view, stale, limits, cutoff_ms, goal
         )
 
     def _cutoff_ms(self) -> int:
@@ -854,6 +921,12 @@ class AntiEntropyService:
             self._stats.rejects[exc.code] = self._stats.rejects.get(exc.code, 0) + 1
             if exc.retry_after > 0:
                 self._backoff.defer(peer, exc.retry_after)
+                logger.debug(
+                    "antientropy.session deferred peer=%s code=%s retry_after=%.2fs",
+                    peer,
+                    exc.code,
+                    exc.retry_after,
+                )
                 return
         else:
             self._stats.errors += 1
@@ -987,6 +1060,37 @@ def _count_reached(reached: dict[int, int], pids: list[int], recent: set[int]) -
     for pid in pids:
         if pid not in recent:
             reached[pid] = reached.get(pid, 0) + 1
+
+
+def _log_session(
+    goal: str, peer: str, pids: int, ok: bool, tally: SessionTally, started: float
+) -> None:
+    logger.info(
+        "antientropy.%s session %s peer=%s pids=%d diverged=%d "
+        "pulled=%d (%s) pushed=%d (%s) in %.2fs",
+        goal,
+        "done" if ok else "stopped",
+        peer,
+        pids,
+        tally.pids_diverged,
+        tally.pulled,
+        human_bytes(tally.pulled_bytes),
+        tally.pushed,
+        human_bytes(tally.pushed_bytes),
+        time.monotonic() - started,
+    )
+
+
+def _log_incomplete(goal: str, passes: int, stale: asyncio.Event, retry: float) -> None:
+    if stale.is_set():
+        logger.debug(
+            "antientropy.%s pass=%d interrupted by a view change", goal, passes
+        )
+        return
+
+    logger.debug(
+        "antientropy.%s pass=%d incomplete, retrying in %.2fs", goal, passes, retry
+    )
 
 
 async def _pause(delay: float, stale: asyncio.Event) -> None:

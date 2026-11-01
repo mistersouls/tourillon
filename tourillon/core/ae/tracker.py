@@ -17,9 +17,12 @@
 A ring change, or a ring member changing phase (a JOINING node becoming
 READY, a READY one starting to drain), invalidates the current view at once: running sessions are
 told to stop, and the responder answers ``not_ready`` instead of comparing
-partitions whose replicas may just have moved. The map is rebuilt only after
-``settle_delay`` without further change, so a burst of membership updates
-(a node joining announces several phases in a row) costs one rebuild.
+partitions whose replicas may just have moved. The map is rebuilt once the
+membership stays quiet for ``settle_quiet``, each further change restarting
+that wait, and at the latest ``settle_delay`` after the first change. A burst
+of membership updates (a node joining announces several phases in a row)
+costs one rebuild, an isolated change is picked up almost at once, and
+continuous churn still gets a fresh view.
 """
 
 import asyncio
@@ -39,12 +42,14 @@ class ViewTracker:
         partitioner: Partitioner,
         replication_factor: int,
         settle_delay: float,
+        settle_quiet: float = 0.5,
     ) -> None:
         self._node_id = node_id
         self._topologymgr = topologymgr
         self._partitioner = partitioner
         self._rf = replication_factor
         self._settle_delay = settle_delay
+        self._settle_quiet = min(settle_quiet, settle_delay)
         self._view: ReplicaView | None = None
 
         # Set when the current view is invalidated; replaced on each rebuild
@@ -61,6 +66,11 @@ class ViewTracker:
     @property
     def settle_delay(self) -> float:
         return self._settle_delay
+
+    @property
+    def settle_quiet(self) -> float:
+        """Usual wait for a rebuild; the retry hint of refused sessions."""
+        return self._settle_quiet
 
     def stale_signal(self) -> asyncio.Event:
         """Event set as soon as the view current at call time is invalidated."""
@@ -87,11 +97,63 @@ class ViewTracker:
 
     async def _run(self) -> None:
         generation = await self._rebuild()
+        loop = asyncio.get_running_loop()
+
         while True:
-            await self._topologymgr.wait_for_change(generation)
+            generation = await self._topologymgr.wait_for_change(generation)
             self._invalidate()
-            await asyncio.sleep(self._settle_delay)
+            logger.info(
+                "antientropy.view invalidated generation=%d quiet=%.2fs max=%.2fs",
+                generation,
+                self._settle_quiet,
+                self._settle_delay,
+            )
+
+            started = loop.time()
+            changes, capped = await self._settle(generation)
             generation = await self._rebuild()
+            self._log_settled(loop.time() - started, changes, capped)
+
+    async def _settle(self, generation: int) -> tuple[int, bool]:
+        """Wait for ``settle_quiet`` without change, at most ``settle_delay``.
+
+        Returns the number of changes coalesced into the coming rebuild and
+        whether the wait was cut short by ``settle_delay``.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._settle_delay
+        changes = 1
+
+        while (remaining := deadline - loop.time()) > 0:
+            wait = min(self._settle_quiet, remaining)
+            try:
+                generation = await asyncio.wait_for(
+                    self._topologymgr.wait_for_change(generation), wait
+                )
+            except TimeoutError:
+                # A wait shortened by the deadline ends at the cap, not in quiet.
+                return changes, wait < self._settle_quiet
+
+            changes += 1
+            logger.debug(
+                "antientropy.view settle extended generation=%d changes=%d",
+                generation,
+                changes,
+            )
+
+        return changes, self._settle_delay > 0
+
+    def _log_settled(self, elapsed: float, changes: int, capped: bool) -> None:
+        if capped:
+            logger.warning(
+                "antientropy.view rebuilt under churn after %.2fs changes=%d: "
+                "membership kept changing for settle_delay",
+                elapsed,
+                changes,
+            )
+            return
+
+        logger.info("antientropy.view settled after %.2fs changes=%d", elapsed, changes)
 
     def _invalidate(self) -> None:
         self._view = None

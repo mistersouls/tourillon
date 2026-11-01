@@ -618,8 +618,12 @@ class AntiEntropyConfig:
     - ``grace``: versions written less than this many seconds ago are ignored;
       they are still in flight through the write path and its obligations.
       Join and drain goals ignore it: they compare everything written so far.
-    - ``settle_delay``: wait after a ring change before resuming, so a burst of
-      membership updates triggers one replica-map rebuild, not many.
+    - ``settle_quiet``: silence, in seconds, the replica map waits for after a
+      ring change before rebuilding; every further change restarts it, so a
+      burst of membership updates triggers one rebuild, not many. Clamped to
+      ``settle_delay``. It is also the retry hint of a refused session.
+    - ``settle_delay``: upper bound on that wait, so continuous membership
+      churn still gets a fresh replica map.
     - ``concurrency``: anti-entropy requests this node serves at once as
       responder; extra requests are refused with ``busy`` instead of
       queueing. The initiator side runs one session at a time.
@@ -647,6 +651,7 @@ class AntiEntropyConfig:
     jitter: float = 0.2
     grace: float = 120.0
     settle_delay: float = 5.0
+    settle_quiet: float = 0.5
     concurrency: int = 4
     pids_per_cycle: int = 4096
     keys_per_request: int = 1024
@@ -663,6 +668,7 @@ class AntiEntropyConfig:
             "jitter": self.jitter,
             "grace": self.grace,
             "settle_delay": self.settle_delay,
+            "settle_quiet": self.settle_quiet,
             "concurrency": self.concurrency,
             "pids_per_cycle": self.pids_per_cycle,
             "keys_per_request": self.keys_per_request,
@@ -686,6 +692,7 @@ class AntiEntropyConfig:
             jitter=_ae_number(document, "jitter", 0.2, minimum=0.0, maximum=1.0),
             grace=_ae_number(document, "grace", 120.0, minimum=0.0),
             settle_delay=_ae_number(document, "settle_delay", 5.0, minimum=0.0),
+            settle_quiet=_ae_number(document, "settle_quiet", 0.5, minimum=0.0),
             concurrency=_ae_int(document, "concurrency", 4, 1),
             pids_per_cycle=_ae_int(document, "pids_per_cycle", 4096, 1),
             keys_per_request=_ae_int(document, "keys_per_request", 1024, 1),

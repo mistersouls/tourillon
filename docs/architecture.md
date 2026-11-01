@@ -410,7 +410,9 @@ replicate with `not_replica`.
 
 `ViewTracker` rebuilds a `ReplicaView` (the replica tuple of every pid, built
 off the hot path and yielding every 4096 pids) whenever the ring or a ring member's phase changes,
-after `settle_delay` so a burst of updates causes one rebuild. Every request
+once membership stays quiet for `settle_quiet` (each further change restarts
+that wait) and at the latest `settle_delay` after the first change, so a burst
+of updates causes one rebuild while an isolated change is picked up at once. Every request
 carries a `Scope`: its pids plus a 16-byte hash of the replica tuples the
 sender computed for them. The responder recomputes it and refuses with
 `stale_view` on mismatch, so both sides always reason about the same
@@ -479,7 +481,8 @@ A maximal record (16 MiB value) always fits one batch on its own.
 | `min_interval` | `1` | floor between two units |
 | `jitter` | `0.2` | relative spread of every delay |
 | `grace` | `120` | seconds before a version is compared |
-| `settle_delay` | `5` | wait after a ring change before rebuilding the view |
+| `settle_delay` | `5` | longest wait after a ring change before rebuilding the view |
+| `settle_quiet` | `0.5` | quiet period that ends that wait early; retry hint of `not_ready` / `stale_view` |
 | `concurrency` | `4` | requests served at once as responder |
 | `pids_per_cycle` | `4096` | pids per unit |
 | `keys_per_request` | `1024` | keys per page while descending |

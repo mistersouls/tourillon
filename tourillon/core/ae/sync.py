@@ -51,12 +51,15 @@ the data and its digests *are* the state.
 """
 
 import asyncio
+import logging
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from tourillon.core.ae.local import LocalStore
 from tourillon.core.ae.view import ReplicaView
+from tourillon.core.log import logger
 from tourillon.core.models.antientropy import (
     MAX_BATCH_BYTES,
     MAX_PAGE_LIMIT,
@@ -103,6 +106,11 @@ class SessionTally:
     keys_scanned: int = 0
     pushed: int = 0
     pulled: int = 0
+    pushed_bytes: int = 0
+    pulled_bytes: int = 0
+
+    def copied(self) -> tuple[int, int, int, int]:
+        return self.pulled, self.pulled_bytes, self.pushed, self.pushed_bytes
 
 
 @dataclass(frozen=True)
@@ -123,6 +131,7 @@ class PeerSync:
         stale: asyncio.Event,
         limits: SessionLimits,
         cutoff_ms: int,
+        goal: str | None = None,
     ) -> None:
         self._local = local
         self._peer = peer
@@ -138,6 +147,12 @@ class PeerSync:
         self._cutoff_ms = cutoff_ms
         self.tally = SessionTally()
 
+        # Join and drain goals report every page at INFO: they may walk
+        # thousands of pids, and the operator waits for them. Sweeps run in
+        # the background and report at DEBUG.
+        self._goal = goal
+        self._level = logging.INFO if goal else logging.DEBUG
+
         # Differing pids where this node holds versions at or past the cutoff
         # bucket: those versions were not compared yet, so the pid is not
         # fully reconciled even when the session succeeds.
@@ -151,10 +166,47 @@ class PeerSync:
         ViewChangedError, BudgetSpentError or the transport / reject error that
         stopped it.
         """
-        for start in range(0, len(pids), MAX_PIDS_PER_REQUEST):
-            await self._sync_root_page(pids[start : start + MAX_PIDS_PER_REQUEST])
+        pages = -(-len(pids) // MAX_PIDS_PER_REQUEST)
 
-    async def _sync_root_page(self, pids: Sequence[int]) -> None:
+        for index, start in enumerate(range(0, len(pids), MAX_PIDS_PER_REQUEST)):
+            page = pids[start : start + MAX_PIDS_PER_REQUEST]
+            before = self.tally.copied()
+            started = time.monotonic()
+            diverged = await self._sync_root_page(page)
+            self._report_page(index + 1, pages, page, diverged, before, started)
+
+    def _report_page(
+        self,
+        index: int,
+        pages: int,
+        pids: Sequence[int],
+        diverged: int,
+        before: tuple[int, int, int, int],
+        started: float,
+    ) -> None:
+        pulled, pulled_bytes, pushed, pushed_bytes = (
+            now - then for now, then in zip(self.tally.copied(), before, strict=True)
+        )
+        logger.get().log(
+            self._level,
+            "antientropy.%s page %d/%d peer=%s pids=%d..%d (%d) diverged=%d "
+            "pulled=%d (%s) pushed=%d (%s) in %.2fs",
+            self._goal or "sweep",
+            index,
+            pages,
+            self._peer,
+            pids[0],
+            pids[-1],
+            len(pids),
+            diverged,
+            pulled,
+            human_bytes(pulled_bytes),
+            pushed,
+            human_bytes(pushed_bytes),
+            time.monotonic() - started,
+        )
+
+    async def _sync_root_page(self, pids: Sequence[int]) -> int:
         local = await self._local.roots(pids)
 
         request = RootsRequest(
@@ -171,6 +223,8 @@ class PeerSync:
 
         for pid in sorted(differing):
             await self.sync_pid(pid)
+
+        return len(differing)
 
     async def sync_pid(self, pid: int) -> None:
         scope = self._scope((pid,))
@@ -317,6 +371,7 @@ class PeerSync:
             )
 
             self.tally.pushed += _count(response, "applied")
+            self.tally.pushed_bytes += _size(records)
 
     async def _pull(self, scope: Scope, pid: int, keys: list[bytes]) -> None:
         requested = set(keys)
@@ -338,6 +393,7 @@ class PeerSync:
                 self._local.foreign(record)
 
             self.tally.pulled += await self._local.apply(pid, records)
+            self.tally.pulled_bytes += _size(records)
 
     def _scope(self, pids: Sequence[int]) -> Scope:
         return Scope(tuple(pids), self._view.view_hash(pids))
@@ -355,6 +411,25 @@ class PeerSync:
     def _spend_repairs(self) -> None:
         if self.tally.pushed + self.tally.pulled >= self._limits.max_repairs:
             raise BudgetSpentError("repairs")
+
+
+def _size(records: Sequence[Record]) -> int:
+    """Value bytes carried by ``records``."""
+    return sum(len(record.value.data) for record in records)
+
+
+def human_bytes(count: int) -> str:
+    """Format a byte count for logs, in binary units."""
+    if count < 1024:
+        return f"{count} B"
+
+    size = count / 1024
+    for unit in ("KiB", "MiB"):
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+
+    return f"{size:.1f} GiB"
 
 
 def _wanted(record: Record, pid: int, requested: set[bytes]) -> bool:

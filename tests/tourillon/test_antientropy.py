@@ -22,6 +22,7 @@ exercised together.
 
 import asyncio
 import contextlib
+import dataclasses
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,7 +36,9 @@ from tourillon.core.ae.sync import (
     PeerSync,
     SessionLimits,
     ViewChangedError,
+    human_bytes,
 )
+from tourillon.core.ae.tracker import ViewTracker
 from tourillon.core.ae.view import ReplicaView, build_view
 from tourillon.core.exceptions import AntiEntropyRejectError
 from tourillon.core.gossip.topology import TopologyManager
@@ -497,6 +500,26 @@ async def test_responder_refusals_defer_the_peer(cluster: _Cluster) -> None:
     assert a.stats.last_failure is not None
 
 
+async def test_refused_sessions_retry_after_the_quiet_period(
+    cluster: _Cluster, caplog: pytest.LogCaptureFixture
+) -> None:
+    members = [_member(n) for n in TOKENS]
+    config = AntiEntropyConfig(grace=10.0, settle_delay=5.0, settle_quiet=0.25)
+    a = await cluster.node("node-a", await _topology(*members), config)
+    await cluster.node("node-b", await _topology(*members), config, serve=False)
+    view = _view(a)
+    await _write(a, [_shared_records(view, "node-b")[0]])
+
+    with caplog.at_level("DEBUG", logger="tourillon.global"):
+        await a.run_unit(
+            Unit("node-b", view.shared["node-b"]), view, a.tracker.stale_signal()
+        )
+
+    assert a.stats.rejects == {AntiEntropyRejectError.NOT_READY: 1}
+    assert "antientropy.session deferred peer=node-b" in caplog.text
+    assert "retry_after=0.25s" in caplog.text
+
+
 async def test_stale_view_is_refused_when_rings_disagree(cluster: _Cluster) -> None:
     a = await cluster.node("node-a", await _topology(*(_member(n) for n in TOKENS)))
     await cluster.node("node-b", await _topology(_member("node-b")))
@@ -700,6 +723,88 @@ async def test_tracker_invalidates_then_rebuilds_on_ring_change(
     assert view.serial != first.serial
     assert any("node-c" in r for r in view.replicas)
     assert not a.tracker.stale_signal().is_set()
+
+
+def _toggled(epoch: int) -> Member:
+    """node-c entering (even epoch) or leaving (odd epoch) the ring."""
+    phase = MemberPhase.READY if epoch % 2 == 0 else MemberPhase.IDLE
+    return dataclasses.replace(_member("node-c"), epoch=epoch, phase=phase)
+
+
+@contextlib.asynccontextmanager
+async def _tracking(
+    topology: TopologyManager, settle_delay: float, settle_quiet: float
+) -> AsyncIterator[ViewTracker]:
+    tracker = ViewTracker(
+        "node-a", topology, PARTITIONER, RF, settle_delay, settle_quiet
+    )
+    tracker.start()
+    await tracker.wait_ready()
+    try:
+        yield tracker
+    finally:
+        await tracker.stop()
+
+
+async def test_tracker_rebuilds_an_isolated_change_after_the_quiet_period(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    topology = await _topology(_member("node-a"), _member("node-b"))
+
+    async with _tracking(topology, settle_delay=30.0, settle_quiet=0.05) as tracker:
+        with caplog.at_level("INFO", logger="tourillon.global"):
+            stale = tracker.stale_signal()
+            await topology.apply_member(_member("node-c"))
+            await asyncio.wait_for(stale.wait(), 2)
+            view = await asyncio.wait_for(tracker.wait_ready(), 2)
+
+    assert any("node-c" in r for r in view.replicas)
+    assert "antientropy.view invalidated" in caplog.text
+    assert "antientropy.view settled after" in caplog.text
+    assert "changes=1" in caplog.text
+
+
+async def test_tracker_coalesces_a_burst_of_changes_into_one_rebuild(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    topology = await _topology(_member("node-a"), _member("node-b"))
+
+    async with _tracking(topology, settle_delay=30.0, settle_quiet=0.2) as tracker:
+        with caplog.at_level("DEBUG", logger="tourillon.global"):
+            stale = tracker.stale_signal()
+            for epoch in (2, 3, 4):
+                await topology.apply_member(_toggled(epoch))
+                await asyncio.sleep(0.02)
+            await asyncio.wait_for(stale.wait(), 2)
+            await asyncio.wait_for(tracker.wait_ready(), 2)
+
+    assert caplog.text.count("antientropy.view rebuilt") == 1
+    assert caplog.text.count("antientropy.view settle extended") == 2
+    assert "changes=3" in caplog.text
+
+
+async def test_tracker_rebuilds_at_the_settle_delay_under_continuous_churn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    topology = await _topology(_member("node-a"), _member("node-b"))
+
+    async with _tracking(topology, settle_delay=0.2, settle_quiet=0.1) as tracker:
+        with caplog.at_level("INFO", logger="tourillon.global"):
+            stale = tracker.stale_signal()
+            epoch = 2
+            while tracker.view is None or tracker.stale_signal() is stale:
+                assert epoch < 100, "the view was never rebuilt"
+                await topology.apply_member(_toggled(epoch))
+                epoch += 1
+                await asyncio.sleep(0.03)
+
+    churn = [r for r in caplog.records if "rebuilt under churn" in r.getMessage()]
+    assert churn and churn[0].levelname == "WARNING"
+
+
+def test_tracker_clamps_the_quiet_period_to_the_settle_delay() -> None:
+    tracker = ViewTracker("node-a", TopologyManager(), PARTITIONER, RF, 0.0, 0.5)
+    assert tracker.settle_quiet == 0.0
 
 
 async def test_build_view_matches_the_replica_walk() -> None:
@@ -1218,6 +1323,63 @@ async def test_joining_node_copies_each_partition_from_its_primary_only(
         assert record.key.to_bytes(Keyspace.TAGS) not in await _owned(
             c, record.key.pid.value
         )
+
+
+async def test_join_reports_every_page_and_the_data_it_copied(
+    cluster: _Cluster, caplog: pytest.LogCaptureFixture
+) -> None:
+    a, b, c = await _joining_cluster(cluster)
+    services = {"node-a": a, "node-b": b}
+    split = _split_by_primary(_view(c))
+    copied = [r for records in split.values() for r in records]
+    size = sum(len(r.value.data) for r in copied)
+
+    for primary, records in split.items():
+        await _write(services[primary], records)
+
+    with caplog.at_level("INFO", logger="tourillon.global"):
+        await asyncio.wait_for(c.wait_joined(), 5)
+
+    pages = [m for m in caplog.messages if m.startswith("antientropy.join page")]
+    sessions = [m for m in caplog.messages if "antientropy.join session" in m]
+    assert len(pages) == len(split) and len(sessions) == len(split)
+    assert all(" 1/1 " in m and "diverged=" in m for m in pages)
+    assert all("session done" in m for m in sessions)
+    assert c.stats.pulled == len(copied) and c.stats.bytes_pulled == size
+    assert f"pulled={len(copied)} ({size} B)" in caplog.text
+    assert "antientropy.join synced" in caplog.text
+
+
+async def test_sweep_pages_are_reported_at_debug_only(
+    cluster: _Cluster, caplog: pytest.LogCaptureFixture
+) -> None:
+    members = [_member(n) for n in TOKENS]
+    a = await cluster.node("node-a", await _topology(*members))
+    await cluster.node("node-b", await _topology(*members))
+    view = _view(a)
+    unit = Unit("node-b", view.shared["node-b"])
+
+    with caplog.at_level("INFO", logger="tourillon.global"):
+        await a.run_unit(unit, view, a.tracker.stale_signal())
+    assert "antientropy.sweep page" not in caplog.text
+
+    with caplog.at_level("DEBUG", logger="tourillon.global"):
+        await a.run_unit(unit, view, a.tracker.stale_signal())
+    assert "antientropy.sweep page 1/1 peer=node-b" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("count", "text"),
+    [
+        (0, "0 B"),
+        (1023, "1023 B"),
+        (1536, "1.5 KiB"),
+        (5 * 1024**2, "5.0 MiB"),
+        (3 * 1024**3, "3.0 GiB"),
+    ],
+)
+def test_human_bytes_uses_binary_units(count: int, text: str) -> None:
+    assert human_bytes(count) == text
 
 
 async def test_join_falls_back_to_other_sources_when_the_primary_is_down(

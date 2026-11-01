@@ -172,7 +172,7 @@ class AntiEntropyResponder:
             raise AntiEntropyRejectError(
                 AntiEntropyRejectError.NOT_READY,
                 "anti-entropy is not serving",
-                self._tracker.settle_delay,
+                self._tracker.settle_quiet,
             )
 
         if not view.covers(scope.pids):
@@ -186,7 +186,7 @@ class AntiEntropyResponder:
             raise AntiEntropyRejectError(
                 AntiEntropyRejectError.STALE_VIEW,
                 "replica views differ",
-                self._tracker.settle_delay,
+                self._tracker.settle_quiet,
             )
 
         if write and not all(view.is_replica(pid) for pid in scope.pids):
