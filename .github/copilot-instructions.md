@@ -33,7 +33,7 @@ uv run ruff check <files>
 runtime (~60 s without them, ~230 s with). Use `-m "not e2e" --no-cov` while you work, then run the
 full `uv run pytest` once before declaring the change done.
 
-**Do not run `black .` or `ruff check --fix .`.** The repository has pre-existing, repo-wide formatting debt; a global run creates a huge unrelated diff. Lint and format only the files you changed, and ignore pre-existing violations elsewhere.
+**Do not run `black .` or `ruff check --fix .`.** These mutating commands can create unrelated changes. Lint and format only the files you changed; CI checks changed files by design.
 
 ## Layering (the most common source of mistakes)
 

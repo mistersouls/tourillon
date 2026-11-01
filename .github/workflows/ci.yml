@@ -71,10 +71,7 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --extra dev --python 3.14
 
-      # The repository carries pre-existing, repo-wide formatting debt, so a
-      # global `ruff check .` / `black --check .` would always fail. Gate only
-      # the Python files touched by this push or pull request, which keeps new
-      # code clean while the backlog is paid down incrementally.
+      # Gate only the Python files touched by this push or pull request.
       - name: Resolve changed Python files
         id: changed
         shell: bash

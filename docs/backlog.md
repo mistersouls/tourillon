@@ -48,7 +48,6 @@ Use [`.github/prompts/fix-bug.prompt.md`](../.github/prompts/fix-bug.prompt.md) 
 
 | # | Item | Evidence |
 | --- | --- | --- |
-| D1 | **Repo-wide lint and format debt.** `uv run ruff check .` reports 109 errors (mostly `I001` import ordering) and `uv run black --check .` would rewrite 168 files. Until this is paid down, contributors and CI must lint only changed files. Pay it down deliberately, in a dedicated formatting-only PR, never mixed with behaviour changes. | `uv run ruff check .`, `uv run black --check .` |
 | D2 | **`tourclient` is not in the coverage gate.** `--cov` covers `tourillon`, `tourctl` and `tourlib` only, so the entire client library's coverage is unmeasured. | `pyproject.toml` (`addopts`) |
 | D3 | **Under-tested runtime internals.** The weakest modules are the peer pool, storage group, node lifecycle, anti-entropy join/drain goals, transport session, phi-accrual detector and gossip bootstrapper — exactly the code paths where distributed bugs hide. | `uv run pytest --cov-report=term-missing` |
 | D4 | **E2E relies on bounded polling.** `Journey.wait_for` polls with short sleeps and fixed budgets (`COMMAND_TIMEOUT`, `CONVERGENCE_TIMEOUT`, `SCENARIO_TIMEOUT`); these may be tight on loaded CI runners. Prefer waiting on observable state and keep the budgets reviewed. | `tests/e2e/journey.py` |

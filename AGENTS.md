@@ -77,18 +77,15 @@ computed over the whole suite.
 
 Baseline you can rely on: **the test suite is green** (705 tests, ~93.9% coverage).
 
-### Formatting debt — read before running a formatter
+### Formatting and linting
 
-`ruff check .` and `black --check .` currently fail **repo-wide on pre-existing code**, not because of your change.
-Therefore:
-
-- **Never run `black .` or `ruff check --fix .` across the whole repository.** That produces a multi-thousand-line diff that buries your actual change and will be rejected.
-- Format and lint **only the files you touched**:
+- **Never run `black .` or `ruff check --fix .` across the whole repository.** These mutating commands can create a large unrelated diff.
+- Format and lint only the files you touched:
   ```bash
   uv run black tourillon/core/services/store.py
   uv run ruff check tourillon/core/services/store.py
   ```
-- Treat pre-existing violations in files you did not touch as out of scope.
+- CI deliberately limits lint and format checks to changed files.
 
 ---
 

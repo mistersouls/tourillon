@@ -20,9 +20,8 @@ Run the test suite with its configured coverage threshold:
 uv run pytest
 ```
 
-Before submitting changes, run the checks on the files you changed. The
-repository has some pre-existing repository-wide lint and formatting debt
-(see [Backlog item D1](backlog.md)).
+Before submitting changes, run the checks on the files you changed. CI
+deliberately scopes lint and format checks to those files.
 
 ```bash
 uv run pre-commit run --files path/to/changed_file.py

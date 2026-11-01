@@ -13,7 +13,7 @@ applyTo: ".github/workflows/**,scripts/**,**/pyproject.toml,.pre-commit-config.y
 
 ## Workflows
 
-- `ci.yml` runs on pushes and pull requests: tests with the coverage gate, plus lint/format **restricted to changed files** (the repository has pre-existing formatting debt, so a global check would always fail).
+- `ci.yml` runs on pushes and pull requests: tests with the coverage gate, plus lint/format **restricted to changed files**.
 - `release-dist.yml` builds native bundles for six platform targets, verifies the installers, runs the real-process E2E journey against the installed executable, and publishes archives on tags.
 - `copilot-setup-steps.yml` pre-installs the toolchain for the Copilot coding agent. Keep its setup steps in sync with `ci.yml`.
 - Pin actions to a major version, keep `uv sync --locked` in CI so a stale lockfile fails loudly, and always upload E2E artifacts with `if: always()`.
