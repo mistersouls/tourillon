@@ -126,6 +126,22 @@ class LmdbBatch:
         )
         self._items.append(item)
 
+    def keys(
+        self,
+        keyspace: Keyspace,
+        prefix: SupportsBytes | None = None,
+        start: bytes | None = None,
+        limit: int = 64,
+        reverse: bool = False,
+    ) -> None:
+        self._items.append(
+            BatchItem(
+                fn=self._txn.keys,
+                args=(keyspace, prefix, start, limit, reverse),
+                kwargs={},
+            )
+        )
+
     def _flush(self) -> None:
         results = []
         try:

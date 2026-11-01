@@ -275,11 +275,13 @@ class _LookupSpy(_StoreSpy):
         self.lookups: list[Key] = []
         self.lookup_error: StoreOperationError | None = None
 
-    async def read_at(self, key: Key) -> Record | None:
+    async def lookup(self, key: Key):
         if self.lookup_error is not None:
             raise self.lookup_error
         self.lookups.append(key)
-        return self.record
+        from tourillon.core.models.repair import VersionLookup
+
+        return VersionLookup(self.record)
 
 
 @pytest.mark.tourillon
@@ -301,7 +303,7 @@ async def test_replication_lookup_handler_returns_the_exact_version(
     payload = manager.serializer.decode(responses[0].payload)
 
     assert responses[0].kind == "replication.lookup.accept"
-    assert Record.from_dict(payload) == record
+    assert Record.from_dict(payload["record"]) == record
     assert manager.store.lookups == [record.key]
 
 
@@ -322,7 +324,7 @@ async def test_replication_lookup_handler_answers_none_when_absent(
     responses = [response async for response in replication_handler.lookup(request)]
 
     assert responses[0].kind == "replication.lookup.accept"
-    assert manager.serializer.decode(responses[0].payload) is None
+    assert manager.serializer.decode(responses[0].payload)["record"] is None
 
 
 @pytest.mark.tourillon

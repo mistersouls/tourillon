@@ -39,7 +39,9 @@ from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports import Telemetry
 from tourillon.core.ports.storage import Storage
 from tourillon.core.services.antientropy import AntiEntropyService
+from tourillon.core.services.gc import GarbageCollector
 from tourillon.core.services.store import StoreService
+from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourillon.core.transports.server import EnvelopeServer
 from tourlib import Serializer, ValidationError
@@ -80,6 +82,7 @@ class NodeLifecycle:
         telemetry: Telemetry,
         store: StoreService,
         placement_strategy: PlacementStrategy,
+        gc: GarbageCollector,
         obligations: ObligationQueue | None = None,
     ) -> None:
         self._config = config
@@ -126,8 +129,10 @@ class NodeLifecycle:
             serializer=serializer,
             replication_factor=config.placement.replication_factor,
             config=config.placement.anti_entropy,
+            retention=RetentionPolicy(config.placement.retention),
             obligations=obligations,
             telemetry=telemetry,
+            notify=gc.submit,
         )
 
         self._state_file = Path(self._config.storage.data_dir) / NODE_STATE_FILENAME

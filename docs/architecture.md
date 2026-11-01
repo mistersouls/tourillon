@@ -219,14 +219,20 @@ A write that misses its requested `quorum_write` is **not rolled back**: the ver
 
 1. The client hands the handle back through `kv.repair`.
 2. The receiving node decodes it, recomputes the partition id from the address and refuses a mismatch or an implausibly distant timestamp — all local, before any RPC.
-3. `replication.lookup` asks each replica whether it holds that exact version; a copy held by a stand-in can serve as the source but never counts as its owner's durability.
+3. `replication.lookup` returns one snapshot containing the exact source, up to X retained version identities and whether X newer versions exclude the requested one. A copy held by a stand-in can serve as the source but never counts as its owner's durability.
 4. Missing owners receive the version, and the requested quorum is verified again — so a repair may itself report a quorum failure, with the same handle, and be retried.
 
-The handle makes a partial write resumable instead of pushing the operator towards a second write under a new timestamp.
+Repair remains exact: it never substitutes a newer version. If an exact source
+still exists, repair may restore that history even on replicas holding X newer
+versions; subsequent GC may collect it again. When no source is found and
+observed retention evidence establishes that the requested quorum is
+unavailable, it rejects with `outdated`, the token and newer identities with
+observed owner counts. Unknown or unreachable replicas alone do not establish
+that diagnostic. A collected historical token is not guaranteed repairable.
 
 ### Replication obligations
 
-An obligation states that one node must eventually hold one exact version.
+An obligation states that one target must receive a version whose HLC is at least `required_ts`.
 It is the single form of replication debt: the write path (handoff and failed
 replica writes) and read repair produce it, anti-entropy consumes it.
 
@@ -251,10 +257,9 @@ META value := empty
 
 Delivery (`AntiEntropyService.deliver`) takes bounded batches from the queue
 and pushes the versions through `antientropy.push`, grouped per target and
-partition. An obligation is removed once its target accepted the version.
-It is dropped without a copy when the version is gone, or when its target no
-longer replicates the partition in the current target view: the sweep and
-the drain goal cover that version instead. Obligations of a target that is
+partition. The immutable timestamped identity is unchanged; delivery loads the latest local version once per address and groups covered debts into one send per target/key, even across byte-batch boundaries. Only captured, covered identities are removed after a validated acknowledgement; concurrent new debts remain. `applied`, `already_present` and `ignored_retention` account explicitly for every submitted record. The last disposition satisfies delivery, not proof that the exact version is stored, and never counts as an exact write or repair quorum acknowledgement.
+
+Missing covering data is logged and its debt remains durable. A debt is dropped without delivery only when its target no longer replicates the partition in the current target view. Obligations of a target that is
 suspected, unknown or refusing stay in `META`, the target is backed off and
 the backlog is reloaded later. Obligations take priority over the periodic
 sweep: a sweep unit waits until the queue is idle.
@@ -450,6 +455,7 @@ caps the rate.
   or are suspected by the failure detector, are skipped.
 - Per-session budgets: `max_keys_per_cycle` keys listed and
   `max_repairs_per_cycle` versions copied (`BudgetSpentError`).
+- Merge descent saves exclusive key/bucket checkpoints per peer and view, including local-only windows. Completed chunks advance the checkpoint; failed chunks are retried. Partition and root-page order rotates so early differing buckets cannot indefinitely starve later work. Checkpoints reset after a completed traversal or view change and are not persisted across restarts.
 - Writes go through small transactions (`APPLY_BATCH` = 64 records, 8 MiB) and
   every scan yields to the event loop, so client `kv.put/get/delete` are never
   blocked behind a long anti-entropy transaction.
@@ -474,9 +480,10 @@ A maximal record (16 MiB value) always fits one batch on its own.
 
 `[placement.anti_entropy]` in the node configuration (`AntiEntropyConfig`):
 
+Anti-entropy is mandatory: delivery and the periodic sweep always start.
+
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `true` | run the periodic sweep (obligation delivery and the join/drain goals always run) |
 | `sweep_period` | `600` | seconds to compare every unit once |
 | `min_interval` | `1` | floor between two units |
 | `jitter` | `0.2` | relative spread of every delay |
@@ -488,7 +495,7 @@ A maximal record (16 MiB value) always fits one batch on its own.
 | `keys_per_request` | `1024` | keys per page while descending |
 | `max_batch_bytes` | `4 MiB` | payload of one push or fetch |
 | `max_repairs_per_cycle` | `10000` | versions copied by one session |
-| `max_keys_per_cycle` | `1000000` | keys listed by one session |
+| `max_keys_per_cycle` | `1000000` | keys listed by one session; at least 2 for a local/remote merge page |
 | `hotqueue_size` | `4096` | obligations scheduled in memory at once; the rest wait in `META` |
 
 Values are only bounded below; anything an envelope cannot carry is clamped
@@ -496,19 +503,13 @@ and paginated.
 
 ### Known limits
 
-- **GC interplay.** The GC keeps the most recent versions of each address. It
-  must never collect a version that a replica could still push back, or
-  anti-entropy would resurrect it; the GC must therefore collect consistently
-  across replicas (for example only versions older than a horizon well beyond
-  `grace` plus a sweep). The GC is not implemented yet.
+- **Retention policy.** Replicas must use the same X (§12). Every AE scope carries it and a mismatch is explicitly rejected. Historical arrivals outside local top-X are ignored only after X newer versions are durably present in the same local snapshot. Digests represent retained records, not a retirement floor.
 - **Unreachable joins and drains.** A join skips sources that are down, so a
   version held only by a dead node arrives later through the sweep. A drain
   cannot finish while no live replica replaces the node.
 - **Orphaned obligations.** A read-repair obligation recorded on a node after
   its drain finished stays in `META` until delivery drops it as obsolete.
-- **Handoff restart.** A budget stop on a very large orphan partition
-  restarts its descent from the beginning on the next sweep (copies already
-  made are not redone, only rescanned).
+- **Handoff restart.** Budget stops resume in memory; a process restart rechecks data and handoff marks from the beginning.
 - **Digest migration.** Data written before digests were maintained has no
   roots and is invisible to anti-entropy until rewritten.
 - The responder's `range` scan is bounded by the bucket size, not by a budget.
@@ -562,7 +563,7 @@ Storage ──session_provider_for(group)──▶ SessionProvider ──session
 ```
 
 - One session provider per **group**; sessions are short-lived and scoped to read or write.
-- `Session` offers `get`, `put`, `delete`, `last` and `iter`; `Batch` offers the same scheduling API resolved by one `await batch.result()`.
+- `Session` offers `get`, `put`, `delete`, `last`, `iter` and bounded `keys` pages of `KVRef` (key and keyspace); `Batch` offers the scheduling API resolved by one `await batch.result()`. Both key-only APIs use the native cursor with `values=False`, without materializing values or intermediate `KVPair` objects.
 - Keyspaces and record layout live in `tourillon/core/models/storageschema.py`. Keys are length-prefixed byte compositions — never ad-hoc strings.
 - `Storage.latest_hlc(total_groups)` is read at boot to restore the hybrid logical clock so timestamps never move backwards across restarts.
 
@@ -581,7 +582,58 @@ expose its underlying raw session. Paged scans log and skip unreadable
 entries while still advancing their cursor; no transaction stays open while
 the caller consumes a page.
 
+`GroupSession` and `GroupSessionManager` have no retention policy. They expose
+bounded `latest_identities`/`latest_identities_many` reads and atomic `remove`
+operations; the caller selects what may be removed.
+
+`core/storage/retention.py` provides `RetentionPolicy`, an explicit collaborator
+that neither opens transactions nor wraps storage. Callers open
+`GroupSessionManager.session(write=...)` and pass that session to the policy
+only when their use case needs it:
+
+- Store inserts exact writes and hints with `session.put`, without a retention
+  preflight. An acknowledgement means the exact version was stored, not that
+  it will be retained forever. Records, obligations and digests remain atomic.
+- AE calls `policy.apply(session, records)` to prevent repeated reintroduction
+  of collected history. It reports `applied`, `already_present` or
+  `ignored_retention` per input and carries X in scopes to detect mismatches.
+- GC calls `policy.collect(session, keys)` to select versions covered by X
+  newer durable local versions, then removes them atomically.
+- Exact repair lookup calls `policy.lookup(session, key)` for the source and
+  retention evidence. Ordinary reads and writes do not incur these reads.
+
+Policy decisions and mutations use the same caller-owned transaction.
+Admission reads are grouped by distinct address into two metadata batches,
+without loading their payloads. There is one rule implementation, but no
+mandatory wrapper or retention-aware raw session.
+
 Configuration and node state are persisted through the `Persistence` port, TOML by default, with per-path locking and atomic replace.
+
+### Local historical GC
+
+`GarbageCollector` retains the X greatest HLC versions per `(namespace, key)` within each partition, including tombstones. X is at least 1: the current local state is never collected, even on outgoing or orphan partitions. Historical obligations remain useful through a newer retained version; retained outgoing copies remain available to AE until transfers finish. Entire orphan-partition removal, current tombstone removal and file compaction are not implemented.
+
+Collection deletes `LOGS` and `TAGS` and subtracts root/bucket count-XOR contributions in the same write transaction. Empty digest cells are removed; rollback preserves all three surfaces. No `STALE` tag, time floor, remote vote or pre-collection quorum check is used. Reads of the newest X identities use bounded, key-only storage pages without materializing their payloads.
+
+One mandatory worker owns periodic passes, a deduplicated bounded hot queue and internally requested passes. `submit(PartitionAddress)` is a generic notification API with no AE types or network dependency; AE is its first producer. `Manager` owns its start and stop; `NodeLifecycle` requires the GC collaborator to wire notifications to AE. Overflow falls back to the periodic scan. Each transaction handles at most `batch_size` candidates and yields between pages. The manager starts the worker after clock restoration and stops it before closing storage.
+
+AE and GC are mandatory, and their retention configuration is validated.
+This does not impose admission filtering on exact writes: history can exceed X
+until GC runs. The GC notification callback is required.
+
+```toml
+[placement.retention]
+versions = 2
+interval = 600.0
+batch_size = 64
+hotqueue_size = 4096
+```
+
+Bounds: `versions` 1..64, `interval` 0.01..86400 seconds, `batch_size` 1..1024 and `hotqueue_size` 1..65536. **The default retains two versions**; replicas must be configured together. Increasing X cannot recover already collected history.
+
+`manager.gc.request(dry_run=True)` queues a non-mutating estimate; `request()` queues collection. Both use the same protection checks. `manager.gc.status.to_dict()` exposes job ID, queued/running/completed/failed/cancelled state, scanned/collectible counts, serialized value bytes, start time and errors. Estimates are local snapshots, not reservations or predicted filesystem savings; hot work is not processed by the estimating pass. There is deliberately no new `tourctl` command or admin wire endpoint yet.
+
+The contract preserves current state under the replication requested at write time; it does not retain history indefinitely. Free backend pages can be reused, but file size need not decrease after GC.
 
 ---
 
@@ -628,6 +680,6 @@ The following are design decisions that have **not** been settled yet; see [`bac
 
 - Namespaces exist on the wire and in addressing but have no registry, quota, or access-control semantics.
 - Consistency is expressed as raw per-request quorum integers; there is no named consistency-level API.
-- Data anti-entropy heals replicas proactively (§9), but the version GC that bounds storage is not implemented, and its consistency constraint with anti-entropy is not enforced yet.
+- Data anti-entropy heals retained state proactively (§9); historical GC is local top-X (§12). Final current-tombstone removal and whole-orphan reclamation remain out of scope.
 - Placement has no failure-domain (anti-affinity) awareness.
 - Ownership only changes through joins and explicit drains; there is no automatic rebalancing of vnodes.

@@ -233,14 +233,23 @@ class Key:
 @dataclass(frozen=True, slots=True, eq=True)
 class ObligationKey:
     """
-    Durable promise that `target` must eventually hold the version `key`.
+    Immutable debt: `target` must process this address at least through `key.ts`.
 
-    Layout: OBLIGATION | len(target) | target | TAGS(key). Keying by
-    `(target, version)` makes repeated submissions idempotent.
+    A newer stored version may cover the debt. Layout remains OBLIGATION |
+    len(target) | target | TAGS(key); the timestamp identifies the immutable
+    debt, not necessarily the record delivered.
     """
 
     target: str
     key: "Key"
+
+    @property
+    def required_ts(self) -> HLCTimestamp:
+        return self.key.ts
+
+    @property
+    def address(self) -> PartitionAddress:
+        return PartitionAddress(self.key.pid, self.key.address)
 
     def __post_init__(self) -> None:
         _validate_target(self.target)

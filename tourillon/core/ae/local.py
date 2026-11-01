@@ -33,14 +33,21 @@ durable work list of the delivery worker.
 """
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from itertools import groupby
 
 from tourillon.core.log import logger
 from tourillon.core.models.antientropy import record_size
-from tourillon.core.models.storageschema import Key, Keyspace, ObligationKey, Record
+from tourillon.core.models.storageschema import (
+    Key,
+    Keyspace,
+    ObligationKey,
+    PartitionAddress,
+    Record,
+)
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.ports.storage import Storage
+from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.storage.session import (
     OWNED_KINDS,
     DigestCell,
@@ -59,10 +66,24 @@ SCAN_PAGE = 4096
 class LocalStore:
     """Anti-entropy view of the local partition groups."""
 
-    def __init__(self, storage: Storage, partitioner: Partitioner) -> None:
+    def __init__(
+        self,
+        storage: Storage,
+        partitioner: Partitioner,
+        notify: Callable[[PartitionAddress], None],
+        retention: RetentionPolicy,
+    ) -> None:
         self._storage = storage
+        self._retention = retention
         self._partitioner = partitioner
-        self._managers: dict[int, GroupSessionManager] = {}
+        if not callable(notify):
+            raise ValueError("GC notification callback is required")
+        self._notify = notify
+
+    @property
+    def retention_versions(self) -> int:
+        """Policy identifier carried by AE scopes, not an admission decision."""
+        return self._retention.versions
 
     async def roots(self, pids: Sequence[int]) -> dict[int, DigestCell]:
         """Read the root cell of each pid, one read session per group."""
@@ -70,8 +91,9 @@ class LocalStore:
 
         for group, members in groupby(sorted(pids), key=self._partitioner.group_for):
             batch = list(members)
-            manager = await self._manager(group)
 
+            provider = await self._storage.session_provider_for(group)
+            manager = GroupSessionManager(provider)
             async with manager.session() as session:
                 values = await session.roots(batch)
 
@@ -92,9 +114,10 @@ class LocalStore:
         cursor = after
 
         for group in range(first, self._partitioner.total_groups):
-            manager = await self._manager(group)
 
             while len(roots) < limit:
+                provider = await self._storage.session_provider_for(group)
+                manager = GroupSessionManager(provider)
                 async with manager.session() as session:
                     page, more = await session.root_page(cursor, limit - len(roots))
 
@@ -115,8 +138,10 @@ class LocalStore:
         self, pid: int, after: int | None, limit: int
     ) -> tuple[list[tuple[int, DigestCell]], int | None]:
         """One page of the bucket cells of ``pid`` after an exclusive cursor."""
-        manager = await self._manager(self._partitioner.group_for(pid))
+        group = self._partitioner.group_for(pid)
 
+        provider = await self._storage.session_provider_for(group)
+        manager = GroupSessionManager(provider)
         async with manager.session() as session:
             return await session.bucket_page(pid, after, limit)
 
@@ -148,11 +173,13 @@ class LocalStore:
         also counts versions too recent to compare, so the eligible part is
         recomputed by scanning instead.
         """
-        manager = await self._manager(self._group_of(start))
+        group = self._group_of(start)
         cell = DigestCell()
         cursor: bytes | None = start
 
         while cursor is not None:
+            provider = await self._storage.session_provider_for(group)
+            manager = GroupSessionManager(provider)
             async with manager.session() as session:
                 keys, cursor = await session.owned_keys(cursor, stop, SCAN_PAGE)
 
@@ -166,9 +193,19 @@ class LocalStore:
     async def keys(
         self, start: bytes, stop: bytes, limit: int
     ) -> tuple[list[Key], bytes | None]:
-        manager = await self._manager(self._group_of(start))
+        group = self._group_of(start)
+        provider = await self._storage.session_provider_for(group)
+        manager = GroupSessionManager(provider)
         async with manager.session() as session:
-            return await session.owned_keys(start, stop, limit)
+            keys, cursor = await session.owned_keys(start, stop, limit)
+
+        for key in keys:
+            self.notify(key)
+
+        return keys, cursor
+
+    def notify(self, key: Key) -> None:
+        self._notify(PartitionAddress(key.pid, key.address))
 
     async def read(
         self, pid: int, keys: Sequence[Key], max_bytes: int
@@ -179,7 +216,7 @@ class LocalStore:
         at least one key so callers progress even past one oversized value.
         Versions no longer present or not owned are consumed silently.
         """
-        manager = await self._manager(self._partitioner.group_for(pid))
+        group = self._partitioner.group_for(pid)
         records: list[Record] = []
         consumed = 0
         size = 0
@@ -187,6 +224,8 @@ class LocalStore:
         for start in range(0, len(keys), APPLY_BATCH):
             chunk = keys[start : start + APPLY_BATCH]
 
+            provider = await self._storage.session_provider_for(group)
+            manager = GroupSessionManager(provider)
             async with manager.session() as session:
                 found = await session.get_many(chunk)
 
@@ -205,17 +244,48 @@ class LocalStore:
 
     async def apply(self, pid: int, records: Sequence[Record]) -> int:
         """Write owned versions in small transactions; return how many were new."""
-        manager = await self._manager(self._partitioner.group_for(pid))
-        applied = 0
+        result = await self.apply_result(pid, records)
+        return result["applied"]
+
+    async def apply_result(self, pid: int, records: Sequence[Record]) -> dict[str, int]:
+        group = self._partitioner.group_for(pid)
+        result = {"applied": 0, "already_present": 0, "ignored_retention": 0}
 
         for batch in _batches(records):
+            provider = await self._storage.session_provider_for(group)
+            manager = GroupSessionManager(provider)
             async with manager.session(write=True) as session:
-                written = await session.put_many(batch)
+                outcomes = await self._retention.apply(session, batch)
+                for disposition in outcomes:
+                    result[disposition] += 1
 
-            applied += sum(written)
+            for record in batch:
+                self.notify(record.key)
             await asyncio.sleep(0)
 
-        return applied
+        return result
+
+    async def latest_records(
+        self, obligations: Sequence[ObligationKey]
+    ) -> dict[Key, Record]:
+        """Materialize one latest record per address, mapped to captured debts."""
+        found: dict[Key, Record] = {}
+        by_address: dict[PartitionAddress, Record | None] = {}
+
+        for obligation in obligations:
+            address = obligation.address
+            if address not in by_address:
+                group = self._partitioner.group_for(address.pid.value)
+                provider = await self._storage.session_provider_for(group)
+                manager = GroupSessionManager(provider)
+                async with manager.session() as session:
+                    by_address[address] = await session.get(address)
+
+            record = by_address[address]
+            if record is not None and record.key.ts >= obligation.required_ts:
+                found[obligation.key] = record
+
+        return found
 
     async def records(self, keys: Sequence[Key]) -> dict[Key, Record]:
         """Read the owned versions of ``keys``, any group; absent ones are omitted."""
@@ -226,8 +296,9 @@ class LocalStore:
             key=lambda k: self._partitioner.group_for(_pid_of(k)),
         ):
             batch = list(members)
-            manager = await self._manager(group)
 
+            provider = await self._storage.session_provider_for(group)
+            manager = GroupSessionManager(provider)
             async with manager.session() as session:
                 values = await session.get_many(batch)
 
@@ -241,8 +312,8 @@ class LocalStore:
         self, group: int, after: bytes | None, limit: int
     ) -> tuple[list[ObligationKey], bytes | None]:
         """One page of the obligations persisted in ``group``."""
-        manager = await self._manager(group)
-
+        provider = await self._storage.session_provider_for(group)
+        manager = GroupSessionManager(provider)
         async with manager.session() as session:
             return await session.obligation_page(after, limit)
 
@@ -252,16 +323,18 @@ class LocalStore:
             sorted(obligations, key=lambda ob: _pid_of(ob.key)),
             key=lambda ob: self._partitioner.group_for(_pid_of(ob.key)),
         ):
-            manager = await self._manager(group)
 
+            provider = await self._storage.session_provider_for(group)
+            manager = GroupSessionManager(provider)
             async with manager.session(write=True) as session:
                 await session.remove_obligations(list(members))
 
     async def has_obligations(self) -> bool:
         """Whether any group still persists a replication obligation."""
         for group in range(self._partitioner.total_groups):
-            manager = await self._manager(group)
 
+            provider = await self._storage.session_provider_for(group)
+            manager = GroupSessionManager(provider)
             async with manager.session() as session:
                 if await session.has_obligations():
                     return True
@@ -288,15 +361,6 @@ class LocalStore:
 
     def _group_of(self, tags_key: bytes) -> int:
         return self._partitioner.group_for(int.from_bytes(tags_key[:4], "big"))
-
-    async def _manager(self, group: int) -> GroupSessionManager:
-        manager = self._managers.get(group)
-
-        if manager is None:
-            provider = await self._storage.session_provider_for(group)
-            manager = self._managers[group] = GroupSessionManager(provider)
-
-        return manager
 
 
 def _pid_of(key: Key) -> int:

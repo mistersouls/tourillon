@@ -104,9 +104,14 @@ class Scope:
 
     pids: tuple[int, ...]
     view: bytes
+    retention_versions: int
 
     def to_dict(self) -> dict[str, Any]:
-        return {"pids": list(self.pids), "view": self.view}
+        return {
+            "pids": list(self.pids),
+            "view": self.view,
+            "retention_versions": self.retention_versions,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Scope":
@@ -117,7 +122,15 @@ class Scope:
         ):
             raise ValueError("pids must be a non-empty list of integers >= 0")
 
-        return cls(pids=tuple(pids), view=_bytes(data["view"], "view", VIEW_BYTES))
+        versions = _int(data, "retention_versions", 1)
+        if versions > 64:
+            raise ValueError("retention_versions exceeds 64")
+
+        return cls(
+            pids=tuple(pids),
+            view=_bytes(data["view"], "view", VIEW_BYTES),
+            retention_versions=versions,
+        )
 
     @property
     def pid(self) -> int:

@@ -182,6 +182,30 @@ class NoReplicaAvailableError(StoreOperationError):
         )
 
 
+class OutdatedRepairError(StoreOperationError):
+    code = "outdated"
+
+    def __init__(
+        self, token: str, received: int, required: int, newer: list[dict[str, Any]]
+    ) -> None:
+        self.token = token
+        self.received = received
+        self.required = required
+        self.newer = newer
+        self._set_details(
+            "repair", (), "exact version quorum unavailable: version outside retention"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **super().to_dict(),
+            "token": self.token,
+            "received": self.received,
+            "required": self.required,
+            "newer": self.newer,
+        }
+
+
 class InvalidQuorumError(StoreOperationError):
     """Raised when a request asks for a quorum the store cannot record.
 

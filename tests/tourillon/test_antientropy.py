@@ -33,10 +33,12 @@ import pytest
 
 from tests.helpers.telemetry import RecordingTelemetry
 from tourillon.bootstrap.handlers import antientropy as handlers
+from tourillon.core.ae.local import LocalStore
 from tourillon.core.ae.sync import (
     BudgetSpentError,
     PeerSync,
     SessionLimits,
+    SyncProgress,
     ViewChangedError,
     human_bytes,
 )
@@ -44,8 +46,13 @@ from tourillon.core.ae.tracker import ViewTracker
 from tourillon.core.ae.view import ReplicaView, build_view
 from tourillon.core.exceptions import AntiEntropyRejectError
 from tourillon.core.gossip.topology import TopologyManager
-from tourillon.core.models.antientropy import PushRequest, Scope
-from tourillon.core.models.config import AntiEntropyConfig
+from tourillon.core.models.antientropy import (
+    PushRequest,
+    RootsRequest,
+    Scope,
+    decode_record,
+)
+from tourillon.core.models.config import AntiEntropyConfig, RetentionConfig
 from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.models.retry import BackoffRetry
 from tourillon.core.models.storageschema import (
@@ -66,16 +73,43 @@ from tourillon.core.services.antientropy import (
     initiates,
     plan,
 )
+from tourillon.core.services.gc import GarbageCollector
 from tourillon.core.spaces.hashspace import HashSpace
+from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.storage.session import DigestCell, GroupSessionManager
 from tourillon.infra.storage.lmdb_session import LmdbConfig, LmdbSessionProvider
 from tourlib.adapter import MsgPackSerializer
 from tourlib.envelope import Envelope, build_envelope
-from tourlib.exceptions import ProtocolError
+from tourlib.exceptions import ProtocolError, ValidationError
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
 
 pytestmark = pytest.mark.tourillon
+
+
+@pytest.mark.parametrize(
+    "versions, notify",
+    [
+        (None, lambda address: None),
+        (0, lambda address: None),
+        (2, None),
+    ],
+)
+def test_local_ae_rejects_missing_retention_or_gc_notification(
+    tmp_path: Path,
+    versions: int,
+    notify,
+) -> None:
+    with pytest.raises(
+        (ValueError, ValidationError), match="retention.versions|GC notification"
+    ):
+        LocalStore(
+            _Storage(tmp_path),
+            PARTITIONER,
+            notify,
+            RetentionPolicy(RetentionConfig(versions=versions)),
+        )
+
 
 SERIALIZER = MsgPackSerializer()
 # 16 partitions in 2 groups over an 8-bit ring.
@@ -238,13 +272,17 @@ class _Cluster:
         *,
         serve: bool = True,
         telemetry: RecordingTelemetry | None = None,
+        retention_versions: int = 64,
     ) -> AntiEntropyService:
         storage = _Storage(self._tmp_path / node_id)
         self.storages.append(storage)
+        policy = RetentionConfig(versions=retention_versions)
+        retention = RetentionPolicy(policy)
 
         service = AntiEntropyService(
             node_id=node_id,
-            storage=storage,  # type: ignore[arg-type]
+            storage=storage,
+            retention=retention,
             partitioner=PARTITIONER,
             topologymgr=topology,
             peer_pool=self.network.pool(),  # type: ignore[arg-type]
@@ -254,6 +292,7 @@ class _Cluster:
             clock=lambda: NOW,
             backoff=BackoffRetry(initial_delay=0.0, max_delay=0.0, jitter=0.0),
             telemetry=None if telemetry is None else telemetry.as_port(),
+            notify=GarbageCollector(storage, PARTITIONER, policy).submit,
         )
 
         self.network.nodes[node_id] = service
@@ -284,16 +323,145 @@ async def cluster(
 
 
 async def _three(
-    cluster: _Cluster, config: AntiEntropyConfig | None = None
+    cluster: _Cluster,
+    config: AntiEntropyConfig | None = None,
+    *,
+    retention_versions: int = 64,
 ) -> tuple[AntiEntropyService, AntiEntropyService, AntiEntropyService]:
     members = [_member(n) for n in TOKENS]
 
     nodes = [
-        await cluster.node(m.node_id, await _topology(*members), config)
+        await cluster.node(
+            m.node_id,
+            await _topology(*members),
+            config,
+            retention_versions=retention_versions,
+        )
         for m in members
     ]
 
     return nodes[0], nodes[1], nodes[2]
+
+
+def _history(record: Record, count: int) -> list[Record]:
+    return [
+        dataclasses.replace(
+            record,
+            key=dataclasses.replace(record.key, ts=HLCTimestamp(i << 22, 0, "writer")),
+        )
+        for i in range(1, count + 1)
+    ]
+
+
+async def _collect_history(
+    service: AntiEntropyService, records: list[Record], versions: int
+) -> None:
+    assert service.local.retention_versions == versions
+    group = PARTITIONER.group_for(records[0].key.pid.value)
+    provider = await service.local._storage.session_provider_for(group)
+    async with GroupSessionManager(provider).session(write=True) as session:
+        await service.local._retention.collect(session, [r.key for r in records])
+
+
+async def test_retained_sets_converge_under_tiny_budgets_without_old_bucket_starvation(
+    cluster: _Cluster,
+) -> None:
+    config = AntiEntropyConfig(
+        grace=0, settle_delay=0, max_keys_per_cycle=2, max_repairs_per_cycle=1
+    )
+    a, b, _ = await _three(cluster, config, retention_versions=2)
+    view = _view(a)
+    records = _history(_shared_records(view, "node-b")[0], 4)
+    await _write(a, records[:2])
+    await _write(b, records[2:])
+    pid = records[0].key.pid.value
+    for _ in range(20):
+        await a.run_unit(Unit("node-b", (pid,)), view, a.tracker.stale_signal())
+        await _collect_history(a, records, 2)
+        await _collect_history(b, records, 2)
+    expected = {r.key.to_bytes(Keyspace.TAGS) for r in records[2:]}
+    assert await _owned(a, pid) == expected
+    assert await _owned(b, pid) == expected
+    assert a.stats.budget_stops > 0
+    assert await a.local.roots([pid]) == await b.local.roots([pid])
+
+
+async def test_retention_policy_mismatch_is_explicitly_rejected(
+    cluster: _Cluster,
+) -> None:
+    a, _, _ = await _three(cluster, retention_versions=2)
+    view = _view(a)
+    pids = tuple(view.shared["node-b"])
+    with pytest.raises(AntiEntropyRejectError, match="retention"):
+        await a.responder.roots(RootsRequest(Scope(pids, view.view_hash(pids), 3), ()))
+
+
+async def test_latest_version_covers_grouped_debts_after_gc_and_preserves_concurrent_debt(
+    cluster: _Cluster,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a, b, _ = await _three(cluster, retention_versions=2)
+    view = _view(a)
+    records = _history(_shared_records(view, "node-b")[0], 4)
+    await _write(a, records[:3])
+    debts = [await _oblige(a, record, "node-b") for record in records[:2]]
+    await _collect_history(a, records, 2)
+    original = cluster.network.request
+
+    async def concurrent(peer: str, envelope: Envelope) -> Envelope:
+        response = await original(peer, envelope)
+        if envelope.kind == "antientropy.push":
+            payload = SERIALIZER.decode(envelope.payload)
+            assert len(payload["records"]) == 1
+            assert decode_record(payload["records"][0]) == records[2]
+            await _write(a, records[3:])
+            await _oblige(a, records[3], "node-b")
+        return response
+
+    monkeypatch.setattr(cluster.network, "request", concurrent)
+    await a.deliver(debts, view)
+    pid = records[0].key.pid.value
+    assert await _owned(b, pid) == {records[2].key.to_bytes(Keyspace.TAGS)}
+    assert cluster.network.requests.count(("node-b", "antientropy.push")) == 1
+    provider = await a.local._storage.session_provider_for(PARTITIONER.group_for(pid))
+    async with GroupSessionManager(provider).session() as session:
+        page, _ = await session.obligation_page(None, 10)
+        assert page == [ObligationKey("node-b", records[3].key)]
+
+
+async def test_ignored_retention_covers_delivery_but_malformed_ack_does_not(
+    cluster: _Cluster,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a, b, _ = await _three(cluster, retention_versions=1)
+    view = _view(a)
+    records = _history(_shared_records(view, "node-b")[0], 3)
+    await _write(a, records[:1])
+    await _write(b, records[2:])
+    debt = await _oblige(a, records[0], "node-b")
+    await a.deliver([debt], view)
+    assert not await a.local.has_obligations()
+    assert await _owned(b, records[0].key.pid.value) == {
+        records[2].key.to_bytes(Keyspace.TAGS)
+    }
+    debt = await _oblige(a, records[0], "node-b")
+    original = cluster.network.request
+
+    async def malformed(peer: str, envelope: Envelope) -> Envelope:
+        response = await original(peer, envelope)
+        if envelope.kind == "antientropy.push":
+            return dataclasses.replace(
+                response,
+                payload=SERIALIZER.encode(
+                    {"applied": True, "already_present": 0, "ignored_retention": 0}
+                ),
+            )
+        return response
+
+    monkeypatch.setattr(cluster.network, "request", malformed)
+    await a.deliver([debt], view)
+    assert await a.local.has_obligations()
+    assert a.obligations.backlog
 
 
 def _view(service: AntiEntropyService) -> ReplicaView:
@@ -600,6 +768,7 @@ async def test_scan_budget_counts_listed_keys(cluster: _Cluster) -> None:
             max_keys_scanned=0,
         ),
         int((NOW - 10) * 1000),
+        progress=SyncProgress(),
     )
 
     with pytest.raises(BudgetSpentError):
@@ -619,6 +788,7 @@ async def test_rpc_refuses_once_stale() -> None:
         stale,
         SessionLimits(1, 1, 1, 1),
         0,
+        progress=SyncProgress(),
     )
 
     with pytest.raises(ViewChangedError):
@@ -661,21 +831,22 @@ async def test_service_loop_starts_sweeps_and_stops(cluster: _Cluster) -> None:
     assert a.to_dict()["serial"] is None
 
 
-async def test_disabled_service_delivers_but_never_sweeps(cluster: _Cluster) -> None:
+async def test_service_always_starts_delivery_and_sweep(cluster: _Cluster) -> None:
     members = [_member(n) for n in TOKENS]
 
     a = await cluster.node(
         "node-a",
         await _topology(*members),
-        AntiEntropyConfig(enabled=False, min_interval=0.01),
+        AntiEntropyConfig(min_interval=0.01),
     )
 
     await a.start()
     assert a.running
-    assert [t.get_name() for t in a._tasks] == ["antientropy-delivery"]
-    await asyncio.sleep(0.05)
-    assert a.stats.sweeps == 0
-    assert a.to_dict()["enabled"] is False
+    assert [t.get_name() for t in a._tasks] == [
+        "antientropy-delivery",
+        "antientropy-loop",
+    ]
+    assert "enabled" not in a.to_dict()
 
 
 async def test_loop_survives_a_failing_sweep(
@@ -881,7 +1052,7 @@ async def test_responder_refuses_beyond_capacity_and_drains_on_stop(
 
     view = _view(a)
     pid = view.shared["node-b"][0]
-    scope = Scope((pid,), view.view_hash((pid,)))
+    scope = Scope((pid,), view.view_hash((pid,)), 64)
     release = asyncio.Event()
 
     async def hold() -> int:
@@ -914,12 +1085,12 @@ async def test_responder_rejects_unknown_and_foreign_partitions(
         return None
 
     with pytest.raises(AntiEntropyRejectError) as exc:
-        await a.responder.serve(Scope((99,), b"\x00" * 16), work)
+        await a.responder.serve(Scope((99,), b"\x00" * 16, 64), work)
 
     assert exc.value.code == AntiEntropyRejectError.INVALID
 
     foreign = next(p for p in range(16) if not view.is_replica(p))
-    scope = Scope((foreign,), view.view_hash((foreign,)))
+    scope = Scope((foreign,), view.view_hash((foreign,)), 64)
 
     # Reads of a foreign partition are served: a joining node pulls from it.
     assert await a.responder.serve(scope, work) is None
@@ -1064,11 +1235,8 @@ async def _oblige(
 ) -> ObligationKey:
     obligation = ObligationKey(target, record.key)
     group = PARTITIONER.group_for(record.key.pid.value)
-    manager = GroupSessionManager(
-        await service.local._storage.session_provider_for(group)
-    )
-
-    async with manager.session(write=True) as session:
+    provider = await service.local._storage.session_provider_for(group)
+    async with GroupSessionManager(provider).session(write=True) as session:
         await session.put_obligations([obligation])
 
     return obligation
@@ -1092,7 +1260,9 @@ async def test_deliver_pushes_owed_versions_then_forgets_them(
     assert ("node-b", "antientropy.push") in cluster.network.requests
 
 
-async def test_deliver_drops_obligations_no_longer_owed(cluster: _Cluster) -> None:
+async def test_deliver_drops_only_obsolete_targets_and_retains_uncovered_debts(
+    cluster: _Cluster,
+) -> None:
     a, _, _ = await _three(cluster)
     view = _view(a)
     record = _records(1)[0]
@@ -1104,9 +1274,31 @@ async def test_deliver_drops_obligations_no_longer_owed(cluster: _Cluster) -> No
 
     await a.deliver([foreign, missing], view)
 
-    assert not await a.local.has_obligations()
-    assert a.stats.obligations_dropped == 2
+    assert await a.local.has_obligations()
+    assert a.stats.obligations_dropped == 1
+    assert a.obligations.backlog
     assert cluster.network.requests == []
+
+
+async def test_budget_checkpoints_cover_local_only_windows_and_multiple_partitions(
+    cluster: _Cluster,
+) -> None:
+    config = AntiEntropyConfig(
+        grace=0, settle_delay=0, max_keys_per_cycle=2, max_repairs_per_cycle=1
+    )
+    a, b, _ = await _three(cluster, config)
+    view = _view(a)
+    records = _shared_records(view, "node-b")[:12]
+    assert len({r.key.pid.value for r in records}) > 1
+    await _write(a, records)
+    for _ in range(40):
+        sync = a._session("node-b", view, a.tracker.stale_signal(), a._cutoff_ms())
+        with contextlib.suppress(BudgetSpentError):
+            await sync.sync_roots(view.shared["node-b"])
+        assert sync.tally.keys_scanned <= 2
+        assert sync.tally.pushed + sync.tally.pulled <= 1
+    for pid in {r.key.pid.value for r in records}:
+        assert await _owned(a, pid) == await _owned(b, pid)
 
 
 async def test_deliver_parks_obligations_of_unreachable_targets(
@@ -1150,9 +1342,7 @@ async def test_deliver_keeps_obligations_when_the_push_fails(
 async def test_delivery_reloads_persisted_obligations_on_start(
     cluster: _Cluster,
 ) -> None:
-    config = AntiEntropyConfig(
-        enabled=False, grace=10.0, settle_delay=0.0, min_interval=0.01
-    )
+    config = AntiEntropyConfig(grace=10.0, settle_delay=0.0, min_interval=0.01)
     a, b, _ = await _three(cluster, config)
     view = _view(a)
     record = _shared_records(view, "node-b")[0]

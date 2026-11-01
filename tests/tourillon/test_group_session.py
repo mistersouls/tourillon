@@ -13,14 +13,16 @@
 # limitations under the License.
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
 
+from tourillon.core.models.config import RetentionConfig
 from tourillon.core.models.storageschema import (
     Key,
     Keyspace,
+    KeyTag,
     KVPair,
     KVRef,
     MetaKind,
@@ -33,6 +35,7 @@ from tourillon.core.models.storageschema import (
     Value,
 )
 from tourillon.core.ports.storage import Session
+from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.storage.session import (
     BUCKET_PREFIX,
     DEFAULT_BUCKET_SHIFT,
@@ -43,6 +46,7 @@ from tourillon.core.storage.session import (
     root_key,
 )
 from tourillon.infra.storage.lmdb_session import LmdbConfig, LmdbSessionProvider
+from tourlib.exceptions import ValidationError
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
 
@@ -91,6 +95,138 @@ async def test_manager_flushes_digest_with_records(
     async with manager.session() as session:
         assert await session.read(first.key) == first
         assert await session.read(second.key) == second
+
+
+def _history(count: int, *, tombstone: bool = False) -> list[Record]:
+    base = _record(0)
+    return [
+        replace(
+            base,
+            key=replace(
+                base.key,
+                ts=HLCTimestamp(
+                    wall_ms=i << DEFAULT_BUCKET_SHIFT, counter=0, node_id="node"
+                ),
+            ),
+            tag=Tag(
+                kind=TagKind.TOMBSTONE if tombstone and i == count else TagKind.LIVE
+            ),
+        )
+        for i in range(1, count + 1)
+    ]
+
+
+@pytest.mark.parametrize("versions", [1, 2, 4])
+async def test_collection_atomically_keeps_top_versions_and_current_tombstone(
+    provider: LmdbSessionProvider,
+    versions: int,
+) -> None:
+    records = _history(5, tombstone=True)
+    manager = GroupSessionManager(provider)
+    async with manager.session(write=True) as session:
+        await session.put_many(records)
+        await session.put(_record(42))
+        await session.put_obligations([ObligationKey("target", records[0].key)])
+    async with manager.session(write=True) as session:
+        count, size = await RetentionPolicy(RetentionConfig(versions=versions)).collect(
+            session, [r.key for r in records]
+        )
+        assert count == 5 - versions
+        assert size > 0
+    async with manager.session() as session:
+        assert [await session.read(r.key) for r in records] == (
+            [None] * (5 - versions) + records[-versions:]
+        )
+        assert await session.read(_record(42).key) == _record(42)
+        assert await session.has_obligations()
+    async with provider.session() as raw:
+        root = await raw.get(KVRef(root_key(1), Keyspace.META))
+        assert root is not None
+        expected = DigestCell.of(_record(42).key)
+        for record in records[-versions:]:
+            expected += DigestCell.of(record.key)
+        assert DigestCell.from_bytes(root.value) == expected
+        assert await raw.get(KVRef(bucket_key(1, 1), Keyspace.META)) is None
+        for record in records[:-versions]:
+            assert (
+                await raw.get(KVRef(record.key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
+                is None
+            )
+
+
+async def test_collection_dry_run_and_rollback_preserve_records_and_digests(
+    provider: LmdbSessionProvider,
+) -> None:
+    records = _history(3)
+    manager = GroupSessionManager(provider)
+    async with manager.session(write=True) as session:
+        await session.put_many(records)
+    async with manager.session() as session:
+        result = await RetentionPolicy(RetentionConfig(versions=1)).collect(
+            session, [r.key for r in records], dry_run=True
+        )
+        assert result[0] == 2
+    with pytest.raises(RuntimeError, match="rollback"):
+        async with manager.session(write=True) as session:
+            await RetentionPolicy(RetentionConfig(versions=1)).collect(
+                session, [r.key for r in records]
+            )
+            await session.flush()
+            raise RuntimeError("rollback")
+    async with manager.session() as session:
+        assert [await session.read(r.key) for r in records] == records
+    async with provider.session() as raw:
+        root = await raw.get(KVRef(root_key(1), Keyspace.META))
+        assert root is not None
+        assert DigestCell.from_bytes(root.value).count == 3
+
+
+async def test_retention_rejects_out_of_order_historical_arrivals(
+    provider: LmdbSessionProvider,
+) -> None:
+    records = _history(4)
+    manager = GroupSessionManager(provider)
+    async with manager.session(write=True) as session:
+        versions = RetentionPolicy(RetentionConfig(versions=2))
+        assert await versions.apply(session, records[-2:]) == ["applied", "applied"]
+        lookup = await versions.lookup(session, records[0].key)
+        assert lookup.outside_retention
+        assert await versions.apply(session, records[:2]) == [
+            "ignored_retention",
+            "ignored_retention",
+        ]
+        lookup = await versions.lookup(session, records[-1].key)
+        assert not lookup.outside_retention
+        assert await session.latest_identities(
+            PartitionAddress(records[0].key.pid, records[0].key.address), 2
+        ) == [KeyTag(r.key, r.tag) for r in reversed(records[-2:])]
+
+
+@pytest.mark.parametrize("versions", [0, -1, True, 65])
+async def test_collection_rejects_invalid_retention_without_removing_current_state(
+    provider: LmdbSessionProvider,
+    versions: int,
+) -> None:
+    record = _record(1)
+    manager = GroupSessionManager(provider)
+    async with manager.session(write=True) as session:
+        await session.put(record)
+    with pytest.raises(ValidationError, match="retention.versions"):
+        async with manager.session(write=True) as session:
+            await RetentionPolicy(RetentionConfig(versions=versions)).collect(
+                session, [record.key]
+            )
+    async with manager.session() as session:
+        assert await session.read(record.key) == record
+
+
+@pytest.mark.parametrize("versions", [None, 0, True, 65])
+def test_retention_policy_rejects_disabled_or_invalid_retention(
+    provider: LmdbSessionProvider,
+    versions: int,
+) -> None:
+    with pytest.raises(ValidationError, match="retention.versions"):
+        RetentionConfig(versions=versions)
 
 
 async def test_repeated_flush_preserves_cumulative_deltas(

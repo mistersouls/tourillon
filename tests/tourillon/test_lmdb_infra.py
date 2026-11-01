@@ -70,6 +70,80 @@ def _provider(tmp_path, group: int = 0) -> LmdbSessionProvider:
 
 
 @pytest.mark.tourillon
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("limit", [0, -1, 1, 2, 10])
+@pytest.mark.parametrize("prefix", [None, Pid(1), Pid(3)])
+async def test_key_only_pages_match_pair_pages_without_changing_values(
+    tmp_path,
+    reverse: bool,
+    limit: int,
+    prefix: Pid | None,
+) -> None:
+    provider = _provider(tmp_path)
+    pairs = [
+        KVPair(Pid(pid).to_bytes() + suffix, b"payload" * 1024, Keyspace.LOGS)
+        for pid, suffix in [(0, b"a"), (1, b"a"), (1, b"b"), (2, b"a")]
+    ]
+    try:
+        async with provider.session(write=True) as session:
+            for pair in pairs:
+                await session.put(pair)
+
+        async with provider.session() as session:
+            async with session.batch() as batch:
+                batch.list(Keyspace.LOGS, prefix=prefix, limit=limit, reverse=reverse)
+                batch.keys(Keyspace.LOGS, prefix=prefix, limit=limit, reverse=reverse)
+
+            listed, batched_keys = await batch.result()
+            direct_keys = await session.keys(
+                Keyspace.LOGS, prefix=prefix, limit=limit, reverse=reverse
+            )
+            assert (
+                direct_keys
+                == batched_keys
+                == [KVRef(pair.key, pair.keyspace) for pair in listed]
+            )
+            for pair in listed:
+                assert pair.value == b"payload" * 1024
+    finally:
+        await provider.close()
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_key_only_pages_preserve_start_bounds_and_deleted_cursor(
+    tmp_path,
+    reverse: bool,
+) -> None:
+    provider = _provider(tmp_path)
+    prefix = Pid(1)
+    keys = [prefix.to_bytes() + suffix for suffix in (b"a", b"b", b"c")]
+    try:
+        async with provider.session(write=True) as session:
+            for key in keys:
+                await session.put(KVPair(key, b"value", Keyspace.LOGS))
+            await session.put(KVPair(Pid(2).to_bytes() + b"a", b"other", Keyspace.LOGS))
+
+            for start in (keys[1], prefix.to_bytes() + b"bb", b"\xff" * 8):
+                async with session.batch() as batch:
+                    batch.list(
+                        Keyspace.LOGS, prefix=prefix, start=start, reverse=reverse
+                    )
+                (listed,) = await batch.result()
+                assert await session.keys(
+                    Keyspace.LOGS, prefix=prefix, start=start, reverse=reverse
+                ) == [KVRef(pair.key, pair.keyspace) for pair in listed]
+
+            await session.delete(KVRef(keys[1], Keyspace.LOGS))
+            resumed = await session.keys(
+                Keyspace.LOGS, prefix=prefix, start=keys[1], reverse=reverse
+            )
+            assert resumed == [KVRef(keys[0] if reverse else keys[2], Keyspace.LOGS)]
+    finally:
+        await provider.close()
+
+
+@pytest.mark.tourillon
 @pytest.mark.asyncio
 async def test_lmdb_transaction_round_trips_and_filters_records(tmp_path) -> None:
     provider = _provider(tmp_path)

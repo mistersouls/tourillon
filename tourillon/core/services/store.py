@@ -27,6 +27,7 @@ from tourillon.core.exceptions import (
     InvalidRepairTokenError,
     NodeDrainingError,
     NoReplicaAvailableError,
+    OutdatedRepairError,
     QuorumNotMetError,
     StoreOperationError,
     VersionNotFoundError,
@@ -37,12 +38,14 @@ from tourillon.core.models.config import ReadRepairConfig, RepairConfig
 from tourillon.core.models.repair import (
     RepairIssue,
     RepairResult,
+    VersionLookup,
     decode_token,
     encode_token,
 )
 from tourillon.core.models.storageschema import (
     Key,
     Keyspace,
+    KeyTag,
     ObligationKey,
     PartitionAddress,
     Pid,
@@ -56,6 +59,7 @@ from tourillon.core.partition.placement import PlacementStrategy, Preference
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports.storage import Storage
 from tourillon.core.ports.telemetry import Telemetry
+from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.storage.session import GroupSessionManager
 from tourillon.core.telemetry import build_noop_telemetry
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT, MAX_CLOCK_SKEW_MS, MAX_QUORUM
@@ -103,6 +107,7 @@ class StoreService:
         clock: HLCClock,
         serializer: Serializer,
         peer_pool: PeerPool,
+        retention: RetentionPolicy,
         response_delay: float = REPLICATION_RESPONSE_DELAY,
         read_repair: ReadRepairConfig | None = None,
         repair: RepairConfig | None = None,
@@ -112,6 +117,7 @@ class StoreService:
         self._node_id = node_id
         self._telemetry = telemetry or build_noop_telemetry()
         self._storage = storage
+        self._retention = retention
         self._partitioner = partitioner
         self._placement_strategy = placement_strategy
         self._clock = clock
@@ -331,6 +337,21 @@ class StoreService:
         """Answer whether this node holds one exact version."""
         return await self._local_read_at(key, kind="replication.lookup")
 
+    async def lookup(
+        self, key: Key, *, kind: str = "replication.lookup"
+    ) -> VersionLookup:
+        group = self._partitioner.group_for(key.pid.value)
+        with self._telemetry.start_span(
+            "storage.operation", attributes={"group": group, "kind": kind}
+        ):
+            return await self._lookup_local(key, group)
+
+    async def _lookup_local(self, key: Key, group: int) -> VersionLookup:
+        provider = await self._storage.session_provider_for(group)
+        manager = GroupSessionManager(provider)
+        async with manager.session() as session:
+            return await self._retention.lookup(session, key)
+
     async def write(self, record: Record) -> Record:
         with self._operation("replication.write"):
             return await self._write(record)
@@ -369,17 +390,18 @@ class StoreService:
                 "storage.operation",
                 attributes={"group": group, "kind": kind},
             ),
+            self._telemetry.start_span(
+                "storage.transaction", attributes={"group": group}
+            ),
         ):
             provider = await self._storage.session_provider_for(group)
-            with self._telemetry.start_span(
-                "storage.transaction", attributes={"group": group}
-            ):
-                async with GroupSessionManager(provider).session(write=True) as session:
-                    with self._telemetry.start_span("storage.record.put"):
-                        await session.put(record)
-                    if obligations:
-                        with self._telemetry.start_span("storage.obligations.put"):
-                            await session.put_obligations(obligations)
+            manager = GroupSessionManager(provider)
+            async with manager.session(write=True) as session:
+                with self._telemetry.start_span("storage.record.put"):
+                    await session.put(record)
+                if obligations:
+                    with self._telemetry.start_span("storage.obligations.put"):
+                        await session.put_obligations(obligations)
         self._stats.obligations_recorded += len(obligations)
         self._telemetry.obligations_total.add(
             len(obligations), attributes={"event": "recorded"}
@@ -447,10 +469,12 @@ class StoreService:
         fanout: Sequence[tuple[str, str, str | None]],
     ) -> RepairResult:
         token = request.token
-        answers, read_errors = await self._collect_repair_reads(key, fanout)
+        lookups, read_errors = await self._collect_repair_reads(key, fanout)
+        answers = {owner: result.record for owner, result in lookups.items()}
         source = self._repair_source(answers.values())
         if source is None:
             self._stats.repairs_rejected += 1
+            self._check_outdated(request, key, fanout, lookups, 0)
             raise VersionNotFoundError(token)
 
         holders = self._repair_holders(answers, fanout)
@@ -466,7 +490,50 @@ class StoreService:
         )
         durable = len(holders) + len(applied)
         self._ensure_repair_quorum(durable, request, [*read_errors, *errors], token)
-        return RepairResult(RepairIssue.REPAIRED, durable, token)
+        issue = RepairIssue.REPAIRED if applied else RepairIssue.ALREADY_DURABLE
+        return RepairResult(issue, durable, token)
+
+    @staticmethod
+    def _check_outdated(
+        request: RepairRequest,
+        key: Key,
+        fanout: Sequence[tuple[str, str, str | None]],
+        lookups: Mapping[str, VersionLookup],
+        durable: int,
+    ) -> None:
+        if durable >= request.quorum_write:
+            return
+        direct = {owner for owner, target, _ in fanout if owner == target}
+        outside = {
+            owner
+            for owner, result in lookups.items()
+            if owner in direct and result.outside_retention
+        }
+        if (
+            not outside
+            or len({owner for owner, _, _ in fanout}) - len(outside)
+            >= request.quorum_write
+        ):
+            return
+
+        copies: dict[bytes, tuple[KeyTag, set[str]]] = {}
+        for owner, result in lookups.items():
+            for identity in result.retained:
+                if owner in direct and identity.key.ts > key.ts:
+                    raw = identity.key.to_bytes(Keyspace.TAGS)
+                    copies.setdefault(raw, (identity, set()))[1].add(owner)
+
+        newer = [
+            {
+                "version": item.to_dict(),
+                "replicas": len(owners),
+                "owners": sorted(owners),
+            }
+            for item, owners in sorted(
+                copies.values(), key=lambda pair: pair[0].key.ts, reverse=True
+            )
+        ]
+        raise OutdatedRepairError(request.token, durable, request.quorum_write, newer)
 
     @staticmethod
     def _ensure_repair_quorum(
@@ -540,16 +607,16 @@ class StoreService:
         self,
         key: Key,
         fanout: Sequence[tuple[str, str, str | None]],
-    ) -> tuple[dict[str, Record | None], list[Exception]]:
+    ) -> tuple[dict[str, VersionLookup], list[Exception]]:
         """Ask every replica whether it holds this exact version."""
-        answers: dict[str, Record | None] = {}
+        answers: dict[str, VersionLookup] = {}
         errors: list[Exception] = []
         tasks = {
-            asyncio.create_task(self._read_at_from_target(target, key), name=owner)
+            asyncio.create_task(self._lookup_target(target, key), name=owner)
             for owner, target, _ in fanout
         }
 
-        def collect(done: set[asyncio.Task[Record | None]]) -> None:
+        def collect(done: set[asyncio.Task[VersionLookup]]) -> None:
             for task in done:
                 try:
                     answers[task.get_name()] = task.result()
@@ -560,6 +627,24 @@ class StoreService:
         unanswered = await self._drain_parallel_tasks(tasks, collect, None)
         errors.extend(self._unanswered(unanswered))
         return answers, errors
+
+    async def _lookup_target(self, target: str, key: Key) -> VersionLookup:
+        if target == self._node_id:
+            return await self.lookup(key, kind="kv.repair")
+        result = VersionLookup.from_dict(
+            await self._remote_request(
+                "replication.lookup", target, {"key": key.to_dict()}
+            )
+        )
+        if result.record is not None and result.record.key != key:
+            raise ValueError("lookup returned a different exact version")
+        if any(
+            r.key.address != key.address or r.key.pid != key.pid
+            for r in result.retained
+        ):
+            raise ValueError("lookup returned another address")
+
+        return result
 
     @staticmethod
     def _repair_holders(
@@ -935,9 +1020,7 @@ class StoreService:
         payload = await self._remote_request(
             "replication.lookup", node_id, {"key": key.to_dict()}
         )
-        if payload is None:
-            return None
-        return Record.from_dict(payload)
+        return VersionLookup.from_dict(payload).record
 
     async def _remote_request(
         self, kind: str, node_id: str, payload: dict[str, Any]
@@ -958,6 +1041,11 @@ class StoreService:
                 await self._peer_pool.release(node_id, client)
 
             expected = f"{kind}.accept"
+            if response.kind == f"{kind}.reject":
+                data = self._serializer.decode(response.payload)
+                if data.get("errors"):
+                    raise StoreOperationError.from_dict(data)
+                raise RuntimeError(f"invalid response kind for {kind}: {response.kind}")
             if response.kind != expected:
                 raise RuntimeError(f"invalid response kind for {kind}: {response.kind}")
             return self._serializer.decode(response.payload)
@@ -1020,8 +1108,9 @@ class StoreService:
         with self._telemetry.start_span(
             "storage.operation", attributes={"group": group, "kind": kind}
         ):
-            session_provider = await self._storage.session_provider_for(group)
-            async with GroupSessionManager(session_provider).session() as session:
+            provider = await self._storage.session_provider_for(group)
+            manager = GroupSessionManager(provider)
+            async with manager.session() as session:
                 return await session.get(addr)
 
     async def _local_read_at(self, key: Key, *, kind: str) -> Record | None:
@@ -1029,8 +1118,9 @@ class StoreService:
         with self._telemetry.start_span(
             "storage.operation", attributes={"group": group, "kind": kind}
         ):
-            session_provider = await self._storage.session_provider_for(group)
-            async with GroupSessionManager(session_provider).session() as session:
+            provider = await self._storage.session_provider_for(group)
+            manager = GroupSessionManager(provider)
+            async with manager.session() as session:
                 return await session.read(key)
 
     async def _local_write(self, record: Record, *, kind: str) -> Record:
@@ -1043,16 +1133,15 @@ class StoreService:
                 "storage.operation",
                 attributes={"group": group, "kind": kind},
             ),
-        ):
-            session_provider = await self._storage.session_provider_for(group)
-            with self._telemetry.start_span(
+            self._telemetry.start_span(
                 "storage.transaction", attributes={"group": group}
-            ):
-                async with GroupSessionManager(session_provider).session(
-                    write=True
-                ) as session:
-                    with self._telemetry.start_span("storage.record.put"):
-                        await session.put(record)
+            ),
+        ):
+            provider = await self._storage.session_provider_for(group)
+            manager = GroupSessionManager(provider)
+            async with manager.session(write=True) as session:
+                with self._telemetry.start_span("storage.record.put"):
+                    await session.put(record)
         return record
 
     async def _drain_parallel_tasks(

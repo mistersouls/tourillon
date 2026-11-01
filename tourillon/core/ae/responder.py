@@ -129,16 +129,20 @@ class AntiEntropyResponder:
             return FetchResponse(tuple(records), max(1, consumed))
 
     async def push(self, request: PushRequest) -> int:
+        result = await self.push_result(request)
+        return result["applied"]
+
+    async def push_result(self, request: PushRequest) -> dict[str, int]:
         async with self._admit(request.scope, write=True):
             records = [r for r in request.records if r.tag.kind in OWNED_KINDS]
 
             for record in records:
                 self._local.foreign(record)
 
-            applied = await self._local.apply(request.scope.pid, records)
-            self.applied += applied
+            result = await self._local.apply_result(request.scope.pid, records)
+            self.applied += result["applied"]
 
-            return applied
+            return result
 
     async def serve[T](self, scope: Scope, work: Callable[[], Awaitable[T]]) -> T:
         """Run ``work`` under admission; for callers that are not wire handlers."""
@@ -165,6 +169,12 @@ class AntiEntropyResponder:
                 self._idle.set()
 
     def _check(self, scope: Scope, write: bool) -> None:
+        if scope.retention_versions != self._local.retention_versions:
+            self.rejected += 1
+            raise AntiEntropyRejectError(
+                AntiEntropyRejectError.INVALID,
+                "replicas have different retention policies",
+            )
         view = self._tracker.view
 
         if not self._running or view is None:

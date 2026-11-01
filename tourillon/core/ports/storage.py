@@ -27,6 +27,16 @@ from tourlib.models.types import SupportsBytes
 
 
 class Batch(Protocol):
+    def keys(
+        self,
+        keyspace: Keyspace,
+        prefix: SupportsBytes | None = None,
+        start: bytes | None = None,
+        limit: int = 64,
+        reverse: bool = False,
+    ) -> None:
+        """Schedule a bounded page of KVRef without materializing values."""
+
     async def __aenter__(self) -> "Batch":
         """Enter the batch context manager."""
 
@@ -85,6 +95,16 @@ class Batch(Protocol):
 
 
 class Session(Protocol):
+    async def keys(
+        self,
+        keyspace: Keyspace,
+        prefix: SupportsBytes | None = None,
+        start: bytes | None = None,
+        limit: int = 64,
+        reverse: bool = False,
+    ) -> list[KVRef]:
+        """Read a bounded reference page, with the same bounds as Batch.list."""
+
     async def exists(self, ref: KVRef) -> bool:
         """Check exact key presence without retrieving its value."""
 

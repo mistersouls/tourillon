@@ -62,7 +62,7 @@ async def _fetch(responder: AntiEntropyResponder, request: Any) -> dict[str, Any
 
 
 async def _push(responder: AntiEntropyResponder, request: Any) -> dict[str, Any]:
-    return {"applied": await responder.push(request)}
+    return await responder.push_result(request)
 
 
 @dispatcher.on("antientropy.roots")

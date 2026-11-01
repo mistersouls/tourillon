@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from tourillon.core.models.storageschema import Key, Keyspace
+from tourillon.core.models.storageschema import Key, Keyspace, KeyTag, Record
 
 
 class RepairIssue(Enum):
@@ -25,6 +25,41 @@ class RepairIssue(Enum):
 
     REPAIRED = "repaired"
     ALREADY_DURABLE = "already_durable"
+
+
+@dataclass(frozen=True)
+class VersionLookup:
+    """One local snapshot: exact source and bounded retained version identities."""
+
+    record: Record | None
+    retained: tuple[KeyTag, ...] = ()
+    outside_retention: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record": None if self.record is None else self.record.to_dict(),
+            "retained": [r.to_dict() for r in self.retained],
+            "outside_retention": self.outside_retention,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "VersionLookup":
+        if not isinstance(data, dict) or set(data) != {
+            "record",
+            "retained",
+            "outside_retention",
+        }:
+            raise ValueError("invalid version lookup payload")
+        if not isinstance(data["retained"], list) or len(data["retained"]) > 64:
+            raise ValueError("retained lookup identities must be bounded")
+        if not isinstance(data["outside_retention"], bool):
+            raise ValueError("outside_retention must be boolean")
+
+        return cls(
+            None if data["record"] is None else Record.from_dict(data["record"]),
+            tuple(KeyTag.from_dict(r) for r in data["retained"]),
+            data["outside_retention"],
+        )
 
 
 @dataclass(frozen=True)
