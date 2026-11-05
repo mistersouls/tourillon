@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import re
 import socket
 import ssl
 from collections.abc import AsyncIterator
@@ -22,8 +23,9 @@ import pytest
 
 from tests.helpers import generate_ca, start_envelope_server
 from tourclient.exception import UnknownServiceError
-from tourctl.bootstrap.main import app
-from tourctl.core.probe import _probe_error_message, ping_probe
+from tourctl.bootstrap.main import app, main
+from tourctl.core.error import PROBE_ERROR_PROFILE, cli_error
+from tourctl.core.probe import _format_rtt, ping_probe
 from tourillon.core.config import ClientConfigGenerator
 from tourlib.adapter import CryptographyMtlsAdapter, MsgPackSerializer, TomlPersistence
 from tourlib.envelope import Envelope, replay_envelope
@@ -89,9 +91,9 @@ def _closed_local_port() -> int:
     return port
 
 
-@pytest.mark.asyncio
-@pytest.mark.tourctl
-async def test_probe_ping_returns_json_with_real_runtime(tmp_path: Path) -> None:
+async def _ping_real_server(
+    tmp_path: Path, *, endpoint: str = "client", as_json: bool
+) -> tuple[str, dict, str]:
     ca_cert_path, ca_key_path = generate_ca(tmp_path)
     server_ssl = _build_server_ssl_from_ca(tmp_path, ca_cert_path, ca_key_path)
     serializer = MsgPackSerializer()
@@ -122,18 +124,60 @@ async def test_probe_ping_returns_json_with_real_runtime(tmp_path: Path) -> None
             ca_cert_path=ca_cert_path,
             ca_key_path=ca_key_path,
         )
-        result = await ping_probe(endpoint="client", tourconf=tourconf)
+        result = await ping_probe(endpoint=endpoint, tourconf=tourconf, as_json=as_json)
     finally:
         await server.stop()
 
-    request_data = serializer.decode(captured["request"].payload)
+    return result, serializer.decode(captured["request"].payload), f"{host}:{port}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.tourctl
+async def test_probe_ping_returns_json_with_real_runtime(tmp_path: Path) -> None:
+    result, request_data, address = await _ping_real_server(tmp_path, as_json=True)
     output = json.loads(result)
 
+    assert output.pop("rtt_ms") >= 0
     assert output == {
+        "address": address,
+        "endpoint": "client",
         "node_id": "probe-server",
         "recv_ms": request_data["timestamp_ms"] + 7,
         "timestamp_ms": request_data["timestamp_ms"],
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.tourctl
+async def test_probe_ping_prints_one_line_by_default(tmp_path: Path) -> None:
+    result, _, address = await _ping_real_server(tmp_path, as_json=False)
+
+    assert re.fullmatch(
+        rf"Pong from probe-server at {re.escape(address)} in (<1|\d+)ms\.", result
+    )
+
+
+@pytest.mark.tourctl
+@pytest.mark.parametrize(
+    ("rtt_ms", "text"), [(0.2, "<1ms"), (1.0, "1ms"), (2.6, "3ms"), (120.4, "120ms")]
+)
+def test_probe_ping_rounds_the_round_trip(rtt_ms: float, text: str) -> None:
+    assert _format_rtt(rtt_ms) == text
+
+
+@pytest.mark.tourctl
+def test_main_probe_ping_reports_errors_as_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "missing-tourconf.toml"
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["probe", "ping", "peer", "--tourconf", str(missing), "--json"])
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 2
+    assert captured.out == ""
+    assert json.loads(captured.err)["error"]["code"] == "invalid_config"
 
 
 @pytest.mark.tourctl
@@ -209,5 +253,5 @@ def test_probe_error_message_is_clear(
     context_name: str | None,
     expected: str,
 ) -> None:
-    message = _probe_error_message(exc, context_name)
+    message = cli_error(exc, context_name, PROBE_ERROR_PROFILE).message
     assert expected in message

@@ -18,7 +18,7 @@ import pytest
 
 from tourlib.adapter import MsgPackSerializer
 from tourlib.exceptions import ValidationError
-from tourlib.models.gc import GcInfo, GcRequest, GcResponse, GcStatus, GcStatusRequest
+from tourlib.models.gc import GcInfo, GcJobs, GcRequest, GcResponse, GcStatus
 
 pytestmark = pytest.mark.tourlib
 
@@ -45,7 +45,43 @@ def test_gc_models_roundtrip():
     assert GcRequest.from_document({"dry_run": True, "partition": 7}) == GcRequest(
         True, 7
     )
-    assert GcStatusRequest.from_document({"job_id": "job"}) == GcStatusRequest("job")
+    jobs = GcJobs("node", info, "2026-01-01T00:00:00+00:00", (status,))
+    assert (
+        GcJobs.from_document(serializer.decode(serializer.encode(jobs.to_dict())))
+        == jobs
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"node_id": ""},
+        {"worker": None},
+        {"next_pass_at": ""},
+        {"jobs": [GcStatus()]},
+        {"jobs": ("job",)},
+    ],
+)
+def test_gc_jobs_validation(changes):
+    info = GcInfo(True, 2, 600, 0, GcStatus())
+    document = {"node_id": "node", "worker": info, "next_pass_at": None, "jobs": ()}
+    with pytest.raises(ValidationError):
+        GcJobs(**{**document, **changes})
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        None,
+        {"node_id": "node"},
+        {"node_id": "n", "worker": {}, "next_pass_at": None, "jobs": {}},
+    ],
+)
+def test_gc_jobs_document_validation(document):
+    if isinstance(document, dict) and "worker" in document:
+        document["worker"] = asdict(GcInfo(True, 2, 600, 0, GcStatus()))
+    with pytest.raises(ValidationError):
+        GcJobs.from_document(document)
 
 
 @pytest.mark.parametrize(

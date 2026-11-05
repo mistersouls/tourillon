@@ -34,6 +34,7 @@ import pytest
 from tests.helpers.telemetry import RecordingTelemetry
 from tourillon.bootstrap.handlers import antientropy as handlers
 from tourillon.core.ae.local import LocalStore
+from tourillon.core.ae.obligations import ObligationQueue
 from tourillon.core.ae.sync import (
     BudgetSpentError,
     PeerSync,
@@ -273,11 +274,13 @@ class _Cluster:
         serve: bool = True,
         telemetry: RecordingTelemetry | None = None,
         retention_versions: int = 64,
+        obligations: ObligationQueue | None = None,
     ) -> AntiEntropyService:
         storage = _Storage(self._tmp_path / node_id)
         self.storages.append(storage)
         policy = RetentionConfig(versions=retention_versions)
         retention = RetentionPolicy(policy)
+        config = config or AntiEntropyConfig(grace=10.0, settle_delay=0.0)
 
         service = AntiEntropyService(
             node_id=node_id,
@@ -288,7 +291,12 @@ class _Cluster:
             peer_pool=self.network.pool(),  # type: ignore[arg-type]
             serializer=SERIALIZER,
             replication_factor=RF,
-            config=config or AntiEntropyConfig(grace=10.0, settle_delay=0.0),
+            config=config,
+            obligations=(
+                obligations
+                if obligations is not None
+                else ObligationQueue(config.hotqueue_size)
+            ),
             clock=lambda: NOW,
             backoff=BackoffRetry(initial_delay=0.0, max_delay=0.0, jitter=0.0),
             telemetry=None if telemetry is None else telemetry.as_port(),
@@ -744,6 +752,8 @@ async def test_session_stops_when_the_view_goes_stale(cluster: _Cluster) -> None
     assert a.stats.view_changes == 1
     assert cluster.network.requests == []
     assert await a.sweep(view, stale) is False
+    assert a.stats.last_sweep_at is None
+    assert a.stats.last_sweep_diverged == 0
 
 
 async def test_budget_stops_the_session(cluster: _Cluster) -> None:
@@ -815,6 +825,9 @@ async def test_sweep_walks_every_unit(cluster: _Cluster) -> None:
 
     assert await a.sweep(view, a.tracker.stale_signal()) is True
     assert a.stats.sweeps == 1
+    assert a.stats.last_sweep_at is not None
+    assert a.stats.last_sweep_diverged == 0
+    assert a.stats.to_dict()["last_sweep_at"] == a.stats.last_sweep_at
 
 
 async def test_service_loop_starts_sweeps_and_stops(cluster: _Cluster) -> None:
@@ -850,6 +863,7 @@ async def test_service_always_starts_delivery_and_sweep(cluster: _Cluster) -> No
         AntiEntropyConfig(min_interval=0.01),
     )
 
+    assert a.started_at is None
     await a.start()
     assert a.running
     assert [t.get_name() for t in a._tasks] == [
@@ -857,6 +871,10 @@ async def test_service_always_starts_delivery_and_sweep(cluster: _Cluster) -> No
         "antientropy-loop",
     ]
     assert "enabled" not in a.to_dict()
+    assert a.started_at is not None
+    assert a.stuck_after >= 60.0
+    await a.stop()
+    assert a.started_at is None
 
 
 async def test_loop_survives_a_failing_sweep(
@@ -1237,6 +1255,26 @@ def test_peer_backoff_honours_hints_and_grows() -> None:
     assert not backoff.deferred("p") and "p" not in backoff._delay
 
 
+def test_peer_backoff_reports_remaining_delay_and_last_error() -> None:
+    now = [10.0]
+    backoff = PeerBackoff(
+        BackoffRetry(initial_delay=4.0, factor=2.0, max_delay=8.0, jitter=0.0),
+        lambda: now[0],
+    )
+
+    assert backoff.remaining("p") == 0.0
+    assert backoff.last_error("p") is None
+    backoff.note("p", "timeout after 2s")
+    backoff.failed("p")
+    now[0] = 11.0
+    assert backoff.remaining("p") == 3.0
+    assert backoff.last_error("p") == "timeout after 2s"
+    now[0] = 20.0
+    assert backoff.remaining("p") == 0.0
+    backoff.succeeded("p")
+    assert backoff.last_error("p") is None
+
+
 # --- obligations, join and drain goals ---------------------------------------
 
 
@@ -1268,6 +1306,10 @@ async def test_deliver_pushes_owed_versions_then_forgets_them(
     assert not await a.local.has_obligations()
     assert a.stats.obligations_delivered == 1
     assert ("node-b", "antientropy.push") in cluster.network.requests
+    retry_in, error, delivered_ago = a.delivery_state("node-b")
+    assert (retry_in, error) == (0.0, None)
+    assert delivered_ago is not None and delivered_ago >= 0.0
+    assert a.delivery_state("node-c") == (0.0, None, None)
 
 
 async def test_deliver_drops_only_obsolete_targets_and_retains_uncovered_debts(
@@ -1347,6 +1389,30 @@ async def test_deliver_keeps_obligations_when_the_push_fails(
     assert await a.local.has_obligations()
     assert a.stats.obligations_delivered == 0
     assert a.stats.errors == 1
+    assert a.stats.delivery_errors == 1
+    assert a.stats.to_dict()["delivery_errors"] == 1
+    _, error, delivered_ago = a.delivery_state("node-b")
+    assert error == "OSError: node-b unreachable"
+    assert delivered_ago is None
+
+
+async def test_obligation_pages_can_be_restricted_to_one_target(
+    cluster: _Cluster,
+) -> None:
+    a, _, _ = await _three(cluster)
+    view = _view(a)
+    record = _shared_records(view, "node-b")[0]
+    await _write(a, [record])
+    to_b = await _oblige(a, record, "node-b")
+    to_c = await _oblige(a, record, "node-c")
+    group = PARTITIONER.group_for(record.key.pid.value)
+
+    every, _ = await a.local.obligation_page(group, None, 10)
+    only_c, cursor = await a.local.obligation_page(group, None, 10, "node-c")
+
+    assert set(every) == {to_b, to_c}
+    assert only_c == [to_c]
+    assert cursor is None
 
 
 async def test_delivery_reloads_persisted_obligations_on_start(
@@ -1371,6 +1437,19 @@ async def test_delivery_reloads_persisted_obligations_on_start(
     assert not await a.local.has_obligations()
     assert record.key.to_bytes(Keyspace.TAGS) in await _owned(b, record.key.pid.value)
     assert a.to_dict()["hotqueue"]["backlog"] is False
+
+
+async def test_empty_shared_obligation_queue_is_used_as_is(cluster: _Cluster) -> None:
+    """An empty queue is falsy; the service must still share it with the store.
+
+    A private substitute would hide every obligation the write path submits
+    until the next restart reloads them from META.
+    """
+    queue = ObligationQueue(8)
+    assert not queue
+    members = [_member("node-a"), _member("node-b")]
+    a = await cluster.node("node-a", await _topology(*members), obligations=queue)
+    assert a.obligations is queue
 
 
 async def test_sweep_waits_for_queued_obligations(cluster: _Cluster) -> None:
@@ -1436,9 +1515,14 @@ async def test_join_goal_retries_until_sources_answer(cluster: _Cluster) -> None
         await asyncio.sleep(0.01)
 
     assert not joining.done()  # node-b refuses: the goal is not reached
+    progress = c.goal
+    assert progress is not None and progress.goal == "join"
+    assert progress.done < progress.total
+    assert set(progress.waiting) <= {"node-b"}
     cluster.network.nodes["node-b"].responder.start()
     await asyncio.wait_for(joining, 5)
     assert c.stats.join_passes >= 2
+    assert c.goal is None
 
 
 def test_primary_source_pairs_joiners_one_to_one_with_leavers() -> None:
@@ -1657,9 +1741,15 @@ async def test_drain_goal_is_not_reached_while_a_replica_is_down(
         await asyncio.sleep(0.01)
 
     assert not draining.done()
+    progress = c.goal
+    assert progress is not None and progress.goal == "drain"
+    assert progress.total > 0
+    assert progress.waiting.get("node-b", 0) > 0
+    assert progress.done < progress.total
     draining.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await draining
+    assert c.goal is None
 
 
 async def test_sweep_that_copies_data_is_measured_and_logged_at_info(

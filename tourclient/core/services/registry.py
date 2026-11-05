@@ -16,6 +16,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
+from tourclient.core.services.ae import AeService
+from tourclient.core.services.gc import GcService
 from tourclient.core.services.inspect import InspectService
 from tourclient.core.services.kv import KvService
 from tourclient.core.services.node import NodeService
@@ -24,7 +26,9 @@ from tourclient.core.transport import Transport
 from tourlib import Serializer
 
 # Service type alias for type hints
-ServiceType = ProbeService | InspectService | NodeService | KvService
+ServiceType = (
+    ProbeService | InspectService | NodeService | KvService | GcService | AeService
+)
 
 
 @dataclass(frozen=True)
@@ -48,10 +52,20 @@ SERVICE_REGISTRY: dict[str, ServiceRegistration] = {
         factory=InspectService,
     ),
     "node": ServiceRegistration(
-        # Lifecycle, GC submission and GC job lookup are peer-only operations.
+        # Lifecycle operations are peer-only.
         name="node",
         supported_endpoints=frozenset(["peer"]),  # type: ignore[arg-type]
         factory=NodeService,
+    ),
+    "gc": ServiceRegistration(
+        name="gc",
+        supported_endpoints=frozenset(["peer"]),  # type: ignore[arg-type]
+        factory=GcService,
+    ),
+    "ae": ServiceRegistration(
+        name="ae",
+        supported_endpoints=frozenset(["peer"]),  # type: ignore[arg-type]
+        factory=AeService,
     ),
     "kv": ServiceRegistration(
         name="kv",

@@ -55,6 +55,13 @@ class CryptographyMtlsAdapter:
             ),
         )
 
+    def certificate_expiry(self, certificate_pem: bytes) -> dt.datetime:
+        try:
+            certificate = x509.load_pem_x509_certificate(certificate_pem)
+        except ValueError as exc:
+            raise ValueError("certificate must be a PEM encoded X.509 cert") from exc
+        return certificate.not_valid_after_utc
+
     def generate_cert(
         self,
         *,

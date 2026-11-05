@@ -24,6 +24,7 @@ import pytest
 
 from tourillon.core.config import GossipConfig
 from tourillon.core.gossip.gossiper import Gossiper, GossipStats
+from tourillon.core.gossip.heartbeat import HeartbeatTable
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.peer.pool import PeerPool
@@ -598,6 +599,56 @@ async def test_gossiper_ae_cycle_ping_pong_and_digest_delta_paths(
 
     assert "Received gossip.error during AE cycle" in caplog.text
     assert "cid=" in caplog.text
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_gossiper_ae_cycle_beats_ships_and_merges_heartbeats() -> None:
+    serializer = _MapSerializer()
+    topology = TopologyManager()
+    await topology.merge_registry((_member("node-a"), _member("node-b", epoch=2)))
+    heartbeats = HeartbeatTable("node-a", clock=lambda: 50.0, wall=lambda: 1.0)
+    pong = _envelope(
+        "gossip.pong",
+        serializer,
+        {"same": True, "heartbeats": {"node-b": 500, "gone": 9, "bad": -1}},
+    )
+    client = _FakeClient(request_responses=[pong])
+    engine = Gossiper(
+        node_id="node-a",
+        config=GossipConfig(),
+        stats=GossipStats(),
+        topologymgr=topology,
+        peer_pool=cast(PeerPool, cast(object, _FakePool(client))),
+        serializer=serializer,
+        telemetry=build_noop_telemetry(),
+        heartbeats=heartbeats,
+    )
+
+    await engine._run_ae_cycle()
+
+    assert engine.heartbeats is heartbeats
+    ping = serializer.decode(client.requests[0].payload)
+    assert ping["heartbeats"] == {"node-a": 1001}
+    assert heartbeats.table() == {"node-a": 1001, "node-b": 500}
+    assert heartbeats.age("node-b") == 0.0
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_gossiper_builds_its_own_heartbeat_table_by_default() -> None:
+    engine = Gossiper(
+        node_id="node-a",
+        config=GossipConfig(),
+        stats=GossipStats(),
+        topologymgr=TopologyManager(),
+        peer_pool=cast(PeerPool, object()),
+        serializer=_FakeSerializer(),
+        telemetry=build_noop_telemetry(),
+    )
+
+    assert engine.heartbeats.node_id == "node-a"
+    assert list(engine.heartbeats.table()) == ["node-a"]
 
 
 @pytest.mark.tourillon

@@ -119,8 +119,8 @@ def join(journey: Journey) -> None:
 def membership_snapshot(journey: Journey) -> tuple:
     infos = [journey.inspect(node) for node in journey.nodes.values()]
     memberships = []
-    for info in infos:
-        members = info["members"]
+    for node in journey.nodes.values():
+        members = journey.members(node)
         assert {member["node_id"] for member in members} == {"A", "B"}
         assert {member["phase"] for member in members} == {"READY"}
         memberships.append(
@@ -240,7 +240,7 @@ def retained(journey: Journey) -> None:
     before, after = journey.observations["identity"], journey.inspect(a)
     assert after["node_id"] == before["node_id"] == "A"
     assert after["ring_position"] == before["ring_position"]
-    assert after["self_member"]["phase"] == "READY"
+    assert after["phase"] == "READY"
     journey.check(a, "survivor", "durable")
     journey.check(a, "deleted", None)
 
@@ -271,7 +271,7 @@ def typed(journey: Journey) -> None:
             "binary",
             f"@{file}",
             "bytes",
-            {"type": "bytes", "base64": base64.b64encode(binary).decode("ascii")},
+            {"base64": base64.b64encode(binary).decode("ascii")},
         ),
     ]
     for key, raw, kind, expected in cases:
@@ -286,7 +286,7 @@ def typed_exact(journey: Journey) -> None:
         version = journey.check(journey.nodes["A"], key, expected)
         if key == "binary":
             assert (
-                base64.b64decode(version["data"]["base64"], validate=True)
+                base64.b64decode(version["value"]["base64"], validate=True)
                 == journey.observations["binary"]
             )
 
@@ -344,6 +344,7 @@ def resumed(journey: Journey) -> None:
     assert outcome == {
         "issue": "already_durable",
         "replicas": 1,
+        "required": 1,
         "token": match.group(1),
     }, outcome
 

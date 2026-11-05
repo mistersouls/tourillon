@@ -381,4 +381,4 @@ def then_probe_output_has_node_id(probe_command_context: dict[str, object]) -> N
     node_id = probe_command_context["node_id"]
     assert isinstance(result, subprocess.CompletedProcess)
     assert isinstance(node_id, str)
-    assert f'"node_id": "{node_id}"' in result.stdout
+    assert result.stdout.startswith(f"Pong from {node_id} at ")

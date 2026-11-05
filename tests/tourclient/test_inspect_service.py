@@ -13,282 +13,247 @@
 # limitations under the License.
 
 import ssl
-from collections.abc import AsyncIterator
-from dataclasses import asdict
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any
 
 import pytest
 
 from tests.helpers import start_envelope_server
+from tests.helpers.inspect import make_page, make_status, make_view
 from tourclient.core import InspectService, Transport
+from tourclient.exception import RequestRejectedError
 from tourlib.adapter import MsgPackSerializer
 from tourlib.envelope import Envelope, replay_envelope
 from tourlib.exceptions import ResponseError
-from tourlib.models.gc import GcInfo, GcStatus
-from tourlib.models.inspect import NodeInspectRequest
+from tourlib.models.health import HealthReason, NodeHealth
+from tourlib.models.inspect import MembersRequest
+from tourlib.models.member import MemberReport, MemberRequest
+
+pytestmark = pytest.mark.tourctl
+
+SERIALIZER = MsgPackSerializer()
 
 
-def _node_info_document(
-    *,
-    chunk_index: int,
-    has_more: bool,
-    next_cursor: str | None,
-    members: list[dict[str, object]],
-    gossip_stats: dict[str, object],
-    self_member: dict[str, object] | None = None,
-) -> dict[str, object]:
-    payload = {
-        "gc": asdict(GcInfo(True, 2, 600, 0, GcStatus())),
-        "node_id": "node-3",
-        "snapshot_at": "2026-08-16T09:15:20Z",
-        "chunk_index": chunk_index,
-        "has_more": has_more,
-        "next_cursor": next_cursor,
-        "ring_position": {
-            "partition_shift": 10,
-            "total_partitions": 1024,
-            "owned_partitions": 256,
-            "owned_percent": 25.0,
-            "vnode_ranges": [
-                {
-                    "token": "0x7b",
-                    "arc": [1023, 63],
-                    "partitions": 64,
-                }
-            ],
-        },
-        "members": members,
-        "gossip_stats": gossip_stats,
-    }
-    payload["self_member"] = self_member or {
-        "node_id": "node-3",
-        "phase": "READY",
-        "status": "-",
-        "epoch": 3,
-    }
-    return payload
-
-
-@pytest.mark.parametrize("gc", [None, {}, {"running": True}])
-def test_inspection_rejects_missing_or_invalid_gc_status(gc) -> None:
-    from tourclient.core.services.inspect import _node_info_from_document
-
-    payload = _node_info_document(
-        chunk_index=0,
-        has_more=False,
-        next_cursor=None,
-        members=[],
-        gossip_stats={},
-    )
-    payload["gc"] = gc
-    with pytest.raises(ResponseError, match="response gc"):
-        _node_info_from_document(payload)
-
-
-@pytest.mark.asyncio
-async def test_inspect_service_collects_multiple_pages(
+async def _call(
     mtls_contexts: tuple[ssl.SSLContext, ssl.SSLContext],
-) -> None:
+    kind: str,
+    reply_kind: str,
+    payload: Any,
+    action: Callable[[InspectService], Awaitable[Any]],
+    seen: list[Any] | None = None,
+) -> Any:
     server_ssl, client_ssl = mtls_contexts
-    serializer = MsgPackSerializer()
-    seen_cursors: list[str | None] = []
 
-    async def inspect_handler(request: Envelope) -> AsyncIterator[Envelope]:
-        request_data = serializer.decode(request.payload)
-        cursor = request_data.get("cursor")
-        seen_cursors.append(cursor)
-
-        if cursor is None:
-            payload = _node_info_document(
-                chunk_index=0,
-                has_more=True,
-                next_cursor="node-1",
-                members=[
-                    {
-                        "node_id": "node-1",
-                        "phase": "READY",
-                        "status": "LIVE",
-                        "epoch": 3,
-                    }
-                ],
-                gossip_stats={"known_members": 3},
-                self_member={
-                    "node_id": "node-3",
-                    "phase": "READY",
-                    "status": "-",
-                    "epoch": 3,
-                },
-            )
-        else:
-            payload = _node_info_document(
-                chunk_index=1,
-                has_more=False,
-                next_cursor=None,
-                members=[
-                    {"node_id": "node-3", "phase": "READY", "status": "-", "epoch": 3}
-                ],
-                gossip_stats={},
-            )
-
+    async def handler(request: Envelope) -> AsyncIterator[Envelope]:
+        if seen is not None:
+            seen.append(SERIALIZER.decode(request.payload))
         yield replay_envelope(
-            kind="node.info",
-            request=request,
-            payload=serializer.encode(payload),
+            kind=reply_kind, request=request, payload=SERIALIZER.encode(payload)
         )
 
-    server = await start_envelope_server({"node.inspect": inspect_handler}, server_ssl)
-
+    server = await start_envelope_server({kind: handler}, server_ssl)
     try:
         host, port = server.endpoint
         transport = Transport(
-            bind=f"{host}:{port}",
-            ssl_context=client_ssl,
-            serializer=serializer,
+            bind=f"{host}:{port}", ssl_context=client_ssl, serializer=SERIALIZER
         )
         await transport.connect()
         try:
-            service = InspectService(transport, serializer=serializer)
-            chunks = await service.inspect(NodeInspectRequest(limit=1))
+            return await action(InspectService(transport, serializer=SERIALIZER))
         finally:
             await transport.close()
     finally:
         await server.stop()
 
-    assert seen_cursors == [None, "node-1"]
-    assert len(chunks) == 2
-    assert chunks[0].has_more is True
-    assert chunks[0].next_cursor == "node-1"
-    assert chunks[1].has_more is False
-    assert chunks[0].self_member is not None
-    assert chunks[0].self_member.node_id == "node-3"
-    assert [member.node_id for member in chunks[0].members] == ["node-1"]
-    assert [member.node_id for member in chunks[1].members] == ["node-3"]
 
+async def test_status_decodes_the_node_status(mtls_contexts) -> None:
+    status = make_status()
+    seen: list[Any] = []
 
-@pytest.mark.asyncio
-async def test_inspect_service_accepts_hex_token_values(
-    mtls_contexts: tuple[ssl.SSLContext, ssl.SSLContext],
-) -> None:
-    server_ssl, client_ssl = mtls_contexts
-    serializer = MsgPackSerializer()
-    token_hex = "0x1234567890abcdef1234567890abcdef"
-
-    async def inspect_handler(request: Envelope) -> AsyncIterator[Envelope]:
-        payload = _node_info_document(
-            chunk_index=0,
-            has_more=False,
-            next_cursor=None,
-            members=[
-                {"node_id": "node-3", "phase": "READY", "status": "-", "epoch": 3}
-            ],
-            gossip_stats={},
-        )
-        ring_position = payload["ring_position"]
-        assert isinstance(ring_position, dict)
-        vnode_ranges = ring_position["vnode_ranges"]
-        assert isinstance(vnode_ranges, list)
-        vnode_ranges[0]["token"] = token_hex
-        yield replay_envelope(
-            kind="node.info",
-            request=request,
-            payload=serializer.encode(payload),
-        )
-
-    server = await start_envelope_server({"node.inspect": inspect_handler}, server_ssl)
-
-    try:
-        host, port = server.endpoint
-        transport = Transport(
-            bind=f"{host}:{port}",
-            ssl_context=client_ssl,
-            serializer=serializer,
-        )
-        await transport.connect()
-        try:
-            service = InspectService(transport, serializer=serializer)
-            chunks = await service.inspect()
-        finally:
-            await transport.close()
-    finally:
-        await server.stop()
-
-    assert len(chunks) == 1
-    assert chunks[0].ring_position.vnode_ranges[0].token == token_hex
-    assert chunks[0].ring_position.vnode_ranges[0].arc == (1023, 63)
-
-
-@pytest.mark.asyncio
-async def test_inspect_service_fails_on_unexpected_response_kind(
-    mtls_contexts: tuple[ssl.SSLContext, ssl.SSLContext],
-) -> None:
-    server_ssl, client_ssl = mtls_contexts
-    serializer = MsgPackSerializer()
-
-    async def bad_inspect_handler(request: Envelope) -> AsyncIterator[Envelope]:
-        yield replay_envelope(
-            kind="node.status",
-            request=request,
-            payload=serializer.encode({"status": "ok"}),
-        )
-
-    server = await start_envelope_server(
-        {"node.inspect": bad_inspect_handler}, server_ssl
+    result = await _call(
+        mtls_contexts,
+        "node.inspect",
+        "node.inspect.accept",
+        status.to_document(),
+        lambda service: service.status(),
+        seen,
     )
 
-    try:
-        host, port = server.endpoint
-        transport = Transport(
-            bind=f"{host}:{port}",
-            ssl_context=client_ssl,
-            serializer=serializer,
+    assert result == status
+    assert seen == [{}]
+
+
+async def test_health_decodes_the_verdict(mtls_contexts) -> None:
+    verdict = NodeHealth.from_reasons(
+        "node-3", [HealthReason("phase", "Node is JOINING")]
+    )
+    seen: list[Any] = []
+
+    result = await _call(
+        mtls_contexts,
+        "node.health",
+        "node.health.accept",
+        verdict.to_document(),
+        lambda service: service.health(),
+        seen,
+    )
+
+    assert result == verdict
+    assert seen == [{}]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"node_id": "x", "status": "BAD"},
+        {"node_id": "x", "status": "OK", "reasons": "none"},
+        {"node_id": "x", "status": "OK", "reasons": [1]},
+        {"node_id": "x", "status": "OK", "extra": 1},
+    ],
+)
+async def test_health_rejects_an_invalid_verdict(mtls_contexts, payload) -> None:
+    with pytest.raises(ResponseError, match="invalid node.health response"):
+        await _call(
+            mtls_contexts,
+            "node.health",
+            "node.health.accept",
+            payload,
+            lambda service: service.health(),
         )
-        await transport.connect()
-        try:
-            service = InspectService(transport, serializer=serializer)
-            with pytest.raises(ResponseError, match="unexpected inspect response kind"):
-                await service.inspect()
-        finally:
-            await transport.close()
-    finally:
-        await server.stop()
 
 
-@pytest.mark.asyncio
-async def test_inspect_service_rejects_missing_self_member_payload(
-    mtls_contexts: tuple[ssl.SSLContext, ssl.SSLContext],
+async def test_members_sends_the_request_and_decodes_the_page(mtls_contexts) -> None:
+    page = make_page(make_view("node-2", status="DEAD"), cursor="next")
+    request = MembersRequest(phases=("joining",), limit=10, cursor="abc")
+    seen: list[Any] = []
+
+    result = await _call(
+        mtls_contexts,
+        "node.members",
+        "node.members.accept",
+        page.to_document(),
+        lambda service: service.members(request),
+        seen,
+    )
+
+    assert result == page
+    assert seen == [request.to_document()]
+
+
+async def test_members_defaults_to_the_anomalies_request(mtls_contexts) -> None:
+    seen: list[Any] = []
+
+    await _call(
+        mtls_contexts,
+        "node.members",
+        "node.members.accept",
+        make_page().to_document(),
+        lambda service: service.members(),
+        seen,
+    )
+
+    assert seen == [MembersRequest().to_document()]
+
+
+async def test_member_sends_id_and_decodes_report(mtls_contexts) -> None:
+    report = MemberReport(
+        node_id="node-2",
+        view_from="node-1",
+        address="node-2:7701",
+        phase="READY",
+        epoch=2,
+        status="ALIVE",
+        since_s=2,
+        last_heard_s=1,
+        ring_share_percent=25,
+        partitions=64,
+        total_partitions=256,
+        vnodes=4,
+        answered=0,
+        neighbors=0,
+        owed_by=(),
+        unanswered=(),
+        stand_ins=(),
+    )
+    request = MemberRequest("node-2")
+    seen: list[Any] = []
+
+    result = await _call(
+        mtls_contexts,
+        "node.member",
+        "node.member.accept",
+        report.to_document(),
+        lambda service: service.member(request),
+        seen,
+    )
+
+    assert result == report
+    assert seen == [request.to_document()]
+
+
+async def test_member_rejection_preserves_the_error_code(mtls_contexts) -> None:
+    with pytest.raises(RequestRejectedError, match="unknown member") as info:
+        await _call(
+            mtls_contexts,
+            "node.member",
+            "node.member.reject",
+            {"code": "member_not_found", "message": "unknown member"},
+            lambda service: service.member(MemberRequest("missing")),
+        )
+
+    assert info.value.code == "member_not_found"
+
+
+@pytest.mark.parametrize(
+    "payload,code,message",
+    [
+        ({"code": "invalid_request", "message": "bad limit"}, "invalid_request", "bad"),
+        (["not", "a", "table"], None, "node.members rejected"),
+    ],
+)
+async def test_members_reject_raises_request_rejected(
+    mtls_contexts, payload, code, message
 ) -> None:
-    server_ssl, client_ssl = mtls_contexts
-    serializer = MsgPackSerializer()
-
-    async def inspect_handler(request: Envelope) -> AsyncIterator[Envelope]:
-        payload = _node_info_document(
-            chunk_index=0,
-            has_more=False,
-            next_cursor=None,
-            members=[],
-            gossip_stats={},
-        )
-        payload.pop("self_member", None)
-        yield replay_envelope(
-            kind="node.info",
-            request=request,
-            payload=serializer.encode(payload),
+    with pytest.raises(RequestRejectedError, match=message) as info:
+        await _call(
+            mtls_contexts,
+            "node.members",
+            "node.members.reject",
+            payload,
+            lambda service: service.members(),
         )
 
-    server = await start_envelope_server({"node.inspect": inspect_handler}, server_ssl)
+    assert info.value.code == code
+    assert info.value.request_kind == "node.members"
 
-    try:
-        host, port = server.endpoint
-        transport = Transport(
-            bind=f"{host}:{port}",
-            ssl_context=client_ssl,
-            serializer=serializer,
-        )
-        await transport.connect()
-        try:
-            service = InspectService(transport, serializer=serializer)
-            with pytest.raises(ResponseError, match="self_member"):
-                await service.inspect()
-        finally:
-            await transport.close()
-    finally:
-        await server.stop()
+
+@pytest.mark.parametrize(
+    "kind,reply_kind,payload,match",
+    [
+        ("node.inspect", "node.info", {}, "unexpected node.inspect response kind"),
+        ("node.inspect", "node.inspect.accept", [1], "invalid node.inspect response"),
+        ("node.inspect", "node.inspect.accept", {}, "invalid node.inspect response"),
+        (
+            "node.members",
+            "node.members.accept",
+            {"node_id": "x"},
+            "invalid node.members response",
+        ),
+        (
+            "node.members",
+            "node.members.accept",
+            "page",
+            "invalid node.members response payload",
+        ),
+    ],
+)
+async def test_unexpected_responses_raise_response_error(
+    mtls_contexts, kind, reply_kind, payload, match
+) -> None:
+    async def action(service: InspectService) -> Any:
+        if kind == "node.inspect":
+            return await service.status()
+        return await service.members()
+
+    with pytest.raises(ResponseError, match=match):
+        await _call(mtls_contexts, kind, reply_kind, payload, action)

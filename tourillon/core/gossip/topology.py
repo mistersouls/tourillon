@@ -16,7 +16,8 @@
 
 import asyncio
 import hashlib
-from collections.abc import Iterable
+import time
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
 from tourillon.core.gossip.registry import MemberRegistry
@@ -71,9 +72,13 @@ class TopologyManager:
     immediately stale.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._lock = asyncio.Lock()
         self._registry = MemberRegistry()
+        self._clock = clock
+        # Local monotonic time at which each member's phase was last seen to
+        # change; feeds the "since" column of operator views.
+        self._phase_since: dict[str, float] = {}
         self._ring = Ring.empty()
         self._ring_changed = asyncio.Condition()
         # Bumped on every ring or ownership change; lets waiters detect a
@@ -144,6 +149,11 @@ class TopologyManager:
             return self._fingerprint  # type: ignore[return-value]
 
     @property
+    def phase_since(self) -> Mapping[str, float]:
+        """Monotonic time at which each member's phase was last seen to change."""
+        return self._phase_since
+
+    @property
     def generation(self) -> int:
         """Counter of ring and ownership changes; read it before a snapshot."""
         return self._generation
@@ -173,6 +183,8 @@ class TopologyManager:
             )
             return False
         self._fingerprint = None  # invalidate cache on any accepted mutation
+        if old is None or old.phase is not member.phase:
+            self._phase_since[member.node_id] = self._clock()
         return self._update_ring(old, member)
 
     def _update_ring(self, old: Member | None, new: Member) -> bool:

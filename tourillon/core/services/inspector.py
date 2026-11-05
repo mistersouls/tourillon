@@ -11,28 +11,74 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Operator views of this node and of the cluster as this node sees it.
 
-import asyncio
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator
+Nothing here contacts another node: the member list is the local gossip view
+(no fan-out), statuses combine the local failure detector with the age of the
+member's gossip heartbeat, and every answer has a bounded size whatever the
+cluster size.
+"""
+
+import base64
+import bisect
+import json
+import time
+from collections.abc import Awaitable, Callable, Iterable
+from importlib.metadata import PackageNotFoundError, version
 
 from tourillon.core.gossip.gossiper import GossipStats
-from tourillon.core.gossip.registry import MemberRegistry
+from tourillon.core.gossip.heartbeat import HeartbeatTable
 from tourillon.core.gossip.topology import TopologyManager
+from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer.pool import PeerPool
+from tourillon.core.probe.detector import PeerStatus
+from tourlib.exceptions import ValidationError
 from tourlib.models.gc import GcInfo
 from tourlib.models.inspect import (
-    MemberInspect,
-    NodeInfo,
-    NodeInspectRequest,
+    PHASES,
+    AntiEntropyInfo,
+    MembersPage,
+    MembersRequest,
+    MembersSummary,
+    MemberView,
+    NodeStatus,
+    PhaseCount,
     RingPositionInspect,
     VnodeRangeInspect,
+    now_iso,
 )
+
+_SEVERITY = {"DEAD": 0, "SUSPECT": 1}
+_ANOMALY = 2
+
+type SortKey = tuple
+
+
+def _package_version() -> str:
+    try:
+        return version("tourillon")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def encode_cursor(key: SortKey) -> str:
+    raw = json.dumps(list(key), separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_cursor(cursor: str) -> SortKey:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        key = json.loads(base64.urlsafe_b64decode(padded.encode()))
+    except (ValueError, TypeError) as exc:
+        raise ValidationError("invalid cursor") from exc
+    if not isinstance(key, list) or not key:
+        raise ValidationError("invalid cursor")
+    return tuple(key)
 
 
 class NodeInspector:
-    INSPECT_CHUNK_SIZE = 1024
-
     def __init__(
         self,
         node_id: str,
@@ -41,6 +87,10 @@ class NodeInspector:
         partitioner: Partitioner,
         topologymgr: TopologyManager,
         gc_snapshot: Callable[[], GcInfo],
+        heartbeats: HeartbeatTable,
+        antientropy: Callable[[], AntiEntropyInfo],
+        local_member: Callable[[], Awaitable[Member]],
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._node_id = node_id
         self._stats = stats
@@ -48,141 +98,127 @@ class NodeInspector:
         self._partitioner = partitioner
         self._topologymgr = topologymgr
         self._gc_snapshot = gc_snapshot
+        self._heartbeats = heartbeats
+        self._antientropy = antientropy
+        self._local_member = local_member
+        self._clock = clock
+        self._version = _package_version()
 
-    async def inspect(self, request: NodeInspectRequest) -> AsyncIterator[NodeInfo]:
+    async def status(self) -> NodeStatus:
         topology = await self._topologymgr.snapshot()
-        snapshot_at = NodeInfo.now_iso()
-        self_member = self._build_self_member(topology.registry)
-        filters = self._build_filters(request)
-        member_by_id = self._build_node_map(
-            topology.registry,
-            prefix=request.node_id_prefix,
-            phase_filter=filters["phases"],
-            probe_filter=filters["probe_statuses"],
+        me = topology.registry.get(self._node_id)
+        count = len(topology.registry)
+        if me is None:
+            # An IDLE node waiting for "node join" has not gossiped itself yet.
+            me = await self._local_member()
+            count += 1
+
+        now = self._clock()
+        ready_alive = sum(
+            1
+            for member in topology.registry
+            if member.phase is MemberPhase.READY
+            and self.status_of(member.node_id, count, now) == "ALIVE"
         )
-        ring_position = self._build_ring_position(topology.ring)
-        node_ids = self._collect_node_ids(member_by_id, request)
-        chunk_size = min(self.INSPECT_CHUNK_SIZE, request.limit)
-        gossip_stats = self._stats.to_dict()
-        gc_info = self._gc_snapshot()
+        return NodeStatus(
+            node_id=self._node_id,
+            address=me.peer_address,
+            version=self._version,
+            snapshot_at=now_iso(),
+            phase=me.phase.value.upper(),
+            epoch=me.epoch,
+            since_s=self._phase_age(self._node_id, now),
+            ring_position=self._build_ring_position(topology.ring),
+            members=MembersSummary(total=count, ready_alive=ready_alive),
+            antientropy=self._antientropy(),
+            gc=self._gc_snapshot(),
+            gossip_stats=self._stats.to_dict(),
+        )
 
-        if not node_ids:
-            yield self._build_chunk(
-                snapshot_at=snapshot_at,
-                chunk_index=0,
-                chunk_ids=(),
-                member_by_id=member_by_id,
-                total_nodes=0,
-                chunk_size=chunk_size,
-                gossip_stats=gossip_stats,
-                ring_position=ring_position,
-                self_member=self_member,
-                gc_info=gc_info,
-            )
-            return
+    async def members(self, request: MembersRequest) -> MembersPage:
+        topology = await self._topologymgr.snapshot()
+        now = self._clock()
+        count = len(topology.registry)
+        views = [self._view(member, count, now) for member in topology.registry]
+        summary = summarise(views)
 
-        for chunk_index, chunk_ids in enumerate(
-            self._iter_chunks(node_ids, chunk_size)
-        ):
-            yield self._build_chunk(
-                snapshot_at=snapshot_at,
-                chunk_index=chunk_index,
-                chunk_ids=chunk_ids,
-                member_by_id=member_by_id,
-                total_nodes=len(node_ids),
-                chunk_size=chunk_size,
-                gossip_stats=gossip_stats,
-                ring_position=ring_position,
-                self_member=self_member,
-                gc_info=gc_info,
-            )
-            # yield loop
-            await asyncio.sleep(0)
+        selected = [
+            (self._sort_key(view, request, now), view)
+            for view in views
+            if matches(view, request)
+        ]
+        selected.sort(key=lambda pair: pair[0])
+        keys = [key for key, _ in selected]
+        start = 0
+        if request.cursor is not None:
+            try:
+                start = bisect.bisect_right(keys, decode_cursor(request.cursor))
+            except TypeError as exc:
+                raise ValidationError("invalid cursor") from exc
 
-    @staticmethod
-    def _build_filters(request: NodeInspectRequest) -> dict[str, set[str]]:
-        return {
-            "phases": set(request.phases),
-            "probe_statuses": set(request.probe_statuses),
-        }
+        end = start + request.limit
+        page = selected[start:end]
+        cursor = encode_cursor(page[-1][0]) if page and end < len(selected) else None
+        return MembersPage(
+            node_id=self._node_id,
+            snapshot_at=now_iso(),
+            members=count,
+            summary=summary,
+            items=tuple(view for _, view in page),
+            total=len(selected),
+            cursor=cursor,
+            anomalies_only=request.anomalies_only,
+        )
 
-    def _build_node_map(
-        self,
-        registry: Iterable,
-        *,
-        prefix: str | None,
-        phase_filter: set[str],
-        probe_filter: set[str],
-    ) -> dict[str, MemberInspect]:
-        members: dict[str, MemberInspect] = {}
-        for member in sorted(registry, key=lambda item: item.node_id):
-            node_id = member.node_id
-            phase = member.phase.value.upper()
-            status = self._status_for(node_id)
-            if prefix is not None and not node_id.startswith(prefix):
-                continue
-            if phase_filter and phase not in phase_filter:
-                continue
-            if probe_filter and status not in probe_filter:
-                continue
-            members[node_id] = MemberInspect(
-                node_id=node_id,
-                phase=phase,
-                status=status,
-                epoch=member.epoch,
-            )
-        return members
-
-    def _build_self_member(self, registry: MemberRegistry) -> MemberInspect:
-        member = registry.get(self._node_id)
+    async def member_view(self, node_id: str) -> MemberView | None:
+        """This node's view of one member; None when it is not a member."""
+        topology = await self._topologymgr.snapshot()
+        member = topology.registry.get(node_id)
         if member is None:
-            raise RuntimeError(
-                f"self member '{self._node_id}' not found in topology registry"
-            )
-        return MemberInspect(
-            node_id=member.node_id,
-            phase=member.phase.value.upper(),
-            status=self._status_for(member.node_id),
-            epoch=member.epoch,
-        )
+            return None
+        return self._view(member, len(topology.registry), self._clock())
 
-    def _status_for(self, node_id: str) -> str:
+    def status_of(self, node_id: str, count: int, now: float) -> str:
+        """Return ALIVE, SUSPECT or DEAD as this node sees the member.
+
+        The worst of two signals wins: the heartbeat age, known for every
+        member, and the failure detector, known only for connected peers.
+        """
         if node_id == self._node_id:
-            return "-"
+            return "ALIVE"
+        status = self._heartbeats.status(node_id, count, now)
+        detector = self._peer_pool.failure_detector(node_id)
+        if detector is not None and status is PeerStatus.ALIVE:
+            status = detector.status()
+        return status.value.upper()
 
-        fd = self._peer_pool.failure_detector(node_id)
-        if fd is not None:
-            status = fd.status()
-            return status.value.upper()
+    def _phase_age(self, node_id: str, now: float) -> float | None:
+        since = self._topologymgr.phase_since.get(node_id)
+        return None if since is None else max(0.0, now - since)
 
-        return "UNKNOWN"
-
-    @staticmethod
-    def _collect_node_ids(
-        member_by_id: dict[str, MemberInspect],
-        request: NodeInspectRequest,
-    ) -> list[str]:
-        node_ids: list[str] = []
-        for node_id in sorted(member_by_id):
-            if request.cursor is not None and node_id <= request.cursor:
-                continue
-            if request.only_anomalies and not NodeInspector._is_anomalous(
-                member_by_id.get(node_id),
-            ):
-                continue
-            node_ids.append(node_id)
-        return node_ids
-
-    @staticmethod
-    def _is_anomalous(member: MemberInspect | None) -> bool:
-        if member is None:
-            return False
-        return member.phase != "READY" or member.status in {"SUSPECT", "DEAD"}
+    def _view(self, member: Member, count: int, now: float) -> MemberView:
+        status = self.status_of(member.node_id, count, now)
+        heard = self._heartbeats.age(member.node_id, now)
+        since = self._phase_age(member.node_id, now)
+        if status != "ALIVE" and heard is not None:
+            since = heard if since is None else min(since, heard)
+        return MemberView(
+            node_id=member.node_id,
+            address=member.peer_address,
+            phase=member.phase.value.upper(),
+            status=status,
+            epoch=member.epoch,
+            last_heard_s=heard,
+            since_s=since,
+        )
 
     @staticmethod
-    def _iter_chunks(node_ids: list[str], chunk_size: int) -> Iterator[tuple[str, ...]]:
-        for start in range(0, len(node_ids), chunk_size):
-            yield tuple(node_ids[start : start + chunk_size])
+    def _sort_key(view: MemberView, request: MembersRequest, now: float) -> SortKey:
+        if not request.anomalies_only:
+            return (view.node_id,)
+        severity = _SEVERITY.get(view.status, _ANOMALY)
+        changed_at = now - (view.since_s or 0.0)
+        return (severity, changed_at, view.node_id)
 
     def _build_ring_position(self, ring) -> RingPositionInspect:
         vnode_ranges: list[VnodeRangeInspect] = []
@@ -195,10 +231,12 @@ class NodeInspector:
 
             partitions = self._partitioner.arc_count(partition_range.arc)
             owned_partitions += partitions
-            token = self._format_token(partition_range.owner.token)
-            arc = partition_range.arc
             vnode_ranges.append(
-                VnodeRangeInspect(token=token, arc=arc, partitions=partitions)
+                VnodeRangeInspect(
+                    token=f"0x{partition_range.owner.token:x}",
+                    arc=partition_range.arc,
+                    partitions=partitions,
+                )
             )
 
         owned_percent = 0.0 if total == 0 else (owned_partitions / total) * 100
@@ -210,40 +248,31 @@ class NodeInspector:
             vnode_ranges=tuple(vnode_ranges),
         )
 
-    @staticmethod
-    def _format_token(token: int) -> str:
-        return f"0x{token:x}"
 
-    def _build_chunk(
-        self,
-        *,
-        snapshot_at: str,
-        chunk_index: int,
-        chunk_ids: tuple[str, ...],
-        member_by_id: dict[str, MemberInspect],
-        total_nodes: int,
-        chunk_size: int,
-        gossip_stats: dict[str, int | str | None],
-        ring_position: RingPositionInspect,
-        self_member: MemberInspect,
-        gc_info: GcInfo,
-    ) -> NodeInfo:
-        end = (chunk_index + 1) * chunk_size
-        has_more = end < total_nodes
-        next_cursor = chunk_ids[-1] if has_more else None
-        return NodeInfo(
-            node_id=self._node_id,
-            gc=gc_info,
-            snapshot_at=snapshot_at,
-            chunk_index=chunk_index,
-            has_more=has_more,
-            next_cursor=next_cursor,
-            self_member=self_member,
-            members=tuple(
-                member_by_id[node_id]
-                for node_id in chunk_ids
-                if node_id in member_by_id
-            ),
-            ring_position=ring_position,
-            gossip_stats=gossip_stats if chunk_index == 0 else {},
+def matches(view: MemberView, request: MembersRequest) -> bool:
+    if request.anomalies_only:
+        return view.anomalous
+    if request.phases and view.phase not in request.phases:
+        return False
+    if request.statuses and view.status not in request.statuses:
+        return False
+    return request.prefix is None or view.node_id.startswith(request.prefix)
+
+
+def summarise(views: Iterable[MemberView]) -> tuple[PhaseCount, ...]:
+    """Count members per phase and status; only phases present appear."""
+    counts: dict[str, dict[str, int]] = {}
+    for view in views:
+        row = counts.setdefault(view.phase, {"ALIVE": 0, "SUSPECT": 0, "DEAD": 0})
+        row[view.status] = row.get(view.status, 0) + 1
+
+    order = {phase: index for index, phase in enumerate(PHASES)}
+    return tuple(
+        PhaseCount(
+            phase=phase,
+            alive=counts[phase]["ALIVE"],
+            suspect=counts[phase]["SUSPECT"],
+            dead=counts[phase]["DEAD"],
         )
+        for phase in sorted(counts, key=lambda p: (order.get(p, len(order)), p))
+    )

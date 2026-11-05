@@ -96,6 +96,9 @@ class Application:
             serializer=self._serializer,
             storage_provider=self._storage_provider,
             telemetry_provider=self._telemetry_provider,
+            certificate_expires_at=self._crypto.certificate_expiry(
+                config.tls.certificate_pem()
+            ),
         )
         logger.debug("Manager created for node '%s'", config.node.id)
         return manager

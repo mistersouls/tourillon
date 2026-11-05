@@ -72,7 +72,7 @@ def ready_peers(drain_journey: Journey) -> None:
     wait_for(lambda: drain_journey.ready(remaining), "second node ready", timeout=30)
 
     def both_ready() -> bool:
-        members = drain_journey.inspect(draining)["members"]
+        members = drain_journey.members(draining)
         return len(members) == 2 and all(m["phase"] == "READY" for m in members)
 
     wait_for(both_ready, "two READY members", timeout=30)
@@ -97,11 +97,26 @@ def write_reference_data(drain_journey: Journey) -> None:
     assert drain_journey.inspect(draining)["ring_position"]["owned_partitions"] > 0
 
 
+@given("the remaining peer is stopped")
+def stop_remaining_peer(drain_journey: Journey) -> None:
+    drain_journey.stop(drain_journey.nodes["remaining-node"])
+
+
 @when("the operator requests that the node drain")
 def request_drain(drain_journey: Journey) -> None:
     node = drain_journey.nodes["draining-node"]
     drain_journey.observations["drain"] = drain_journey.ctl_result(
         node, "node", "drain", node.peer
+    )
+
+
+@when("the operator requests and cancels draining")
+def request_and_cancel_drain(drain_journey: Journey) -> None:
+    node = drain_journey.nodes["draining-node"]
+    requested = drain_journey.ctl_result(node, "node", "drain", node.peer)
+    assert requested.returncode == 0, requested.stdout + requested.stderr
+    drain_journey.observations["cancel_drain"] = drain_journey.ctl_result(
+        node, "node", "drain", node.peer, "--cancel"
     )
 
 
@@ -119,8 +134,8 @@ def drain_completed(drain_journey: Journey) -> None:
     remaining = drain_journey.nodes["remaining-node"]
 
     def completed() -> bool:
-        assert drain_journey.inspect(draining)["self_member"]["phase"] == "IDLE"
-        members = drain_journey.inspect(remaining)["members"]
+        assert drain_journey.inspect(draining)["phase"] == "IDLE"
+        members = drain_journey.members(remaining)
         drained = next(m for m in members if m["node_id"] == draining.name)
         assert drained["phase"] == "IDLE"
         assert drain_journey.ready(remaining)
@@ -146,3 +161,27 @@ def drain_rejected(drain_journey: Journey) -> None:
     assert "without another node" in result.stderr
     assert "Traceback" not in result.stderr
     assert drain_journey.ready(drain_journey.nodes["draining-node"])
+
+
+@then("the draining node returns to ready")
+def drain_cancelled(drain_journey: Journey) -> None:
+    result = drain_journey.observations["cancel_drain"]
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "DRAINING -> READY" in result.stdout
+    assert drain_journey.ready(drain_journey.nodes["draining-node"])
+
+
+@then("the restarted peer can read all written data")
+def restarted_peer_reads_data(drain_journey: Journey) -> None:
+    remaining = drain_journey.nodes["remaining-node"]
+    drain_journey.start(remaining)
+    wait_for(lambda: drain_journey.ready(remaining), "restarted peer ready", timeout=30)
+
+    def all_data_readable() -> bool:
+        for key, value in drain_journey.references.items():
+            drain_journey.check(remaining, key, value)
+        return True
+
+    wait_for(
+        all_data_readable, "all values readable after drain cancellation", timeout=60
+    )

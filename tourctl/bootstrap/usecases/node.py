@@ -15,87 +15,93 @@
 from cyclopts import App
 
 from tourctl.bootstrap.usecases.common import GlobalOptions
-from tourctl.core import inspect_node
+from tourctl.core import node_status
 from tourctl.core.nodedrain import drain
-from tourctl.core.nodegc import collect
+from tourctl.core.nodehealth import node_health
 from tourctl.core.nodejoin import join
+from tourctl.core.nodepause import pause
+from tourctl.core.noderesume import resume
 
 node_app = App(name="node", help="Node lifecycle and inspection commands.")
 
 
-@node_app.command(name="gc")
-async def node_gc(
+@node_app.command(name="status")
+async def node_status_cmd(
     address: str,
-    *,
-    dry_run: bool = False,
-    partition: int | None = None,
-    wait: bool = False,
-    timeout: float = 60.0,
+    vnodes: bool = False,
     json: bool = False,
     opts: GlobalOptions | None = None,
-) -> str:
-    """Submit local historical GC; never purge current state or compact files.
+) -> None:
+    """Summarise one node: phase, ring, anti-entropy, GC, storage and TLS.
 
-    :param address: Target node's peer endpoint.
-    :param dry_run: Estimate without modifying storage.
-    :param partition: Restrict the pass to this partition; default is all local partitions.
-    :param wait: Wait for this job's completion, without cancelling on timeout.
-    :param timeout: Maximum wait in seconds when --wait is used.
-    :param json: Return exact structured counts instead of human-readable units.
+    :param address: Direct peer address of the node, never a load balancer.
+    :param vnodes: Add the table of vnodes and the partitions they own.
+    :param json: Print the full status as JSON.
     :param opts: Client configuration and context options.
     """
     opts = opts or GlobalOptions()
-    return await collect(
-        address,
-        dry_run=dry_run,
-        partition=partition,
-        wait=wait,
-        timeout=timeout,
+    output = await node_status(
+        address=address,
+        vnodes=vnodes,
         as_json=json,
         tourconf=opts.tourconf,
         context_name=opts.context,
     )
+    print(output)
 
 
-@node_app.command(name="inspect")
-async def node_inspect(
+@node_app.command(name="health")
+async def node_health_cmd(
     address: str,
     json: bool = False,
-    phases: list[str] | None = None,
-    probe_statuses: list[str] | None = None,
-    node_id_prefix: str | None = None,
-    only_anomalies: bool = False,
-    limit: int = 500,
-    cursor: str | None = None,
     opts: GlobalOptions | None = None,
-) -> str:
-    """Inspect a node over the peer endpoint and render text or JSON output."""
+) -> None:
+    """Local verdict for supervision: exit 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN.
+
+    :param address: Direct peer address of the node, never a load balancer.
+    :param json: Print the verdict and its reasons as JSON.
+    :param opts: Client configuration and context options.
+    """
     opts = opts or GlobalOptions()
-    return await inspect_node(
+    output = await node_health(
         address=address,
         as_json=json,
-        phases=tuple(phases or ()),
-        probe_statuses=tuple(probe_statuses or ()),
-        node_id_prefix=node_id_prefix,
-        only_anomalies=only_anomalies,
-        limit=limit,
-        cursor=cursor,
         tourconf=opts.tourconf,
         context_name=opts.context,
     )
+    print(output.text)
+    if output.exit_code:
+        raise SystemExit(output.exit_code)
 
 
 @node_app.command(name="join")
 async def node_join(
     address: str,
     seeds: set[str] | None = None,
+    wait: bool = False,
+    timeout: float = 600.0,
+    cancel: bool = False,
+    json: bool = False,
     opts: GlobalOptions | None = None,
 ) -> str:
-    """Trigger node to join a cluster with given seeds or configured seeds."""
+    """Join a cluster, cancel joining, or wait for the requested transition.
+
+    :param address: Direct peer address of the node to join.
+    :param seeds: Optional comma-separated seed addresses.
+    :param wait: Wait until READY or IDLE after cancellation.
+    :param timeout: Maximum wait duration in seconds.
+    :param cancel: Cancel an in-progress join and return the node to IDLE.
+    :param json: Print structured output.
+    :param opts: Client configuration and context options.
+    """
     opts = opts or GlobalOptions()
     return await join(
         address=address,
         seeds=seeds,
+        wait=wait,
+        timeout=timeout,
+        cancel=cancel,
+        as_json=json,
         tourconf=opts.tourconf,
         context_name=opts.context,
     )
@@ -104,16 +110,76 @@ async def node_join(
 @node_app.command(name="drain")
 async def node_drain(
     address: str,
+    wait: bool = False,
+    timeout: float = 600.0,
+    cancel: bool = False,
+    json: bool = False,
     opts: GlobalOptions | None = None,
 ) -> str:
-    """Initiate asynchronous draining; acknowledgement does not mean completion.
+    """Drain a node, cancel draining, or wait for the requested transition.
 
-    :param address: The peer endpoint of the node to drain.
+    :param address: Direct peer address of the node to drain.
+    :param wait: Wait until IDLE or READY after cancellation.
+    :param timeout: Maximum wait duration in seconds.
+    :param cancel: Cancel an in-progress drain and return the node to READY.
+    :param json: Print structured output.
     :param opts: Client configuration and context options.
     """
     opts = opts or GlobalOptions()
     return await drain(
         address=address,
+        wait=wait,
+        timeout=timeout,
+        cancel=cancel,
+        as_json=json,
+        tourconf=opts.tourconf,
+        context_name=opts.context,
+    )
+
+
+@node_app.command(name="pause")
+async def node_pause(
+    address: str,
+    json: bool = False,
+    opts: GlobalOptions | None = None,
+) -> str:
+    """Pause user operations while keeping the node on the ring.
+
+    :param address: Direct peer address of the node to pause.
+    :param json: Print the acknowledgement as JSON.
+    :param opts: Client configuration and context options.
+    """
+    opts = opts or GlobalOptions()
+    return await pause(
+        address=address,
+        as_json=json,
+        tourconf=opts.tourconf,
+        context_name=opts.context,
+    )
+
+
+@node_app.command(name="resume")
+async def node_resume(
+    address: str,
+    wait: bool = False,
+    timeout: float = 300.0,
+    json: bool = False,
+    opts: GlobalOptions | None = None,
+) -> str:
+    """Resume a paused node; optionally wait until anti-entropy reaches READY.
+
+    :param address: Direct peer address of the node to resume.
+    :param wait: Wait for synchronization and the READY phase.
+    :param timeout: Maximum wait duration in seconds.
+    :param json: Print the result as JSON.
+    :param opts: Client configuration and context options.
+    """
+    opts = opts or GlobalOptions()
+    return await resume(
+        address=address,
+        wait=wait,
+        timeout=timeout,
+        as_json=json,
         tourconf=opts.tourconf,
         context_name=opts.context,
     )

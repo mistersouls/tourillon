@@ -40,11 +40,11 @@ async def put(request: Envelope) -> AsyncIterator[Envelope]:
             namespace=data["namespace"],
             quorum_write=_quorum(data, "quorum_write"),
         )
-        version = await manager.store.put(put_req)
+        outcome = await manager.store.put_outcome(put_req)
         yield replay_envelope(
             kind="kv.put.accept",
             request=request,
-            payload=serializer.encode(None if version is None else version.to_dict()),
+            payload=serializer.encode(outcome.to_dict()),
         )
     except StoreOperationError as exc:
         yield replay_envelope(
@@ -65,11 +65,11 @@ async def get(request: Envelope) -> AsyncIterator[Envelope]:
             namespace=data["namespace"],
             quorum_read=_quorum(data, "quorum_read"),
         )
-        version = await manager.store.get(get_req)
+        outcome = await manager.store.get_outcome(get_req)
         yield replay_envelope(
             kind="kv.get.accept",
             request=request,
-            payload=serializer.encode(None if version is None else version.to_dict()),
+            payload=serializer.encode(outcome.to_dict()),
         )
     except StoreOperationError as exc:
         yield replay_envelope(
@@ -90,11 +90,11 @@ async def delete(request: Envelope) -> AsyncIterator[Envelope]:
             namespace=data["namespace"],
             quorum_write=_quorum(data, "quorum_write"),
         )
-        version = await manager.store.delete(delete_req)
+        outcome = await manager.store.delete_outcome(delete_req)
         yield replay_envelope(
             kind="kv.delete.accept",
             request=request,
-            payload=serializer.encode(None if version is None else version.to_dict()),
+            payload=serializer.encode(outcome.to_dict()),
         )
     except StoreOperationError as exc:
         yield replay_envelope(

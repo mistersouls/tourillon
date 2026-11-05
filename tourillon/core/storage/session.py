@@ -331,10 +331,11 @@ class GroupSession:
         return found is not None
 
     async def obligation_page(
-        self, start: bytes | None, limit: int
+        self, start: bytes | None, limit: int, target: str | None = None
     ) -> tuple[list[ObligationKey], bytes | None]:
         """Read a bounded page of obligations after an exclusive cursor.
 
+        ``target`` restricts the page to the obligations owed to that node.
         Malformed entries are logged and skipped; the cursor follows the
         physical page so they cannot stall a scan. None means exhausted.
         """
@@ -343,7 +344,10 @@ class GroupSession:
 
         async with self._session.batch() as batch:
             batch.list(
-                Keyspace.META, prefix=ObligationPrefix(), start=start, limit=limit
+                Keyspace.META,
+                prefix=ObligationPrefix(target),
+                start=start,
+                limit=limit,
             )
         (page,) = await batch.result()
 

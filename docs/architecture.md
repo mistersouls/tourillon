@@ -52,8 +52,8 @@ Shutdown is ordered: `NodeLifecycle.stop()` (client server → drain and join ta
 
 Shutdown signals do not initiate a drain. Only an explicit `tourctl node drain`
 request transitions a `READY` or `PAUSED` node to `DRAINING`. The command acknowledges
-initiation, not completion: use `tourctl node inspect` on the peer endpoint to
-observe the final `IDLE` phase. New writes (including replicated writes) are refused,
+initiation, not completion: use `tourctl node status ADDRESS` on the node's
+peer address to observe the final `IDLE` phase. New writes (including replicated writes) are refused,
 but reads and their background read repairs remain available throughout
 `DRAINING`. Admitted mutations and a snapshot of detached writes and read repairs
 settle before anti-entropy hands the stored partitions to their replacement
@@ -84,6 +84,28 @@ because there is no destination for its ranges.
 At departure, at most five eligible peer addresses are persisted as restart
 seeds; selection stops as soon as this bound is reached.
 
+**Pause and resume.** `tourctl node pause ADDRESS` keeps the node's vnodes on
+the ring and immediately refuses new reads and writes; it does not wait for
+in-flight work or hand data off. The pause is rejected unless another reachable
+`READY` peer can serve data. A paused node still accepts internal anti-entropy
+traffic but does not serve client operations. `tourctl node resume ADDRESS`
+starts catch-up through the join synchronization goal while the node remains
+`PAUSED`; only after the goal completes does it reopen the client listener and
+publish `READY`. `--wait --timeout S` polls `node.inspect` on the same peer
+connection until `READY` or timeout. A paused node remains paused if
+synchronization fails, and a process restarted in `PAUSED` starts peer, gossip
+and anti-entropy services without opening its client listener.
+
+`tourctl node join ADDRESS --cancel` cancels an active join and returns the node
+to `IDLE`; a node already in `READY` treats `node join` as a no-op. Cancelling a
+drain with `tourctl node drain ADDRESS --cancel` returns the node to `READY`,
+reopens its client listener and resumes anti-entropy. Any partitions already
+handed off are reconciled back by anti-entropy; local data is retained. Both
+commands support `--wait --timeout S`, which follows `node.inspect` on the same
+direct peer connection, and `--cancel --wait` waits for the cancellation phase.
+The cancelled join keeps gossip active so peers receive its `IDLE` membership
+update.
+
 ### Two servers, two dispatchers
 
 | Server | Bind | Dispatcher | Traffic |
@@ -112,7 +134,9 @@ The peer server starts first; the client server only opens once the node has joi
 | `GossipService` / `Gossiper` | Membership dissemination and anti-entropy |
 | `AntiEntropyService` | The only mechanism copying versions between nodes: obligation delivery, sweep, join and drain goals |
 | `ObligationQueue` | Bounded in-memory hotqueue of durable replication obligations, shared by the store and anti-entropy |
-| `NodeInspector` | Paginated introspection for `node.inspect` |
+| `NodeInspector` | Operator views: `node.inspect` (one node's status) and `node.members` (paginated member list) |
+| `MemberInspector` | One member's ring share and stand-ins plus neighbour-held anti-entropy obligations; peer queries are capped at 16 concurrent calls and 2 s each |
+| `NodeReport` | Enriches node status with storage usage, TLS handshake/certificate details and join/drain progress; computes the local `node.health` verdict without contacting other nodes |
 | `HLCClock` | Hybrid logical clock, restored from storage at boot |
 | `FailureDetectorProvider` | Per-peer phi-accrual detectors |
 
@@ -283,6 +307,8 @@ Every `gossip.push` carries a `hop_limit` (`gossip.hop_limit`, 3 by default). A 
 Membership anti-entropy (the gossip `ae_interval` loop) and data anti-entropy (§9) are separate loops: membership state is tiny and must converge in seconds, data comparison is large and is paced over minutes.
 
 `PhiAccrual` turns inter-arrival times of successful probes into a suspicion value; `PeerFailureDetector` drives probes per peer and exposes a status consumed by placement.
+
+Failure detectors only exist for peers a node talks to. To give every node an opinion on every member, each node also keeps a `HeartbeatTable`: its own counter is bumped once per membership anti-entropy cycle, the whole table rides on `gossip.ping` / `gossip.pong`, and entries merge by maximum. The local time a counter last increased gives `LAST HEARD`; a member is `SUSPECT` after `ae_interval × (log2(n) + 3)` without news and `DEAD` after three times that. A connected peer's failure detector overrides an `ALIVE` heartbeat. These statuses only feed operator views (`tourctl cluster status`); placement keeps using the failure detectors.
 
 Invariants:
 
@@ -482,6 +508,30 @@ A maximal record (16 MiB value) always fits one batch on its own.
 
 Anti-entropy is mandatory: delivery and the periodic sweep always start.
 
+### Operator view
+
+`AntiEntropyInspector` (`core/services/aeinspector.py`) answers the `ae`
+peer service without touching the delivery path. `ae.status` returns the
+worker state, counters since start (deliveries, delivery errors, completed
+sweeps, diverged, pulled and pushed versions, sweep errors) and one page of
+targets owed data, oldest debt first. Each target carries its pending version
+count, oldest obligation, phase, reachability, backoff delay and last error.
+A target is **stuck** when it is `ALIVE` in a delivery phase, has no backoff,
+and the worker uptime, its oldest obligation and its last successful delivery
+are all older than `max(60 s, 2 ? retry delay)`.
+`ae.obligations` pages the persisted obligations, optionally for one target.
+Both scans stop at a fixed limit and then report lower bounds (`truncated`);
+cursors are opaque and rejected with `invalid_request` when malformed.
+`tourctl ae status ADDRESS` and `tourctl ae obligations ADDRESS [--target
+NODE]` render them, with `--limit`, `--cursor` and `--json`.
+
+`NodeReport` adds storage usage, local certificate expiry and rejected-handshake
+counts, and active join/drain progress to `node.inspect`. Its `node.health`
+verdict is local and has no fan-out: storage at 80% and older pending
+obligations produce warnings; storage at 95%, an expired certificate, stuck
+delivery or stopped workers produce critical reasons. The anti-entropy worker
+being stopped on an `IDLE` node is expected and is not reported as a failure.
+
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `sweep_period` | `600` | seconds to compare every unit once |
@@ -545,12 +595,14 @@ Handlers are async generators registered once per kind on the peer or client dis
 | --- | --- | --- |
 | `probe` | client, peer | `probe.ping` → `probe.pong` |
 | `kv` | client, peer | `kv.put` / `kv.get` / `kv.delete` / `kv.repair` |
-| `node` | peer | `node.join` / `node.drain` / `node.gc` / `node.gc.status` |
-| `inspect` | peer | `node.inspect` → paginated `node.info` |
+| `node` | peer | `node.join` / `node.drain` |
+| `gc` | peer | `gc.run` (submit a pass) / `gc.status` (worker and retained passes) |
+| `ae` | peer | `ae.status` (worker counters, pending targets; optionally filtered to one target) / `ae.obligations` (one page of obligations) |
+| `inspect` | peer | `node.inspect` → `node.inspect.accept` (status); `node.members` → `node.members.accept` (one page); `node.member` → `node.member.accept` (member detail and bounded neighbour AE view) |
 
 `gossip.*`, `replication.*` and `antientropy.*` are internal to the cluster and deliberately have no client service.
 
-`tourctl` builds on those services with cyclopts commands (`probe ping`, `node inspect`, `node join`, `node drain`, `node gc`, `put`, `get`, `delete`, `repair`). Commands stay thin; rendering and error mapping live in `tourctl/core/`, which translates configuration, TLS/connectivity and protocol failures into actionable `SystemExit` messages instead of tracebacks.
+`tourctl` builds on those services with cyclopts commands (`probe ping`, `cluster status`, `node status`, `node join`, `node drain`, `node pause`, `node resume`, `gc run`, `gc status`, `ae status`, `ae obligations`, `put`, `get`, `delete`, `repair`). Commands stay thin; rendering and error mapping live in `tourctl/core/`, which translates configuration, TLS/connectivity and protocol failures into actionable `SystemExit` messages instead of tracebacks.
 
 `tourillon config ca | client | node` generates the mTLS material and the TOML configuration files that both sides consume.
 
@@ -638,18 +690,19 @@ retention checks. Status exposes job ID, state, scope, current group, counts,
 logical record bytes, start/finish timestamps and errors. Estimates are local
 snapshots, not reservations or predicted filesystem savings.
 
-`tourctl node gc ADDRESS [--partition PID] [--dry-run] [--wait] [--timeout 60]
-[--json]` targets the peer endpoint. `node.gc` acknowledges submission only;
-`--wait` polls `node.gc.status` for that exact job, with a bounded wait that
-never cancels server work. Already queued/running requests are rejected.
+`tourctl gc run ADDRESS [--partition PID] [--dry-run] [--wait] [--timeout 60]
+[--json]` targets the peer endpoint. `gc.run` acknowledges submission only;
+`--wait` polls `gc.status` and follows that exact job, with a bounded wait
+that never cancels server work. Already queued/running requests are rejected.
 Failures and cancellation produce nonzero CLI exits; JSON failure output is
-structured on stderr. `node inspect` includes the worker and latest pass in
-text and JSON, without a separate CLI status command. The worker retains at
-most 64 completed job results in memory; expired or unknown IDs are rejected
-explicitly. The status describes scan progress, not a precomputed percentage
-or interleaved hot work. Human output uses binary byte units; JSON keeps exact
-integers. There is no force, compaction, policy mutation or cluster-wide
-collection option.
+structured on stderr. `tourctl gc status ADDRESS [--job PREFIX] [--all]
+[--json]` reads `gc.status`: the worker settings, the next periodic pass and
+the retained passes, newest first, including the one in progress. The worker
+retains at most 64 passes in memory; `--job` resolves a unique prefix on the
+client. `node status` keeps a one-line summary of the latest pass. The status
+describes scan progress, not a precomputed percentage or interleaved hot work.
+Human output uses binary byte units; JSON keeps exact integers. There is no
+force, compaction, policy mutation or cluster-wide collection option.
 
 The contract preserves current state under the replication requested at write time; it does not retain history indefinitely. Free backend pages can be reused, but file size need not decrease after GC.
 

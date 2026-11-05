@@ -65,6 +65,29 @@ class DrainError(Exception):
         self.error = error
 
 
+class PauseError(Exception):
+    """Raised when a node cannot be paused safely."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__(error)
+        self.error = error
+
+
+class ResumeError(Exception):
+    """Raised when a node cannot begin resuming."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__(error)
+        self.error = error
+
+
+class MemberNotFoundError(Exception):
+    """Raised when the local membership view has no such member."""
+
+    def __init__(self, node_id: str, viewer_id: str) -> None:
+        super().__init__(f"{node_id} is not a member known to {viewer_id}.")
+
+
 class StoreOperationError(Exception):
     """Raised when a distributed store operation fails across one or more peers."""
 
@@ -126,8 +149,12 @@ class NodeDrainingError(StoreOperationError):
 
     code = "node_draining"
 
-    def __init__(self, operation: str) -> None:
-        self._set_details(operation, (), f"{operation}: node is draining or idle")
+    def __init__(self, operation: str, node_id: str) -> None:
+        self.node_id = node_id
+        self._set_details(operation, (), f"{operation}: {node_id} is draining or idle")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**super().to_dict(), "node_id": self.node_id}
 
 
 class QuorumNotMetError(StoreOperationError):
@@ -226,6 +253,33 @@ class InvalidQuorumError(StoreOperationError):
 
     def to_dict(self) -> dict[str, Any]:
         return {**super().to_dict(), "quorum": self.quorum}
+
+
+class QuorumUnreachableError(StoreOperationError):
+    """Raised when a write asks for more acknowledgements than replicas exist.
+
+    The bound is the configured replication factor, so the quorum could never
+    be met; the write is refused before any version is produced.
+    """
+
+    code = "quorum_unreachable"
+
+    def __init__(self, operation: str, quorum: int, replication_factor: int) -> None:
+        self.quorum = quorum
+        self.replication_factor = replication_factor
+        self._set_details(
+            operation,
+            (),
+            f"{operation}: quorum {quorum} can never be met, "
+            f"replication factor is {replication_factor}",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **super().to_dict(),
+            "quorum": self.quorum,
+            "replication_factor": self.replication_factor,
+        }
 
 
 class InvalidRepairTokenError(StoreOperationError):

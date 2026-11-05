@@ -272,3 +272,33 @@ async def test_generation_counts_ring_and_ownership_changes() -> None:
     assert (
         await asyncio.wait_for(manager.wait_for_change(generation), 1) == generation + 2
     )
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_phase_since_records_new_members_and_phase_changes_only() -> None:
+    now = [10.0]
+    manager = TopologyManager(clock=lambda: now[0])
+
+    def member(epoch: int, phase: MemberPhase) -> Member:
+        return Member(
+            node_id="node-a",
+            peer_address="127.0.0.1:7001",
+            epoch=epoch,
+            phase=phase,
+            tokens=("b",),
+        )
+
+    await manager.apply_member(member(1, MemberPhase.JOINING))
+    assert manager.phase_since == {"node-a": 10.0}
+
+    now[0] = 20.0
+    await manager.apply_member(member(2, MemberPhase.JOINING))
+    assert manager.phase_since["node-a"] == 10.0
+
+    now[0] = 30.0
+    await manager.apply_member(member(1, MemberPhase.READY))
+    assert manager.phase_since["node-a"] == 10.0
+
+    await manager.apply_member(member(3, MemberPhase.READY))
+    assert manager.phase_since["node-a"] == 30.0

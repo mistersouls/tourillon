@@ -40,7 +40,7 @@ class _GossipSpy:
 
     async def pong(self, request):
         self.ping_requests.append(request)
-        return GossipPong(sender="node-a", same=True)
+        return GossipPong(sender="node-a", same=True, heartbeats={"node-a": 3})
 
     async def delta(self, request):
         self.digest_requests.append(request)
@@ -144,6 +144,34 @@ async def test_gossip_ping_handler_returns_pong(
     assert responses[0].kind == "gossip.pong"
     assert payload["same"] is True
     assert spy.ping_requests[0].fingerprint == "abcd"
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_gossip_ping_handler_round_trips_heartbeats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spy = _GossipSpy()
+    manager = _ManagerStub(spy)
+    monkeypatch.setattr(gossip, "get_manager", lambda: manager)
+
+    request = make_envelope(
+        kind="gossip.ping",
+        payload=manager.serializer.encode(
+            {
+                "sender": "node-b",
+                "fingerprint": "abcd",
+                "count": 2,
+                "heartbeats": {"node-b": 12, "node-x": -4},
+            }
+        ),
+    )
+
+    responses = [response async for response in gossip.ping(request)]
+    payload = manager.serializer.decode(responses[0].payload)
+
+    assert spy.ping_requests[0].heartbeats == {"node-b": 12}
+    assert payload["heartbeats"] == {"node-a": 3}
 
 
 @pytest.mark.tourillon

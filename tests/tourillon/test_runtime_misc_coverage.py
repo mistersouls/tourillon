@@ -15,6 +15,7 @@
 import asyncio
 import signal
 import ssl
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,7 +35,7 @@ from tourillon.core.transports.client import PeerClient
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourlib.adapter import MsgPackSerializer
 from tourlib.envelope import build_envelope
-from tourlib.models.inspect import NodeInspectRequest
+from tourlib.models.inspect import AntiEntropyInfo, MembersRequest
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
 
@@ -137,6 +138,7 @@ def _build_manager(tmp_path: Path, storage: _Storage) -> Manager:
         serializer=MsgPackSerializer(),
         storage_provider=_StorageProvider(storage),
         telemetry_provider=_TelemetryProvider(),
+        certificate_expires_at=datetime(2030, 1, 1, tzinfo=UTC),
     )
 
 
@@ -369,14 +371,19 @@ async def test_manager_start_stop_inspect_join_and_serve_forever(
     async def fake_shutdown() -> None:
         stopped.append("pool")
 
-    async def fake_inspect(request):
-        yield {"request": request.limit}
+    async def fake_status():
+        return "status"
+
+    async def fake_members(request):
+        return ("members", request.limit)
 
     manager._lifecycle.start = fake_start  # type: ignore[method-assign]  # noqa: SLF001
     manager._lifecycle.stop = fake_stop  # type: ignore[method-assign]  # noqa: SLF001
     manager._lifecycle.join = fake_join  # type: ignore[method-assign]  # noqa: SLF001
     manager._peer_pool.shutdown = fake_shutdown  # type: ignore[method-assign]  # noqa: SLF001
-    manager._inspector.inspect = fake_inspect  # type: ignore[method-assign]  # noqa: SLF001
+    manager._report.status = fake_status  # type: ignore[method-assign]  # noqa: SLF001
+    manager._report.health = fake_status  # type: ignore[method-assign]  # noqa: SLF001
+    manager._inspector.members = fake_members  # type: ignore[method-assign]  # noqa: SLF001
     manager._clock.restore = lambda wall_ms, counter: restored.append((wall_ms, counter))  # type: ignore[method-assign]  # noqa: SLF001
 
     assert manager.node_id == "manager-node"
@@ -390,8 +397,9 @@ async def test_manager_start_stop_inspect_join_and_serve_forever(
     assert restored == [(12, 3)]
     assert started == [["seed:9000"]]
 
-    infos = [info async for info in manager.inspect(NodeInspectRequest())]
-    assert infos == [{"request": 1024}]
+    assert await manager.inspect() == "status"
+    assert await manager.health() == "status"
+    assert await manager.members(MembersRequest(limit=7)) == ("members", 7)
 
     await manager.join(seeds=["seed:9000"])
     assert joins == [["seed:9000"]]
@@ -410,6 +418,36 @@ async def test_manager_start_stop_inspect_join_and_serve_forever(
     await manager.serve_forever()
     assert started == [None]
     assert stopped == [True, "pool"]
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_manager_antientropy_info_reflects_queue_and_sweep_stats(
+    tmp_path: Path,
+) -> None:
+    manager = _build_manager(tmp_path, _Storage())
+    stats = manager._lifecycle.antientropy.stats  # noqa: SLF001
+    stats.sweeps = 4
+    stats.last_sweep_at = "2026-11-05T10:00:00+00:00"
+    stats.last_sweep_diverged = 3
+    stats.obligations_delivered = 9
+    stats.errors = 1
+    stats.last_failure = "boom"
+    manager._obligations.backlog = False  # noqa: SLF001
+
+    info = manager._antientropy_info()  # noqa: SLF001
+
+    assert info == AntiEntropyInfo(
+        queued=0,
+        inflight=0,
+        backlog=False,
+        sweeps=4,
+        last_sweep_at="2026-11-05T10:00:00+00:00",
+        last_sweep_diverged=3,
+        delivered=9,
+        errors=1,
+        last_failure="boom",
+    )
 
 
 @pytest.mark.tourillon

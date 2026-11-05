@@ -363,6 +363,42 @@ async def test_latest_hlc_restores_the_clock_of_versions_held_for_obligations(
 
 
 @pytest.mark.tourillon
+async def test_lmdb_storage_usage_sums_space_and_versions_over_groups(
+    tmp_path,
+) -> None:
+    config = StorageConfig(data_dir=str(tmp_path), group_size="8Mi")
+    storage = LMDBStorage(config)
+    try:
+        empty = await storage.usage(total_groups=2)
+        assert empty.map_size == 2 * 8 * 1024 * 1024
+        assert empty.versions == 0
+        assert 0 < empty.used < empty.map_size
+
+        provider = await storage.session_provider_for(1)
+        async with provider.session(write=True) as session:
+            for idx in range(3):
+                key, value, tag = _record(7, idx)
+                await session.put(_log_kv(key, value))
+                await session.put(_tag_kv(key, tag))
+
+        usage = await storage.usage(total_groups=2)
+        assert usage.versions == 3
+        assert usage.used >= empty.used
+        assert usage.map_size == empty.map_size
+    finally:
+        await storage.close()
+
+
+@pytest.mark.tourillon
+async def test_lmdb_usage_rejects_a_closed_provider(tmp_path) -> None:
+    provider = _provider(tmp_path)
+    await provider.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        await provider.usage()
+
+
+@pytest.mark.tourillon
 @pytest.mark.asyncio
 async def test_lmdb_storage_wraps_provider_initialization_failures(
     tmp_path, monkeypatch: pytest.MonkeyPatch

@@ -58,6 +58,9 @@ class Preference:
 class PreferenceList:
     placement: PartitionPlacement
     preferences: tuple[Preference, ...]
+    # The configured factor, not len(preferences): a quorum above it can
+    # never be met, while a short list may still grow as members join.
+    replication_factor: int
 
 
 class PlacementStrategy(Protocol):
@@ -134,7 +137,11 @@ class SimplePlacementStrategy:
                 )
             )
 
-        return PreferenceList(placement=placement, preferences=tuple(preferences))
+        return PreferenceList(
+            placement=placement,
+            preferences=tuple(preferences),
+            replication_factor=self._rf,
+        )
 
     async def _handoff_candidates(
         self,

@@ -24,7 +24,7 @@ from tourclient.exception import RequestRejectedError
 from tourlib.adapter import MsgPackSerializer
 from tourlib.envelope import Envelope, replay_envelope
 from tourlib.exceptions import ResponseError
-from tourlib.models.version import Version
+from tourlib.models.kv import ReadOutcome, WriteOutcome
 
 
 def _version_document(namespace: Any, key: Any, value: Any) -> dict[str, Any]:
@@ -45,6 +45,15 @@ def _version_document(namespace: Any, key: Any, value: Any) -> dict[str, Any]:
     }
 
 
+def _written(namespace: Any, key: Any, value: Any) -> dict[str, Any]:
+    return {
+        "version": _version_document(namespace, key, value),
+        "acknowledged": 2,
+        "required": 1,
+        "replicas": 3,
+    }
+
+
 @pytest.mark.asyncio
 async def test_kv_service_put_get_delete_roundtrip(
     mtls_contexts: tuple[ssl.SSLContext, ssl.SSLContext],
@@ -61,7 +70,7 @@ async def test_kv_service_put_get_delete_roundtrip(
         yield replay_envelope(
             kind="kv.put.accept",
             request=request,
-            payload=serializer.encode(_version_document(*key, store[key])),
+            payload=serializer.encode(_written(*key, store[key])),
         )
 
     async def get_handler(request: Envelope) -> AsyncIterator[Envelope]:
@@ -69,7 +78,13 @@ async def test_kv_service_put_get_delete_roundtrip(
         key = (document["namespace"], document["key"])
         assert document["quorum_read"] == 1
         value = store.get(key)
-        payload = None if value is None else _version_document(*key, value)
+        payload = {
+            "version": None if value is None else _version_document(*key, value),
+            "tombstone": None,
+            "answered": 2,
+            "required": 1,
+            "replicas": 3,
+        }
         yield replay_envelope(
             kind="kv.get.accept",
             request=request,
@@ -84,7 +99,7 @@ async def test_kv_service_put_get_delete_roundtrip(
         yield replay_envelope(
             kind="kv.delete.accept",
             request=request,
-            payload=serializer.encode(_version_document(*key, b"")),
+            payload=serializer.encode(_written(*key, b"")),
         )
 
     async def repair_handler(request: Envelope) -> AsyncIterator[Envelope]:
@@ -128,13 +143,20 @@ async def test_kv_service_put_get_delete_roundtrip(
     finally:
         await server.stop()
 
-    assert isinstance(put_result, Version)
-    assert serializer.decode(put_result.data) == "v1"
-    assert isinstance(get_result, Version)
-    assert serializer.decode(get_result.address.key) == "k"
-    assert isinstance(delete_result, Version)
-    assert serializer.decode(delete_result.address.namespace) == "ns"
-    assert get_missing is None
+    assert isinstance(put_result, WriteOutcome)
+    assert serializer.decode(put_result.version.data) == "v1"
+    assert (put_result.acknowledged, put_result.required, put_result.replicas) == (
+        2,
+        1,
+        3,
+    )
+    assert isinstance(get_result, ReadOutcome)
+    assert get_result.version is not None
+    assert serializer.decode(get_result.version.address.key) == "k"
+    assert isinstance(delete_result, WriteOutcome)
+    assert serializer.decode(delete_result.version.address.namespace) == "ns"
+    assert get_missing.version is None
+    assert get_missing.answered == 2
     assert repair_result == {"issue": "already_durable", "replicas": 1, "token": "tok"}
 
 
@@ -183,7 +205,7 @@ async def test_kv_service_rejects_invalid_version_payload(
         yield replay_envelope(
             kind="kv.get.accept",
             request=request,
-            payload=serializer.encode({"address": {"namespace": b"ns"}}),
+            payload=serializer.encode({"version": {"address": {"namespace": b"ns"}}}),
         )
 
     server = await start_envelope_server({"kv.get": bad_get_handler}, server_ssl)
@@ -261,3 +283,32 @@ async def test_kv_service_raises_rejected_error_with_server_details(
     assert str(error) == (
         "read quorum not met: successes=1, required=2 (no response from node-b within 30.0s)"
     )
+
+
+@pytest.mark.asyncio
+async def test_kv_service_rejects_non_mapping_payload(
+    mtls_contexts: tuple[ssl.SSLContext, ssl.SSLContext],
+) -> None:
+    server_ssl, client_ssl = mtls_contexts
+    serializer = MsgPackSerializer()
+
+    async def null_put_handler(request: Envelope) -> AsyncIterator[Envelope]:
+        yield replay_envelope(
+            kind="kv.put.accept", request=request, payload=serializer.encode(None)
+        )
+
+    server = await start_envelope_server({"kv.put": null_put_handler}, server_ssl)
+    try:
+        host, port = server.endpoint
+        transport = Transport(
+            bind=f"{host}:{port}", ssl_context=client_ssl, serializer=serializer
+        )
+        await transport.connect()
+        try:
+            service = KvService(transport, serializer)
+            with pytest.raises(ResponseError, match="invalid kv.put response payload"):
+                await service.put(namespace="default", key="alpha", value="beta")
+        finally:
+            await transport.close()
+    finally:
+        await server.stop()

@@ -14,11 +14,13 @@
 
 import pytest
 
+from tourillon.core.gossip.heartbeat import HeartbeatTable
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.models.gossip import (
     GossipDigest,
     GossipNodeDigest,
     GossipPing,
+    GossipPong,
     GossipPush,
 )
 from tourillon.core.models.member import Member, MemberPhase
@@ -83,6 +85,45 @@ async def test_gossip_service_pong_not_same_when_fingerprint_differs() -> None:
     result = await service.pong(request)
 
     assert result.same is False
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_gossip_service_pong_merges_and_returns_heartbeats() -> None:
+    topologymgr = TopologyManager()
+    await topologymgr.apply_member(_member("node-a", epoch=1))
+    heartbeats = HeartbeatTable("node-a", clock=lambda: 10.0, wall=lambda: 2.0)
+    service = GossipService(
+        node_id="node-a", topologymgr=topologymgr, heartbeats=heartbeats
+    )
+
+    request = GossipPing(
+        sender="node-b",
+        fingerprint="fp",
+        count=1,
+        heartbeats={"node-b": 70, "node-a": 99_999},
+    )
+    result = await service.pong(request)
+
+    assert result.heartbeats == {"node-a": 2000, "node-b": 70}
+    assert heartbeats.age("node-b") == 0.0
+
+
+@pytest.mark.tourillon
+def test_gossip_ping_from_document_keeps_only_valid_heartbeats() -> None:
+    ping = GossipPing.from_document(
+        {
+            "sender": "node-b",
+            "fingerprint": "fp",
+            "count": 2,
+            "heartbeats": {"node-b": 5, "": 1, "node-c": "x", "node-d": True},
+        }
+    )
+    legacy = GossipPing.from_document({"sender": "b", "fingerprint": "f", "count": 0})
+
+    assert ping.heartbeats == {"node-b": 5}
+    assert legacy.heartbeats == {}
+    assert GossipPong(sender="a", same=True).heartbeats == {}
 
 
 @pytest.mark.tourillon

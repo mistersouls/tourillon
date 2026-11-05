@@ -44,22 +44,7 @@ class GcRequest:
             "dry_run",
             "partition",
         }:
-            raise ValidationError("node.gc accepts only dry_run and partition")
-        return cls(**document)
-
-
-@dataclass(frozen=True)
-class GcStatusRequest:
-    job_id: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.job_id, str) or not self.job_id:
-            raise ValidationError("GC job_id must be non-empty")
-
-    @classmethod
-    def from_document(cls, document: Any) -> "GcStatusRequest":
-        if not isinstance(document, Mapping) or set(document) != {"job_id"}:
-            raise ValidationError("node.gc.status requires job_id")
+            raise ValidationError("gc.run accepts only dry_run and partition")
         return cls(**document)
 
 
@@ -168,3 +153,54 @@ class GcResponse:
         if not isinstance(document, Mapping) or set(document) != {"node_id", "status"}:
             raise ValidationError("Invalid GC response fields")
         return cls(document["node_id"], GcStatus.from_document(document["status"]))
+
+
+@dataclass(frozen=True)
+class GcJobs:
+    """A node's GC worker and its retained passes, newest first."""
+
+    node_id: str
+    worker: GcInfo
+    next_pass_at: str | None
+    jobs: tuple[GcStatus, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.node_id, str) or not self.node_id:
+            raise ValidationError("GC jobs node_id must be non-empty")
+        if not isinstance(self.worker, GcInfo):
+            raise ValidationError("Invalid GC worker info")
+        if self.next_pass_at is not None and (
+            not isinstance(self.next_pass_at, str) or not self.next_pass_at
+        ):
+            raise ValidationError("Invalid GC next pass time")
+        if not isinstance(self.jobs, tuple) or not all(
+            isinstance(job, GcStatus) for job in self.jobs
+        ):
+            raise ValidationError("Invalid GC jobs")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "worker": asdict(self.worker),
+            "next_pass_at": self.next_pass_at,
+            "jobs": [job.to_dict() for job in self.jobs],
+        }
+
+    @classmethod
+    def from_document(cls, document: Any) -> "GcJobs":
+        if not isinstance(document, Mapping) or set(document) != {
+            "node_id",
+            "worker",
+            "next_pass_at",
+            "jobs",
+        }:
+            raise ValidationError("Invalid GC jobs fields")
+        jobs = document["jobs"]
+        if not isinstance(jobs, list):
+            raise ValidationError("Invalid GC jobs")
+        return cls(
+            node_id=document["node_id"],
+            worker=GcInfo.from_document(document["worker"]),
+            next_pass_at=document["next_pass_at"],
+            jobs=tuple(GcStatus.from_document(job) for job in jobs),
+        )

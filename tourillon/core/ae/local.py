@@ -309,13 +309,13 @@ class LocalStore:
         return found
 
     async def obligation_page(
-        self, group: int, after: bytes | None, limit: int
+        self, group: int, after: bytes | None, limit: int, target: str | None = None
     ) -> tuple[list[ObligationKey], bytes | None]:
-        """One page of the obligations persisted in ``group``."""
+        """One page of the obligations persisted in ``group``, for one target or all."""
         provider = await self._storage.session_provider_for(group)
         manager = GroupSessionManager(provider)
         async with manager.session() as session:
-            return await session.obligation_page(after, limit)
+            return await session.obligation_page(after, limit, target)
 
     async def remove_obligations(self, obligations: Sequence[ObligationKey]) -> None:
         """Delete obligations, one write transaction per group."""

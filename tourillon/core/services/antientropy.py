@@ -154,7 +154,12 @@ _SESSION_ERRORS = (
 # being filled and a DRAINING one still serves the comparison of what it
 # hands off.
 _SESSION_PHASES = frozenset(
-    {MemberPhase.JOINING, MemberPhase.READY, MemberPhase.DRAINING}
+    {
+        MemberPhase.JOINING,
+        MemberPhase.READY,
+        MemberPhase.DRAINING,
+        MemberPhase.PAUSED,
+    }
 )
 
 # Phases of the nodes a joining node catches up from.
@@ -182,6 +187,7 @@ class AntiEntropyStats:
     view_changes: int = 0
     budget_stops: int = 0
     errors: int = 0
+    delivery_errors: int = 0
     obligations_delivered: int = 0
     obligations_dropped: int = 0
     obligations_deferred: int = 0
@@ -190,6 +196,8 @@ class AntiEntropyStats:
     rejects: dict[str, int] = field(default_factory=dict)
     last_failure: str | None = None
     last_failure_at: str | None = None
+    last_sweep_at: str | None = None
+    last_sweep_diverged: int = 0
 
     def merge(self, tally: SessionTally, *, handoff: bool) -> None:
         self.roots_compared += tally.roots_compared
@@ -236,6 +244,7 @@ class AntiEntropyStats:
             "view_changes": self.view_changes,
             "budget_stops": self.budget_stops,
             "errors": self.errors,
+            "delivery_errors": self.delivery_errors,
             "obligations_delivered": self.obligations_delivered,
             "obligations_dropped": self.obligations_dropped,
             "obligations_deferred": self.obligations_deferred,
@@ -244,6 +253,8 @@ class AntiEntropyStats:
             "rejects": dict(self.rejects),
             "last_failure": self.last_failure,
             "last_failure_at": self.last_failure_at,
+            "last_sweep_at": self.last_sweep_at,
+            "last_sweep_diverged": self.last_sweep_diverged,
         }
 
 
@@ -255,14 +266,28 @@ class PeerBackoff:
         self._clock = clock
         self._until: dict[str, float] = {}
         self._delay: dict[str, float] = {}
+        self._errors: dict[str, str] = {}
 
     def deferred(self, peer: str) -> bool:
         until = self._until.get(peer)
         return until is not None and self._clock() < until
 
+    def remaining(self, peer: str) -> float:
+        """Seconds before ``peer`` may be contacted again; 0 when it may now."""
+        until = self._until.get(peer)
+        return 0.0 if until is None else max(0.0, until - self._clock())
+
+    def last_error(self, peer: str) -> str | None:
+        """The failure of the last attempt, until an attempt succeeds."""
+        return self._errors.get(peer)
+
+    def note(self, peer: str, error: str) -> None:
+        self._errors[peer] = error
+
     def succeeded(self, peer: str) -> None:
         self._until.pop(peer, None)
         self._delay.pop(peer, None)
+        self._errors.pop(peer, None)
 
     def defer(self, peer: str, seconds: float) -> None:
         """Honour a responder hint without growing the failure backoff."""
@@ -297,6 +322,21 @@ class Exchange:
     reached: dict[int, int] = field(default_factory=dict)
     skipped: set[str] = field(default_factory=set)
     failed: set[str] = field(default_factory=set)
+
+
+@dataclass
+class GoalProgress:
+    """Outcome of the last pass of a join or drain goal.
+
+    ``total`` pids are in the goal, ``done`` of them are complete, and
+    ``waiting`` maps each peer holding the rest back to its pid count. A goal
+    whose first pass has not finished reports ``total == 0``.
+    """
+
+    goal: str
+    total: int = 0
+    done: int = 0
+    waiting: dict[str, int] = field(default_factory=dict)
 
 
 def initiates(node_id: str, peer: str) -> bool:
@@ -347,7 +387,7 @@ class AntiEntropyService:
         config: AntiEntropyConfig,
         *,
         retention: RetentionPolicy,
-        obligations: ObligationQueue | None = None,
+        obligations: ObligationQueue,
         clock: Callable[[], float] = time.time,
         backoff: BackoffRetry | None = None,
         telemetry: Telemetry | None = None,
@@ -362,7 +402,9 @@ class AntiEntropyService:
         self._config = config
         self._clock = clock
         self.local = LocalStore(storage, partitioner, notify, retention)
-        self.obligations = obligations or ObligationQueue(config.hotqueue_size)
+        # Shared with the store: an empty queue is falsy (it defines __len__),
+        # so never substitute a private one.
+        self.obligations = obligations
 
         self.tracker = ViewTracker(
             node_id,
@@ -387,10 +429,35 @@ class AntiEntropyService:
         self._batch_bytes = min(config.max_batch_bytes, MAX_BATCH_BYTES)
         self._retry_delay = max(1.0, config.min_interval)
         self._progress: dict[tuple[str, str], SyncProgress] = {}
+        self._started_at: float | None = None
+        # target -> monotonic time of its last complete obligation delivery.
+        self._delivered_at: dict[str, float] = {}
+        self._goal: GoalProgress | None = None
 
     @property
     def stats(self) -> AntiEntropyStats:
         return self._stats
+
+    @property
+    def goal(self) -> GoalProgress | None:
+        """Progress of the running join or drain goal; None outside one."""
+        return self._goal
+
+    @property
+    def started_at(self) -> float | None:
+        """Wall-clock seconds at which the loops started; None when stopped."""
+        return self._started_at
+
+    @property
+    def stuck_after(self) -> float:
+        """Seconds without progress after which pending delivery is suspicious."""
+        return max(60.0, 2 * self._retry_delay)
+
+    def delivery_state(self, target: str) -> tuple[float, str | None, float | None]:
+        """Retry delay, last error and seconds since the last delivery to ``target``."""
+        delivered = self._delivered_at.get(target)
+        ago = None if delivered is None else max(0.0, time.monotonic() - delivered)
+        return self._backoff.remaining(target), self._backoff.last_error(target), ago
 
     @property
     def running(self) -> bool:
@@ -419,11 +486,13 @@ class AntiEntropyService:
             asyncio.create_task(self._run(), name="antientropy-loop"),
         ]
 
+        self._started_at = self._clock()
         logger.info("ae.started node=%s", self._node_id)
 
     async def stop(self) -> None:
         """Stop the loops, then drain admitted requests; never touches data."""
         tasks, self._tasks = self._tasks, []
+        self._started_at = None
 
         for task in tasks:
             task.cancel()
@@ -451,9 +520,16 @@ class AntiEntropyService:
         ring moved.
         """
         started = time.monotonic()
-        passes = 0
         copied = (self._stats.pulled, self._stats.bytes_pulled)
         logger.info("ae.join started node=%s", self._node_id)
+        self._goal = GoalProgress("join")
+        try:
+            await self._join_loop(started, copied)
+        finally:
+            self._goal = None
+
+    async def _join_loop(self, started: float, copied: tuple[int, int]) -> None:
+        passes = 0
 
         while True:
             view = await self.tracker.wait_ready()
@@ -502,12 +578,14 @@ class AntiEntropyService:
             len(result.failed),
             len(fallback),
         )
+        again = Exchange()
         if fallback:
             again = await self._exchange(
                 fallback, view, stale, cutoff_ms, _SOURCE_PHASES, goal="join"
             )
             failed = failed or bool(again.failed)
 
+        self._goal = _join_progress(primaries, result, again)
         return failed
 
     async def drain(self) -> None:
@@ -519,9 +597,16 @@ class AntiEntropyService:
         one did.
         """
         started = time.monotonic()
-        passes = 0
         copied = (self._stats.handed_off, self._stats.bytes_pushed)
         logger.info("ae.drain started node=%s", self._node_id)
+        self._goal = GoalProgress("drain")
+        try:
+            await self._drain_loop(started, copied)
+        finally:
+            self._goal = None
+
+    async def _drain_loop(self, started: float, copied: tuple[int, int]) -> None:
+        passes = 0
 
         while True:
             view = await self.tracker.wait_ready()
@@ -576,6 +661,7 @@ class AntiEntropyService:
         cutoff_ms = self._now_ms()
         complete = True
         after: int | None = None
+        progress = GoalProgress("drain")
 
         while True:
             roots, after = await self.local.root_page(
@@ -591,8 +677,10 @@ class AntiEntropyService:
                 goal="drain",
             )
             complete = complete and _handed_all(view, pids, result)
+            _tally_drain(progress, view, pids, result)
 
             if after is None or stale.is_set():
+                self._goal = progress
                 return complete and not stale.is_set()
 
     # -- sweep ---------------------------------------------------------------
@@ -659,6 +747,9 @@ class AntiEntropyService:
         self._telemetry.ae_sweeps_total.add(1, attributes={"outcome": outcome})
         after = self._stats.progress()
         delta = {name: after[name] - before[name] for name in after}
+        if outcome == "complete":
+            self._stats.last_sweep_at = datetime.now(UTC).isoformat()
+            self._stats.last_sweep_diverged = delta["diverged"]
         busy = delta["pulled"] or delta["pushed"] or delta["errors"]
         logger.log(
             logging.INFO if busy else logging.DEBUG,
@@ -785,6 +876,7 @@ class AntiEntropyService:
                 raise
             except Exception as exc:  # the loop must outlive any bug
                 self._stats.errors += 1
+                self._stats.delivery_errors += 1
                 self._stats.failed(exc)
                 self.obligations.backlog = True
                 logger.exception("ae.delivery failed")
@@ -896,6 +988,7 @@ class AntiEntropyService:
                 return
 
         self._backoff.succeeded(target)
+        self._delivered_at[target] = time.monotonic()
         logger.debug(
             "ae.obligations delivered target=%s count=%d", target, len(obligations)
         )
@@ -938,6 +1031,8 @@ class AntiEntropyService:
                     )
             except _SESSION_ERRORS as exc:
                 self._failed(target, exc)
+                if not isinstance(exc, AntiEntropyRejectError):
+                    self._stats.delivery_errors += 1
                 return False
 
             await self.local.remove_obligations(chunk)
@@ -1039,6 +1134,7 @@ class AntiEntropyService:
 
     def _failed(self, peer: str, exc: Exception) -> str:
         self._stats.failed(exc)
+        self._backoff.note(peer, describe(exc))
 
         if isinstance(exc, AntiEntropyRejectError):
             self._stats.rejects[exc.code] = self._stats.rejects.get(exc.code, 0) + 1
@@ -1129,6 +1225,37 @@ def _handed_all(view: ReplicaView, pids: Iterable[int], result: Exchange) -> boo
             return False
 
     return True
+
+
+def _join_progress(primaries: dict[str, list[int]], *results: Exchange) -> GoalProgress:
+    """Pids copied by any session; the others wait on their primary source."""
+    copied = {pid for result in results for pid, n in result.reached.items() if n}
+    progress = GoalProgress("join")
+
+    for peer, pids in primaries.items():
+        missing = sum(1 for pid in pids if pid not in copied)
+        progress.total += len(pids)
+        progress.done += len(pids) - missing
+        if missing:
+            progress.waiting[peer] = missing
+
+    return progress
+
+
+def _tally_drain(
+    progress: GoalProgress, view: ReplicaView, pids: list[int], result: Exchange
+) -> None:
+    """Add one page of a drain pass; a missing pid waits on its unfinished peers."""
+    blocked = result.skipped | result.failed
+    progress.total += len(pids)
+
+    for pid in pids:
+        if _handed_all(view, (pid,), result):
+            progress.done += 1
+            continue
+        for peer in view.replicas[pid]:
+            if peer in blocked:
+                progress.waiting[peer] = progress.waiting.get(peer, 0) + 1
 
 
 def _delivery_order(obligation: ObligationKey) -> tuple[str, bytes]:

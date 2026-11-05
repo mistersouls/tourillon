@@ -68,9 +68,9 @@ def node_command_context(tmp_path: Path) -> dict[str, object]:
 
 
 @scenario(
-    "features/tourillon_tourctl_node.feature", "Display help for tourctl node inspect"
+    "features/tourillon_tourctl_node.feature", "Display help for tourctl node status"
 )
-def test_tourctl_node_inspect_help_e2e() -> None:
+def test_tourctl_node_status_help_e2e() -> None:
     pass
 
 
@@ -83,9 +83,33 @@ def test_tourctl_node_join_help_e2e() -> None:
 
 @scenario(
     "features/tourillon_tourctl_node.feature",
-    "Start a node with tourillon and inspect it with tourctl",
+    "Start a node with tourillon and show its status with tourctl",
 )
-def test_tourillon_start_and_tourctl_node_inspect_success_e2e() -> None:
+def test_tourillon_start_and_tourctl_node_status_success_e2e() -> None:
+    pass
+
+
+@scenario(
+    "features/tourillon_tourctl_node.feature",
+    "Start a node with tourillon and check its health with tourctl",
+)
+def test_tourillon_start_and_tourctl_node_health_success_e2e() -> None:
+    pass
+
+
+@scenario(
+    "features/tourillon_tourctl_node.feature",
+    "Start a node with tourillon and show the cluster with tourctl",
+)
+def test_tourillon_start_and_tourctl_cluster_status_success_e2e() -> None:
+    pass
+
+
+@scenario(
+    "features/tourillon_tourctl_node.feature",
+    "Start a node with tourillon and inspect its member report",
+)
+def test_tourillon_start_and_tourctl_cluster_member_success_e2e() -> None:
     pass
 
 
@@ -118,7 +142,7 @@ def given_generated_ca(node_command_context: dict[str, object]) -> None:
             "--country",
             "FR",
             "--validity-days",
-            "5",
+            "60",
             "--key-size",
             "2048",
         ],
@@ -162,7 +186,7 @@ def given_running_node_target_configs(node_command_context: dict[str, object]) -
             "--peer-advertise",
             f"127.0.0.1:{peer_port}",
             "--validity-days",
-            "5",
+            "30",
             "--key-size",
             "2048",
         ],
@@ -244,12 +268,12 @@ def given_running_node_for_node_commands(
     raise AssertionError("tourillon peer listener did not become ready in time")
 
 
-@when("I request help for the tourctl node inspect command")
-def when_request_node_inspect_help(node_command_context: dict[str, object]) -> None:
+@when("I request help for the tourctl node status command")
+def when_request_node_status_help(node_command_context: dict[str, object]) -> None:
     tourctl_cli = node_command_context["tourctl_cli"]
     assert isinstance(tourctl_cli, str)
     node_command_context["result"] = subprocess.run(
-        [tourctl_cli, "node", "inspect", "--help"],
+        [tourctl_cli, "node", "status", "--help"],
         capture_output=True,
         text=True,
         check=False,
@@ -270,8 +294,46 @@ def when_request_node_join_help(node_command_context: dict[str, object]) -> None
     )
 
 
-@when("I run the tourctl node inspect command against peer endpoint")
-def when_run_node_inspect(node_command_context: dict[str, object]) -> None:
+@when("I run the tourctl node status command against peer endpoint")
+def when_run_node_status(node_command_context: dict[str, object]) -> None:
+    _run_against_peer(node_command_context, "node", "status")
+
+
+@when("I run the tourctl node health command against peer endpoint")
+def when_run_node_health(node_command_context: dict[str, object]) -> None:
+    _run_against_peer(node_command_context, "node", "health")
+
+
+@when("I run the tourctl cluster status command against peer endpoint")
+def when_run_cluster_status(node_command_context: dict[str, object]) -> None:
+    _run_against_peer(node_command_context, "cluster", "status", "-a")
+
+
+@when("I run the tourctl cluster member command using the client context")
+def when_run_cluster_member(node_command_context: dict[str, object]) -> None:
+    tourctl_cli = node_command_context["tourctl_cli"]
+    tourconf_path = node_command_context["tourconf_path"]
+    node_id = node_command_context["node_id"]
+    assert isinstance(tourctl_cli, str)
+    assert isinstance(tourconf_path, Path)
+    assert isinstance(node_id, str)
+    node_command_context["result"] = subprocess.run(
+        [
+            tourctl_cli,
+            "cluster",
+            "member",
+            node_id,
+            "--tourconf",
+            str(tourconf_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=COMMAND_TIMEOUT_SECONDS,
+    )
+
+
+def _run_against_peer(node_command_context: dict[str, object], *command: str) -> None:
     tourctl_cli = node_command_context["tourctl_cli"]
     peer_port = node_command_context["peer_port"]
     tourconf_path = node_command_context["tourconf_path"]
@@ -281,8 +343,7 @@ def when_run_node_inspect(node_command_context: dict[str, object]) -> None:
     node_command_context["result"] = subprocess.run(
         [
             tourctl_cli,
-            "node",
-            "inspect",
+            *command,
             f"127.0.0.1:{peer_port}",
             "--tourconf",
             str(tourconf_path),
@@ -328,15 +389,15 @@ def then_node_command_returns_help(node_command_context: dict[str, object]) -> N
     assert "usage:" in result.stdout.lower()
 
 
-@then("the node inspect command exits with zero code")
-def then_node_inspect_succeeds(node_command_context: dict[str, object]) -> None:
+@then("the node status command exits with zero code")
+def then_node_status_succeeds(node_command_context: dict[str, object]) -> None:
     result = node_command_context["result"]
     assert isinstance(result, subprocess.CompletedProcess)
     assert result.returncode == 0
 
 
-@then("the node inspect output includes the running node id")
-def then_node_inspect_output_has_node_id(
+@then("the node status output includes the running node id")
+def then_node_status_output_has_node_id(
     node_command_context: dict[str, object],
 ) -> None:
     result = node_command_context["result"]
@@ -344,14 +405,58 @@ def then_node_inspect_output_has_node_id(
     assert isinstance(result, subprocess.CompletedProcess)
     assert isinstance(node_id, str)
     output = result.stdout
-    assert f"({node_id})" in output
-    assert "Snapshot at:" in output
-    assert "Status" in output
-    assert "Identity" in output
-    assert "Ring position" in output
-    assert "Cluster membership" in output
-    assert "Gossip health" in output
-    assert "Notes" in output
+    assert output.startswith(f"Name:    {node_id}\n")
+    assert "Phase:" in output
+    assert "Ring:" in output
+    assert "Messages:" in output
+
+
+@then("the node health command exits with zero code")
+def then_node_health_succeeds(node_command_context: dict[str, object]) -> None:
+    result = node_command_context["result"]
+    assert isinstance(result, subprocess.CompletedProcess)
+    assert result.returncode == 0
+
+
+@then("the node health output reports the running node as healthy")
+def then_node_health_output_is_healthy(
+    node_command_context: dict[str, object],
+) -> None:
+    result = node_command_context["result"]
+    node_id = node_command_context["node_id"]
+    assert isinstance(result, subprocess.CompletedProcess)
+    assert isinstance(node_id, str)
+    assert result.stdout == f"OK: {node_id}\n"
+
+
+@then("the cluster status output is the view from the running node")
+def then_cluster_status_is_view_from_node(
+    node_command_context: dict[str, object],
+) -> None:
+    result = node_command_context["result"]
+    node_id = node_command_context["node_id"]
+    assert isinstance(result, subprocess.CompletedProcess)
+    assert isinstance(node_id, str)
+    output = result.stdout
+    assert output.startswith(f"View from: {node_id} (gossip, ")
+    assert "Members:   1" in output
+    assert "PHASE" in output
+    assert "Messages:" in output
+
+
+@then("the cluster member output describes the running node")
+def then_cluster_member_reports_running_node(
+    node_command_context: dict[str, object],
+) -> None:
+    result = node_command_context["result"]
+    node_id = node_command_context["node_id"]
+    assert isinstance(result, subprocess.CompletedProcess)
+    assert isinstance(node_id, str)
+    assert f"Node:       {node_id}" in result.stdout
+    assert "Status:     ALIVE" in result.stdout
+    assert f"(view from {node_id})" in result.stdout
+    assert "Ring share: 100%" in result.stdout
+    assert "Owed to it (answered 0 of 0 neighbours)" in result.stdout
 
 
 @then("the node join command exits with zero code")
@@ -361,10 +466,10 @@ def then_node_join_succeeds(node_command_context: dict[str, object]) -> None:
     assert result.returncode == 0
 
 
-@then("the node join output confirms the operation was triggered")
-def then_node_join_output_reports_triggered(
+@then("the node join output confirms the node was already ready")
+def then_node_join_reports_ready_noop(
     node_command_context: dict[str, object],
 ) -> None:
     result = node_command_context["result"]
     assert isinstance(result, subprocess.CompletedProcess)
-    assert "join operation is successful triggered" in result.stdout.lower()
+    assert "is already ready; nothing to do" in result.stdout.lower()

@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from functools import partial
 from typing import Any
 
+from tourillon.core.gossip.heartbeat import HeartbeatTable, parse_heartbeats
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.log import describe, logger
 from tourillon.core.models.config import GossipConfig
@@ -114,9 +115,13 @@ class Gossiper:
         peer_pool: PeerPool,
         serializer: Serializer,
         telemetry: Telemetry,
+        heartbeats: HeartbeatTable | None = None,
     ) -> None:
         self._node_id = node_id
         self._config = config
+        self._heartbeats = heartbeats or HeartbeatTable(
+            node_id, interval=config.ae_interval
+        )
         self._stats = stats
         self._topologymgr = topologymgr
         self._peer_pool = peer_pool
@@ -463,8 +468,13 @@ class Gossiper:
                 exc,
             )
 
+    @property
+    def heartbeats(self) -> HeartbeatTable:
+        return self._heartbeats
+
     async def _run_ae_cycle(self) -> None:
         self._stats.ae_cycles_total += 1
+        self._heartbeats.beat()
         self._telemetry.gossip_ae_cycle_total.add()
         eligible = await self._eligible_members()
         if not eligible:
@@ -503,6 +513,7 @@ class Gossiper:
             "sender": self._node_id,
             "fingerprint": fingerprint,
             "count": len(topology.registry),
+            "heartbeats": self._heartbeats.table(),
         }
 
         ping = self._build_envelope("gossip.ping", payload)
@@ -512,6 +523,8 @@ class Gossiper:
             return
 
         pong_data: dict[str, Any] = self._serializer.decode(pong.payload)
+        self._heartbeats.merge(parse_heartbeats(pong_data.get("heartbeats")))
+        self._heartbeats.forget(member.node_id for member in topology.registry)
         self._stats.last_ae_peer = peer.node_id
         self._stats.last_ae_at = self._utc_now()
         self._set_last_ae_metrics()

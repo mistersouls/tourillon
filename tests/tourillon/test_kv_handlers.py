@@ -27,8 +27,28 @@ from tourillon.core.exceptions import (
 from tourillon.core.models.repair import RepairIssue, RepairResult
 from tourlib.adapter import MsgPackSerializer
 from tourlib.envelope import Envelope
-from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest, RepairRequest
-from tourlib.models.version import Version
+from tourlib.models.kv import (
+    DeleteRequest,
+    GetRequest,
+    PutRequest,
+    ReadOutcome,
+    RepairRequest,
+    WriteOutcome,
+)
+from tourlib.models.ts import HLCTimestamp
+from tourlib.models.version import Address, Meta, Version
+
+_TS = HLCTimestamp(wall_ms=1, counter=0, node_id="node-a")
+_WRITTEN = WriteOutcome(
+    version=Version(
+        address=Address(key=b"key", namespace=b"ns"),
+        data=b"value",
+        meta=Meta(ts=_TS, quorum_write=1),
+    ),
+    acknowledged=2,
+    required=1,
+    replicas=3,
+)
 
 
 class _StoreSpy:
@@ -38,23 +58,25 @@ class _StoreSpy:
         self.delete_error: StoreOperationError | None = None
         self.requests: list[GetRequest | PutRequest | DeleteRequest] = []
 
-    async def put(self, request) -> Version | None:
+    async def put_outcome(self, request) -> WriteOutcome:
         self.requests.append(request)
         if self.put_error is not None:
             raise self.put_error
-        return None
+        return _WRITTEN
 
-    async def get(self, request) -> Version | None:
+    async def get_outcome(self, request) -> ReadOutcome:
         self.requests.append(request)
         if self.get_error is not None:
             raise self.get_error
-        return None
+        return ReadOutcome(
+            version=None, tombstone=_TS, answered=2, required=1, replicas=3
+        )
 
-    async def delete(self, request) -> Version | None:
+    async def delete_outcome(self, request) -> WriteOutcome:
         self.requests.append(request)
         if self.delete_error is not None:
             raise self.delete_error
-        return None
+        return _WRITTEN
 
 
 class _ManagerStub:
@@ -287,3 +309,29 @@ async def test_kv_repair_handler_returns_reject_for_an_unknown_version(
     assert payload["code"] == "version_not_found"
     assert payload["token"] == "tok"
     assert spy.requests == [RepairRequest(token="tok")]
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_kv_accept_payloads_carry_quorum_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _ManagerStub()
+    monkeypatch.setattr(kv_handler, "get_manager", lambda: manager)
+    serializer = manager.serializer
+
+    put = make_envelope(
+        kind="kv.put",
+        payload=serializer.encode({"namespace": b"ns", "key": b"key", "value": b"v"}),
+    )
+    get = make_envelope(
+        kind="kv.get", payload=serializer.encode({"namespace": b"ns", "key": b"key"})
+    )
+    written = [r async for r in kv_handler.put(put)][0]
+    read = [r async for r in kv_handler.get(get)][0]
+
+    assert WriteOutcome.from_dict(serializer.decode(written.payload)) == _WRITTEN
+    outcome = ReadOutcome.from_dict(serializer.decode(read.payload))
+    assert outcome.version is None
+    assert outcome.tombstone == _TS
+    assert (outcome.answered, outcome.required, outcome.replicas) == (2, 1, 3)

@@ -25,6 +25,8 @@ from tourillon.core.exceptions import (
     BootstrapError,
     DrainError,
     JoinError,
+    PauseError,
+    ResumeError,
     StartupError,
 )
 from tourillon.core.gossip.bootstrapper import GossipBootstrapper
@@ -83,7 +85,7 @@ class NodeLifecycle:
         store: StoreService,
         placement_strategy: PlacementStrategy,
         gc: GarbageCollector,
-        obligations: ObligationQueue | None = None,
+        obligations: ObligationQueue,
     ) -> None:
         self._config = config
         self._persistence = persistence
@@ -138,6 +140,7 @@ class NodeLifecycle:
         self._state_file = Path(self._config.storage.data_dir) / NODE_STATE_FILENAME
         self._join_task: asyncio.Task[None] | None = None
         self._drain_task: asyncio.Task[None] | None = None
+        self._resume_task: asyncio.Task[None] | None = None
         self._membership_lock = asyncio.Lock()
         self._peer_started = False
         self._client_started = False
@@ -192,6 +195,12 @@ class NodeLifecycle:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._join_task
 
+        if self.is_resuming():
+            assert self._resume_task is not None
+            self._resume_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._resume_task
+
         await self._antientropy.stop()
         await self._gossiper.stop()
         await self._stop_peer()
@@ -203,15 +212,23 @@ class NodeLifecycle:
     def is_draining(self) -> bool:
         return self._drain_task is not None and not self._drain_task.done()
 
-    async def join(self, seeds: list[str] | None = None) -> None:
+    def is_resuming(self) -> bool:
+        return self._resume_task is not None and not self._resume_task.done()
+
+    async def join(self, seeds: list[str] | None = None) -> bool:
         async with self._membership_lock:
+            state = await self._load_state()
+            if state.phase == MemberPhase.READY:
+                return False
+
             if self.is_draining():
                 raise JoinError("Drain operation already in progress.")
+            if self.is_resuming():
+                raise JoinError("Resume operation already in progress.")
             if self.is_joining():
                 logger.warning("Join operation already in progress")
                 raise JoinError("Join operation already in progress.")
 
-            state = await self._load_state()
             if state.phase == MemberPhase.DRAINING:
                 raise JoinError("Cannot join while the node is draining.")
             effective_seeds = seeds or state.seeds or self._config.node.seeds or []
@@ -223,6 +240,7 @@ class NodeLifecycle:
                     "No seed peers provided for join operation, 'seeds' are required."
                 )
 
+            self._store.pause(readable=False)
             logger.debug("Reloading node state from '%s'", self._state_file)
             joining_state = await self._transition_to(
                 state,
@@ -235,11 +253,36 @@ class NodeLifecycle:
             self._join_task = _background_task(
                 self._perform_join(joining_state), name="node-join"
             )
+            return True
+
+    async def cancel_join(self) -> NodeState:
+        async with self._membership_lock:
+            state = await self._load_state()
+            if state.phase != MemberPhase.JOINING:
+                raise JoinError(f"Node is not joining (phase {state.phase.value}).")
+
+            if self.is_joining():
+                assert self._join_task is not None
+                self._join_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._join_task
+
+            state = await self._load_state()
+            if state.phase != MemberPhase.JOINING:
+                raise JoinError(f"Node is not joining (phase {state.phase.value}).")
+
+            idle = await self._transition_to(state, MemberPhase.IDLE)
+            await self._peer_pool.start()
+            await self._gossiper.start()
+            await self._publish_state(idle)
+            await self._antientropy.stop()
+            self._store.pause(readable=False)
+            return idle
 
     async def drain(self) -> None:
         """Acknowledge an explicit drain request; completion is announced as IDLE."""
         async with self._membership_lock:
-            if self.is_joining() or self.is_draining():
+            if self.is_joining() or self.is_draining() or self.is_resuming():
                 raise DrainError("A membership operation is already in progress.")
             state = await self._load_state()
             if state.phase not in (
@@ -266,6 +309,117 @@ class NodeLifecycle:
             )
             self._drain_task = _background_task(
                 self._perform_drain(state), name="node-drain"
+            )
+
+    async def cancel_drain(self) -> NodeState:
+        async with self._membership_lock:
+            state = await self._load_state()
+            if state.phase != MemberPhase.DRAINING:
+                raise DrainError(f"Node is not draining (phase {state.phase.value}).")
+
+            if self.is_draining():
+                assert self._drain_task is not None
+                self._drain_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._drain_task
+
+            state = await self._load_state()
+            if state.phase != MemberPhase.DRAINING:
+                raise DrainError(f"Node is not draining (phase {state.phase.value}).")
+
+            ready = await self._transition_to(state, MemberPhase.READY)
+            await self._gossiper.start()
+            await self._publish_state(ready)
+            self._store.resume()
+            await self._start_client()
+            await self._antientropy.start()
+            logger.info("Drain cancelled for node '%s'; node is READY", state.node_id)
+            return ready
+
+    async def pause(self) -> None:
+        """Stop serving user operations while retaining the node on the ring."""
+        async with self._membership_lock:
+            if self.is_joining() or self.is_draining() or self.is_resuming():
+                raise PauseError("A membership operation is already in progress.")
+
+            state = await self._load_state()
+            if state.phase == MemberPhase.PAUSED:
+                return
+            if state.phase != MemberPhase.READY:
+                raise PauseError(f"Cannot pause from phase '{state.phase.value}'.")
+
+            await self._ensure_readable_peer(state)
+            self._store.pause(readable=False)
+            try:
+                state = await self._transition_to(state, MemberPhase.PAUSED)
+            except BaseException:
+                self._store.resume()
+                raise
+
+            await self._publish_state(state)
+            logger.info("Node '%s' is paused", state.node_id)
+
+    async def resume(self) -> None:
+        """Catch up a paused node before making it readable and writable."""
+        async with self._membership_lock:
+            if self.is_joining() or self.is_draining() or self.is_resuming():
+                raise ResumeError("A membership operation is already in progress.")
+
+            state = await self._load_state()
+            if state.phase == MemberPhase.READY:
+                return
+            if state.phase != MemberPhase.PAUSED:
+                raise ResumeError(f"Cannot resume from phase '{state.phase.value}'.")
+
+            if not await self._has_readable_peer(state):
+                raise ResumeError(
+                    "Cannot resume: no other reachable READY node can provide data."
+                )
+            self._store.pause(readable=False)
+            self._store.pause(readable=False)
+            self._resume_task = _background_task(
+                self._perform_resume(state), name="node-resume"
+            )
+
+    async def _ensure_readable_peer(self, state: NodeState) -> None:
+        if await self._has_readable_peer(state):
+            return
+
+        raise PauseError("Cannot pause: no other reachable READY node can serve reads.")
+
+    async def _has_readable_peer(self, state: NodeState) -> bool:
+        snapshot = await self._topologymgr.snapshot()
+        return any(
+            member.node_id != state.node_id
+            and member.phase == MemberPhase.READY
+            and self._peer_is_alive(member.node_id)
+            for member in snapshot.registry
+        )
+
+    def _peer_is_alive(self, node_id: str) -> bool:
+        detector = self._peer_pool.failure_detector(node_id)
+        return detector is None or detector.is_alive()
+
+    async def _start_paused_services(self, state: NodeState) -> None:
+        self._store.pause(readable=False)
+        await self._peer_pool.start()
+        if state.seeds:
+            await self._sync_full(state)
+        await self._gossiper.start()
+        await self._publish_state(state)
+        await self._antientropy.start()
+
+    async def _perform_resume(self, state: NodeState) -> None:
+        try:
+            await self._antientropy.wait_joined()
+            await self._start_client()
+            ready = await self._transition_to(state, MemberPhase.READY)
+            self._store.resume()
+            await self._publish_state(ready)
+        except Exception:
+            logger.exception(
+                "Resume synchronisation failed for node '%s'; node remains PAUSED",
+                state.node_id,
             )
 
     @staticmethod
@@ -352,6 +506,7 @@ class NodeLifecycle:
         """
         assert state.phase == MemberPhase.JOINING
 
+        self._store.pause(readable=False)
         await self._peer_pool.start()
         await self._gossiper.start()
         await self._publish_state(state)
@@ -387,14 +542,21 @@ class NodeLifecycle:
             return False
         return True
 
-    async def _publish_state(self, state: NodeState) -> Member:
-        member = Member(
+    async def local_member(self) -> Member:
+        """Describe this node from its persisted state, gossiped or not."""
+        return self._member(await self._load_or_create_state())
+
+    def _member(self, state: NodeState) -> Member:
+        return Member(
             node_id=state.node_id,
             peer_address=self._config.server_peer.advertise,
             epoch=state.epoch,
             phase=state.phase,
             tokens=state.tokens,
         )
+
+    async def _publish_state(self, state: NodeState) -> Member:
+        member = self._member(state)
         await self._topologymgr.apply_member(member)
         await self._gossiper.announce(member)
         return member
@@ -479,6 +641,8 @@ class NodeLifecycle:
 
     async def _startup_paused(self) -> None:
         await self._start_peer()
+        state = await self._load_state()
+        await self._start_paused_services(state)
 
     async def _start_peer(self) -> None:
         peer_addr = self._config.server_peer.bind
@@ -504,6 +668,9 @@ class NodeLifecycle:
         logger.debug("Peer listener started on %s:%s", peer_host, peer_port)
 
     async def _start_client(self) -> None:
+        if self._client_started:
+            return
+
         client_addr = self._config.server_client.bind
         logger.debug("Starting client listener on %s", client_addr)
         try:

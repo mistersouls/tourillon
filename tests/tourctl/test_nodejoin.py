@@ -21,6 +21,7 @@ import pytest
 from tourclient.core.services.node import NodeService
 from tourclient.core.transport import Transport
 from tourclient.exception import UnknownServiceError
+from tourctl.core.error import CliError
 from tourctl.core.nodejoin import _run_join, join
 from tourlib.adapter import MsgPackSerializer
 from tourlib.envelope import Envelope, build_envelope
@@ -123,7 +124,22 @@ async def test_join_returns_message_when_successful(
 
 @pytest.mark.tourctl
 @pytest.mark.asyncio
-async def test_join_wraps_internal_exception_as_system_exit(
+async def test_join_cancel_rejects_seed_overrides() -> None:
+    with pytest.raises(CliError, match="--seeds has no effect with --cancel") as caught:
+        await join(
+            "127.0.0.1:7701",
+            seeds={"seed-a"},
+            cancel=True,
+            tourconf=None,
+            context_name=None,
+        )
+
+    assert caught.value.code == 2
+
+
+@pytest.mark.tourctl
+@pytest.mark.asyncio
+async def test_join_does_not_hide_unexpected_internal_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def fake_run_join(*args, **kwargs) -> JoinResponse:
@@ -131,7 +147,7 @@ async def test_join_wraps_internal_exception_as_system_exit(
 
     monkeypatch.setattr("tourctl.core.nodejoin._run_join", fake_run_join)
 
-    with pytest.raises(SystemExit, match="Node join failed: boom"):
+    with pytest.raises(RuntimeError, match="boom"):
         await join("127.0.0.1:7701", seeds=None, tourconf=None, context_name=None)
 
 

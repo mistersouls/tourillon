@@ -12,24 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
+import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Literal, NoReturn
+from typing import Literal
 
 from tourclient import ProbeService, client
 from tourclient.exception import UnknownServiceError
-from tourctl.core.error import PROBE_ERROR_PROFILE, handle_error
-
-
-def _raise_user_error(message: str) -> NoReturn:
-    raise SystemExit(message)
-
-
-def _probe_error_message(exc: Exception, context_name: str | None) -> str:
-    if isinstance(exc, UnknownServiceError):
-        return str(exc)
-    return handle_error(exc, context_name, PROBE_ERROR_PROFILE)
+from tourctl.core.context import load_client_config
+from tourctl.core.error import PROBE_ERROR_PROFILE, cli_error
+from tourctl.core.render import to_json
+from tourlib.models.probe import ProbePong
 
 
 async def _run_probe_ping(
@@ -37,7 +30,7 @@ async def _run_probe_ping(
     *,
     tourconf: str | Path | None,
     context_name: str | None,
-):
+) -> tuple[ProbePong, float]:
     async with client(
         "probe",
         endpoint=endpoint,
@@ -46,7 +39,22 @@ async def _run_probe_ping(
     ) as probe_service:
         if not isinstance(probe_service, ProbeService):
             raise UnknownServiceError("Unknown service: probe")
-        return await probe_service.ping()
+        started = time.perf_counter()
+        pong = await probe_service.ping()
+        return pong, (time.perf_counter() - started) * 1000
+
+
+async def _endpoint_address(
+    endpoint: Literal["client", "peer"],
+    tourconf: str | Path | None,
+    context_name: str | None,
+) -> str:
+    cluster = (await load_client_config(tourconf)).cluster(context_name)
+    return cluster.client if endpoint == "client" else cluster.peer
+
+
+def _format_rtt(rtt_ms: float) -> str:
+    return "<1ms" if rtt_ms < 1 else f"{round(rtt_ms)}ms"
 
 
 async def ping_probe(
@@ -54,15 +62,24 @@ async def ping_probe(
     *,
     tourconf: str | Path | None = None,
     context_name: str | None = None,
+    as_json: bool = False,
 ) -> str:
-    """Run a probe.ping request through tourclient and return a JSON document."""
+    """Ping the node behind ``endpoint`` and report who answered and how fast."""
     try:
-        probe_pong = await _run_probe_ping(
+        address = await _endpoint_address(endpoint, tourconf, context_name)
+        pong, rtt_ms = await _run_probe_ping(
             endpoint=endpoint,
             tourconf=tourconf,
             context_name=context_name,
         )
     except Exception as exc:
-        _raise_user_error(_probe_error_message(exc, context_name))
+        raise cli_error(exc, context_name, PROBE_ERROR_PROFILE) from None
 
-    return json.dumps(asdict(probe_pong), ensure_ascii=False, indent=2, sort_keys=True)
+    if as_json:
+        document = asdict(pong) | {
+            "address": address,
+            "endpoint": endpoint,
+            "rtt_ms": round(rtt_ms, 3),
+        }
+        return to_json(document)
+    return f"Pong from {pong.node_id} at {address} in {_format_rtt(rtt_ms)}."

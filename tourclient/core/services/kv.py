@@ -19,8 +19,14 @@ from tourclient.core.transport import Transport
 from tourclient.exception import RequestRejectedError
 from tourlib import Serializer
 from tourlib.exceptions import ResponseError
-from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest, RepairRequest
-from tourlib.models.version import Version
+from tourlib.models.kv import (
+    DeleteRequest,
+    GetRequest,
+    PutRequest,
+    ReadOutcome,
+    RepairRequest,
+    WriteOutcome,
+)
 
 
 class KvService:
@@ -41,14 +47,15 @@ class KvService:
         key: Any,
         value: Any,
         quorum_write: int = 1,
-    ) -> Version | None:
+    ) -> WriteOutcome:
         request = PutRequest(
             namespace=self._serializer.encode(namespace),
             key=self._serializer.encode(key),
             value=self._serializer.encode(value),
             quorum_write=quorum_write,
         )
-        return await self._request_and_decode("kv.put", "kv.put.accept", request)
+        document = await self._request_document("kv.put", request)
+        return self._parse(WriteOutcome, document, "kv.put")
 
     async def get(
         self,
@@ -56,13 +63,14 @@ class KvService:
         namespace: Any,
         key: Any,
         quorum_read: int = 1,
-    ) -> Version | None:
+    ) -> ReadOutcome:
         request = GetRequest(
             namespace=self._serializer.encode(namespace),
             key=self._serializer.encode(key),
             quorum_read=quorum_read,
         )
-        return await self._request_and_decode("kv.get", "kv.get.accept", request)
+        document = await self._request_document("kv.get", request)
+        return self._parse(ReadOutcome, document, "kv.get")
 
     async def delete(
         self,
@@ -70,13 +78,14 @@ class KvService:
         namespace: Any,
         key: Any,
         quorum_write: int = 1,
-    ) -> Version | None:
+    ) -> WriteOutcome:
         request = DeleteRequest(
             namespace=self._serializer.encode(namespace),
             key=self._serializer.encode(key),
             quorum_write=quorum_write,
         )
-        return await self._request_and_decode("kv.delete", "kv.delete.accept", request)
+        document = await self._request_document("kv.delete", request)
+        return self._parse(WriteOutcome, document, "kv.delete")
 
     async def repair(
         self,
@@ -101,21 +110,19 @@ class KvService:
             raise ResponseError("invalid kv.repair response payload")
         return document
 
-    async def _request_and_decode(
+    async def _request_document(
         self,
         request_kind: str,
-        response_kind: str,
         request: PutRequest | DeleteRequest | GetRequest,
-    ) -> Version | None:
+    ) -> Any:
         response = await self._transport.request(kind=request_kind, document=request)
         if response.kind == f"{request_kind}.reject":
             raise self._rejected(request_kind, response.payload)
-        if response.kind != response_kind:
+        if response.kind != f"{request_kind}.accept":
             raise ResponseError(
                 f"unexpected {request_kind} response kind: {response.kind}"
             )
-        document = self._serializer.decode(response.payload)
-        return self._parse_version(document, request_kind=request_kind)
+        return self._serializer.decode(response.payload)
 
     def _rejected(self, request_kind: str, payload: bytes) -> RequestRejectedError:
         try:
@@ -125,12 +132,13 @@ class KvService:
         details = document if isinstance(document, Mapping) else {}
         return RequestRejectedError(request_kind, details)
 
-    def _parse_version(self, document: Any, *, request_kind: str) -> Version | None:
-        if document is None:
-            return None
+    @staticmethod
+    def _parse[T: (WriteOutcome, ReadOutcome)](
+        model: type[T], document: Any, request_kind: str
+    ) -> T:
         if not isinstance(document, Mapping):
             raise ResponseError(f"invalid {request_kind} response payload")
         try:
-            return Version.from_dict(document)
+            return model.from_dict(document)
         except (KeyError, TypeError, ValueError) as exc:
             raise ResponseError(f"invalid {request_kind} response payload") from exc

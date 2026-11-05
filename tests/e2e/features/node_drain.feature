@@ -11,3 +11,11 @@ Feature: Operator-initiated node draining
     Given a ready node with an authorized operator
     When the operator requests that the node drain
     Then the command rejects draining without another node
+
+  Scenario: Cancel a blocked drain and retain all data
+    Given two ready peers with an authorized operator
+    And single-replica data has been written across both peers
+    And the remaining peer is stopped
+    When the operator requests and cancels draining
+    Then the draining node returns to ready
+    And the restarted peer can read all written data

@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tourctl.core.inspect import inspect_node
 from tourctl.core.kv import kv_delete, kv_get, kv_put, kv_repair
+from tourctl.core.nodestatus import node_status
 from tourctl.core.probe import ping_probe
 
-__all__ = ["ping_probe", "inspect_node", "kv_put", "kv_get", "kv_delete", "kv_repair"]
+__all__ = ["ping_probe", "node_status", "kv_put", "kv_get", "kv_delete", "kv_repair"]

@@ -62,7 +62,7 @@ def ready_gc_node(gc_journey: Journey) -> None:
 def estimate(gc_journey: Journey) -> None:
     node = gc_journey.nodes["gc-node"]
     gc_journey.observations["estimate"] = gc_journey.ctl(
-        node, "node", "gc", node.peer, "--dry-run", "--wait", "--json"
+        node, "gc", "run", node.peer, "--dry-run", "--wait", "--json"
     )
 
 
@@ -80,7 +80,7 @@ def estimate_preserves(gc_journey: Journey) -> None:
 def collect(gc_journey: Journey) -> None:
     node = gc_journey.nodes["gc-node"]
     gc_journey.observations["collect"] = gc_journey.ctl(
-        node, "node", "gc", node.peer, "--wait", "--json"
+        node, "gc", "run", node.peer, "--wait", "--json"
     )
 
 
@@ -101,24 +101,25 @@ def inspect_gc(gc_journey: Journey) -> None:
     info = gc_journey.inspect(node)["gc"]
     assert info["running"] is True
     assert info["status"] == gc_journey.observations["collect"]["status"]
-    text = gc_journey.ctl_result(node, "node", "inspect", node.peer)
+    collected = info["status"]["collected"]
+    text = gc_journey.ctl_result(node, "node", "status", node.peer)
     assert text.returncode == 0, text.stderr
-    assert "Historical GC" in text.stdout
-    assert "Record bytes" in text.stdout
+    assert "Garbage collection:" in text.stdout
+    assert f"{collected:,} versions collected" in text.stdout
 
 
 @then("a later estimate reports no collectible history")
 def no_history(gc_journey: Journey) -> None:
     node = gc_journey.nodes["gc-node"]
     result = gc_journey.ctl(
-        node, "node", "gc", node.peer, "--dry-run", "--wait", "--json"
+        node, "gc", "run", node.peer, "--dry-run", "--wait", "--json"
     )
     assert result["status"]["scanned"] == 2
     assert result["status"]["collected"] == 0
     scoped = gc_journey.ctl(
         node,
-        "node",
         "gc",
+        "run",
         node.peer,
         "--partition",
         "0",
@@ -135,7 +136,7 @@ def invalid_partition(gc_journey: Journey) -> None:
     node = gc_journey.nodes["gc-node"]
     total = gc_journey.inspect(node)["ring_position"]["total_partitions"]
     gc_journey.observations["invalid"] = gc_journey.ctl_result(
-        node, "node", "gc", node.peer, "--partition", str(total)
+        node, "gc", "run", node.peer, "--partition", str(total)
     )
 
 

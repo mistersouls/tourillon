@@ -12,459 +12,664 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import base64
-import json
-import textwrap
-from collections.abc import Mapping
-from datetime import UTC, datetime
+import re
+import shlex
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, NoReturn
+from typing import Any, BinaryIO, NoReturn
 
 from tourclient import KvService, client
 from tourclient.exception import RequestRejectedError, UnknownServiceError
-from tourctl.core.error import KV_ERROR_PROFILE, handle_error
+from tourctl.core.context import resolve_namespace
+from tourctl.core.error import (
+    EXIT_FAILED,
+    EXIT_INVALID,
+    EXIT_NOT_FOUND,
+    KV_ERROR_PROFILE,
+    CliError,
+    cli_error,
+)
+from tourctl.core.kvvalue import (
+    TEXT_LIMIT,
+    TypeName,
+    ValueView,
+    display,
+    json_safe,
+    parse_typed,
+    read_value,
+)
+from tourctl.core.render import (
+    block,
+    fields,
+    format_since,
+    format_size,
+    format_ts,
+    messages,
+    to_json,
+    ts_to_json,
+)
 from tourlib.adapter import MsgPackSerializer
-from tourlib.models.version import Version
+from tourlib.constant import MAX_QUORUM
+from tourlib.models.kv import ReadOutcome, WriteOutcome
+from tourlib.models.ts import HLCTimestamp
 
-TypeName = Literal["auto", "str", "int", "float", "bool", "json", "bytes"]
-
-_BOOL_TRUE = {"1", "true", "yes", "on"}
-_BOOL_FALSE = {"0", "false", "no", "off"}
-_PRETTY_WIDTH = 96
-_LABEL_WIDTH = 13
-_WIRE_SERIALIZER = MsgPackSerializer()
-
-
-def _raise_user_error(message: str) -> NoReturn:
-    raise SystemExit(message)
+_WIRE = MsgPackSerializer()
+_MAX_NEWER = 5
+_TOMBSTONE_NOTE = (
+    "The tombstone hides older versions; garbage collection removes them later."
+)
 
 
-def _kv_error_message(exc: Exception, context_name: str | None) -> str:
-    if isinstance(exc, UnknownServiceError):
-        return str(exc)
-    message = handle_error(exc, context_name, KV_ERROR_PROFILE)
-    return f"{message}{_resume_hint(exc)}"
+def _invalid(message: str) -> NoReturn:
+    raise CliError(message, EXIT_INVALID, error="invalid_input")
 
 
-def _resume_hint(exc: Exception) -> str:
-    """Surface the handle that makes a partial write resumable.
-
-    A quorum failure means the version is written somewhere and stays there.
-    Hiding the handle would leave the operator with a failure they cannot act
-    on, and tempt them into a second write under a new timestamp.
-    """
-    if not isinstance(exc, RequestRejectedError):
-        return ""
-    token = exc.details.get("token")
-    if not isinstance(token, str) or not token:
-        return ""
-    return f"\nThe version is written but under-replicated. Resume it with:\n  tourctl repair {token}"
+def _count(n: int, singular: str, plural: str | None = None) -> str:
+    return f"{n} {singular if n == 1 else plural or singular + 's'}"
 
 
-def _parse_bool(value: str) -> bool:
-    lowered = value.strip().lower()
-    if lowered in _BOOL_TRUE:
-        return True
-    if lowered in _BOOL_FALSE:
-        return False
-    raise ValueError(f"invalid bool value: {value!r}")
+@dataclass(frozen=True)
+class KeyArgs:
+    """A key as typed on the command line, to name it again in hints."""
+
+    key: str
+    namespace: str | None = None
+    key_type: TypeName = "str"
+    namespace_type: TypeName = "str"
+
+    def hint(self) -> str:
+        parts = [shlex.quote(self.key)]
+        if self.namespace is not None:
+            parts += ["-n", shlex.quote(self.namespace)]
+        if self.namespace_type != "str":
+            parts += ["--namespace-type", self.namespace_type]
+        if self.key_type != "str":
+            parts += ["--key-type", self.key_type]
+        return " ".join(parts)
 
 
-def _infer_type(value: str) -> Any:
-    lowered = value.strip().lower()
-    if lowered in _BOOL_TRUE | _BOOL_FALSE:
-        return _parse_bool(value)
+@dataclass(frozen=True)
+class KeyRef:
+    """A resolved address together with the words that name it."""
 
-    if _looks_like_int(value):
-        return int(value, 10)
-    if _looks_like_float(value):
-        return float(value)
+    namespace: Any
+    key: Any
+    verb: str
+    hint: str
 
-    if _looks_like_json(value):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return value
+    @property
+    def target(self) -> str:
+        return f"{display(self.namespace)}/{display(self.key)}"
 
-    return value
+    @property
+    def subject(self) -> str:
+        return f"{self.verb} {self.target}"
 
-
-def _looks_like_int(value: str) -> bool:
-    stripped = value.strip()
-    if not stripped:
-        return False
-    if stripped[0] in "+-":
-        return stripped[1:].isdigit()
-    return stripped.isdigit()
+    def address(self) -> dict[str, Any]:
+        return {"key": json_safe(self.key), "namespace": json_safe(self.namespace)}
 
 
-def _looks_like_float(value: str) -> bool:
-    stripped = value.strip().lower()
-    if not stripped:
-        return False
-    if _looks_like_int(stripped):
-        return False
-    if "." in stripped or "e" in stripped:
-        try:
-            float(stripped)
-        except ValueError:
-            return False
-        return True
-    return False
-
-
-def _looks_like_json(value: str) -> bool:
-    stripped = value.strip()
-    return stripped.startswith(("{", "[", '"')) or stripped.lower() in {
-        "true",
-        "false",
-        "null",
-    }
-
-
-def _parse_typed_value(value: str, type_name: TypeName) -> Any:
-    if type_name == "auto":
-        return _infer_type(value)
-    if type_name == "str":
-        return value
-    if type_name == "int":
-        return int(value, 10)
-    if type_name == "float":
-        return float(value)
-    if type_name == "bool":
-        return _parse_bool(value)
-    if type_name == "json":
-        return json.loads(value)
-    return base64.b64decode(value, validate=True)
-
-
-def _parse_file_content(payload: bytes, type_name: TypeName) -> Any:
-    if type_name == "bytes":
-        return payload
-    if type_name == "auto":
-        return payload
-    text = payload.decode("utf-8")
-    return _parse_typed_value(text, type_name)
-
-
-def _parse_value(value: str, type_name: TypeName | None) -> Any:
-    if value.startswith("@"):
-        payload = Path(value[1:]).read_bytes()
-        if type_name is None:
-            return payload
-        return _parse_file_content(payload, type_name)
-
-    if type_name is None:
-        return _parse_typed_value(value, "auto")
-    return _parse_typed_value(value, type_name)
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, bytes):
-        return {
-            "type": "bytes",
-            "base64": base64.b64encode(value).decode("ascii"),
-        }
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, list | tuple):
-        return [_json_safe(item) for item in value]
-    return value
-
-
-def _decode_if_wire_encoded(value: Any) -> Any:
-    if not isinstance(value, bytes):
-        return value
+async def _resolve(
+    verb: str, args: KeyArgs, tourconf: str | Path | None, context_name: str | None
+) -> KeyRef:
     try:
-        return _WIRE_SERIALIZER.decode(value)
+        key = parse_typed(args.key, args.key_type)
+    except ValueError as exc:
+        _invalid(f"Invalid key: {exc}")
+    try:
+        raw = await resolve_namespace(
+            args.namespace, tourconf=tourconf, context_name=context_name
+        )
+    except (OSError, KeyError, ValueError) as exc:
+        raise cli_error(exc, context_name, KV_ERROR_PROFILE) from None
+    try:
+        namespace = parse_typed(raw, args.namespace_type)
+    except ValueError as exc:
+        _invalid(f"Invalid namespace: {exc}")
+    return KeyRef(namespace=namespace, key=key, verb=verb, hint=args.hint())
+
+
+def _check_quorum(subject: str, quorum: int) -> None:
+    if not 1 <= quorum <= MAX_QUORUM:
+        raise CliError(
+            f"{subject}: quorum {quorum} is out of range [1, {MAX_QUORUM}].",
+            EXIT_INVALID,
+            error="invalid_quorum",
+        )
+
+
+# Rejections: each server refusal code becomes a message that says what
+# happened, what is already done, and which command comes next.
+
+Rejection = Callable[[str, Mapping[str, Any], "KeyRef | None"], CliError]
+
+
+def _failed(
+    lines: list[str], details: Mapping[str, Any], code: int = EXIT_FAILED
+) -> CliError:
+    return CliError(
+        "\n".join(lines), code, error=str(details.get("code")), details=details
+    )
+
+
+def _write_quorum(
+    subject: str, details: Mapping[str, Any], ref: KeyRef | None
+) -> CliError:
+    received, required = details.get("received", 0), details.get("required", 0)
+    token = details.get("token")
+    lines = [
+        f"{subject}: quorum not met, {received} of {required} required replicas acknowledged."
+    ]
+    if received:
+        lines.append(
+            f"The version is stored on {_count(received, 'replica')} and is not lost; "
+            "anti-entropy spreads it."
+        )
+    if token:
+        lines += [
+            f"Finish the {subject.split()[0]} with:",
+            f"  tourctl repair {token} -w {required}",
+        ]
+    if ref is not None:
+        lines += ["See where it landed with:", f"  tourctl explain {ref.hint}"]
+    return _failed(lines, details)
+
+
+def _read_quorum(
+    subject: str, details: Mapping[str, Any], ref: KeyRef | None
+) -> CliError:
+    received, required = details.get("received", 0), details.get("required", 0)
+    lines = [
+        f"{subject}: quorum not met, {received} of {required} required replicas answered."
+    ]
+    if ref is not None:
+        lines += [
+            "See which replicas are unavailable with:",
+            f"  tourctl explain {ref.hint}",
+        ]
+    return _failed(lines, details)
+
+
+def _quorum_not_met(
+    subject: str, details: Mapping[str, Any], ref: KeyRef | None
+) -> CliError:
+    if details.get("operation") == "read":
+        return _read_quorum(subject, details, ref)
+    return _write_quorum(subject, details, ref)
+
+
+def _quorum_unreachable(
+    subject: str, details: Mapping[str, Any], ref: KeyRef | None
+) -> CliError:
+    quorum, factor = details.get("quorum"), details.get("replication_factor")
+    return _failed(
+        [
+            f"{subject}: quorum {quorum} can never be met, replication factor is {factor}."
+        ],
+        details,
+    )
+
+
+def _invalid_quorum(
+    subject: str, details: Mapping[str, Any], ref: KeyRef | None
+) -> CliError:
+    quorum = details.get("quorum")
+    return _failed(
+        [f"{subject}: quorum {quorum} is out of range [1, {MAX_QUORUM}]."],
+        details,
+        EXIT_INVALID,
+    )
+
+
+def _draining(subject: str, details: Mapping[str, Any], ref: KeyRef | None) -> CliError:
+    work = "reads" if details.get("operation") == "read" else "writes"
+    node = details.get("node_id") or "the node"
+    return _failed(
+        [
+            f"{subject}: {node} is draining and accepts no new {work}.",
+            "Use another node's client endpoint.",
+        ],
+        details,
+    )
+
+
+def _no_replica(
+    subject: str, details: Mapping[str, Any], ref: KeyRef | None
+) -> CliError:
+    lines = [f"{subject}: no replica can take this key; every replica is unavailable."]
+    if ref is not None:
+        lines.append(f"See: tourctl explain {ref.hint}")
+    return _failed(lines, details)
+
+
+def _bad_token(
+    subject: str, details: Mapping[str, Any], ref: KeyRef | None
+) -> CliError:
+    reason = details.get("reason", "unreadable")
+    return _failed(
+        [
+            f"{subject}: invalid token ({reason}). "
+            "Copy it exactly as printed by the failed write."
+        ],
+        details,
+        EXIT_INVALID,
+    )
+
+
+def _version_missing(
+    subject: str, details: Mapping[str, Any], ref: KeyRef | None
+) -> CliError:
+    return _failed(
+        [
+            f"{subject}: no replica holds this version; nothing to copy. "
+            "Write the value again with tourctl put."
+        ],
+        details,
+    )
+
+
+def _newer_line(item: Any) -> str:
+    try:
+        ts = HLCTimestamp.from_dict(item["version"]["key"]["ts"])
+        replicas = int(item.get("replicas", 0))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return "Newer: unknown version"
+    return f"Newer: {format_ts(ts)} on {_count(replicas, 'replica')}"
+
+
+def _outdated(subject: str, details: Mapping[str, Any], ref: KeyRef | None) -> CliError:
+    newer = details.get("newer")
+    items = newer if isinstance(newer, list) else []
+    lines = [
+        f"{subject}: a newer version exists; repairing an older one has no effect."
+    ]
+    lines += [_newer_line(item) for item in items[:_MAX_NEWER]]
+    if len(items) > _MAX_NEWER:
+        lines.append(f"... and {len(items) - _MAX_NEWER} more")
+    return _failed(lines, details)
+
+
+def _repair_quorum(
+    subject: str, details: Mapping[str, Any], ref: KeyRef | None
+) -> CliError:
+    received, required = details.get("received", 0), details.get("required", 0)
+    return _failed(
+        [
+            f"{subject}: {received} of {required} required replicas hold the version.",
+            "Retry later with the same command.",
+        ],
+        details,
+    )
+
+
+_KV_REJECTIONS: dict[str, Rejection] = {
+    "quorum_not_met": _quorum_not_met,
+    "quorum_unreachable": _quorum_unreachable,
+    "invalid_quorum": _invalid_quorum,
+    "node_draining": _draining,
+    "no_replica_available": _no_replica,
+}
+
+_REPAIR_REJECTIONS: dict[str, Rejection] = {
+    "quorum_not_met": _repair_quorum,
+    "invalid_quorum": _invalid_quorum,
+    "invalid_repair_token": _bad_token,
+    "version_not_found": _version_missing,
+    "outdated": _outdated,
+    "node_draining": _draining,
+}
+
+
+def _rejected(
+    exc: RequestRejectedError,
+    subject: str,
+    ref: KeyRef | None,
+    table: Mapping[str, Rejection],
+) -> CliError:
+    details = exc.details
+    handler = table.get(str(exc.code))
+    if handler is not None:
+        return handler(subject, details, ref)
+    message = str(details.get("message") or exc).rstrip(".")
+    return _failed(
+        [f"{subject}: {message}."], {**details, "code": exc.code or "rejected"}
+    )
+
+
+async def _call(
+    method: str, tourconf: str | Path | None, context_name: str | None, **kwargs: Any
+) -> Any:
+    async with client(
+        "kv", endpoint="client", tourconf=tourconf, context_name=context_name
+    ) as service:
+        if not isinstance(service, KvService):
+            raise UnknownServiceError("Unknown service: kv")
+        return await getattr(service, method)(**kwargs)
+
+
+async def _request(
+    method: str,
+    subject: str,
+    ref: KeyRef | None,
+    table: Mapping[str, Rejection],
+    tourconf: str | Path | None,
+    context_name: str | None,
+    **kwargs: Any,
+) -> Any:
+    try:
+        return await _call(method, tourconf, context_name, **kwargs)
+    except RequestRejectedError as exc:
+        raise _rejected(exc, subject, ref, table) from None
+    except Exception as exc:
+        raise cli_error(exc, context_name, KV_ERROR_PROFILE) from None
+
+
+def _decode(data: bytes) -> Any:
+    try:
+        return _WIRE.decode(data)
     except ValueError:
-        return value
+        return data
 
 
-def _version_to_render_dict(version: Version) -> dict[str, Any]:
-    payload = version.to_dict()
-    address = payload["address"]
+def _quorum_json(outcome: WriteOutcome) -> dict[str, int]:
     return {
-        "address": {
-            "key": _decode_if_wire_encoded(address["key"]),
-            "namespace": _decode_if_wire_encoded(address["namespace"]),
-        },
-        "data": _decode_if_wire_encoded(payload["data"]),
-        "meta": payload["meta"],
+        "acknowledged": outcome.acknowledged,
+        "replicas": outcome.replicas,
+        "required": outcome.required,
     }
 
 
-def _stringify_pretty_value(value: Any) -> str:
-    if isinstance(value, bytes):
-        b64 = base64.b64encode(value).decode("ascii")
-        return f"{b64} ({len(value):,} bytes total)"
-    if isinstance(value, str):
-        return value
-    if isinstance(value, (int, float, bool)) or value is None:
-        return str(value)
-    return json.dumps(_json_safe(value), ensure_ascii=False, indent=2, sort_keys=True)
-
-
-def _format_labeled_block(label: str, value: Any) -> str:
-    payload = _stringify_pretty_value(value)
-    lines = payload.splitlines() or [""]
-
-    first = f"{label:<{_LABEL_WIDTH}}{lines[0]}"
-    if len(lines) > 1:
-        rest = [" " * _LABEL_WIDTH + line for line in lines[1:]]
-        return "\n".join([first, *rest])
-
-    if len(first) <= _PRETTY_WIDTH:
-        return first
-
-    wrapped = textwrap.wrap(
-        lines[0],
-        width=max(20, _PRETTY_WIDTH - _LABEL_WIDTH),
-        break_long_words=False,
-        break_on_hyphens=False,
+def _acknowledged(outcome: WriteOutcome) -> str:
+    return (
+        f"acknowledged by {outcome.acknowledged} of "
+        f"{_count(outcome.replicas, 'replica')} ({outcome.required} required)"
     )
-    out = [f"{label:<{_LABEL_WIDTH}}{wrapped[0]}"]
-    out.extend(" " * _LABEL_WIDTH + part for part in wrapped[1:])
-    return "\n".join(out)
 
 
-def _format_hlc_wall_clock(wall_ms: Any) -> str | None:
-    if not isinstance(wall_ms, int):
-        return None
-    dt = datetime.fromtimestamp(wall_ms / 1000, tz=UTC)
-    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def _put_value(view: ValueView) -> str:
+    inline = view.inline()
+    if inline is None:
+        return view.summary
+    if view.type == "str":
+        return f"{inline} ({view.summary})"
+    return f"{inline} ({view.type})"
 
 
-def _render_metadata_lines(meta: Any) -> list[str]:
-    if not isinstance(meta, Mapping):
-        return []
-
-    ts = meta.get("ts")
-    quorum_write = meta.get("quorum_write")
-    if not isinstance(ts, Mapping) or quorum_write is None:
-        return []
-
-    wall_clock = _format_hlc_wall_clock(ts.get("wall_ms"))
-    counter = ts.get("counter")
-    node_id = ts.get("node_id")
-    if wall_clock is None or counter is None or node_id is None:
-        return []
-
-    return [
-        "Metadata",
-        f"    HLC:         {wall_clock}  (wall clock)",
-        f"                 counter={counter}",
-        f"                 node_id={node_id}",
-        f"    Quorum W:    {quorum_write}",
-    ]
-
-
-def _render_pretty(value: Any) -> str:
-    if value is None:
-        return "Not found."
-
-    if not isinstance(value, Mapping):
-        return _format_labeled_block("Value:", value)
-
-    address = value.get("address")
-    if not isinstance(address, Mapping):
-        return _format_labeled_block("Value:", value)
-
-    key = address.get("key")
-    namespace = address.get("namespace")
-    payload = value.get("data")
-    metadata_lines = _render_metadata_lines(value.get("meta"))
-
-    lines = [
-        _format_labeled_block("Key:", key),
-        _format_labeled_block("Namespace:", namespace),
-        _format_labeled_block("Value:", payload),
-    ]
-    lines.extend(metadata_lines)
-    return "\n".join(lines)
-
-
-def _render(value: Any, as_json: bool) -> str:
-    display_value = _json_safe(value)
+def _render_put(ref: KeyRef, outcome: WriteOutcome, as_json: bool) -> str:
+    view = ValueView.of(_decode(outcome.version.data))
+    ts = outcome.version.meta.ts
     if as_json:
-        return json.dumps(display_value, ensure_ascii=False, indent=2, sort_keys=True)
-    return _render_pretty(value)
-
-
-async def _run_put(
-    *,
-    key: Any,
-    value: Any,
-    namespace: Any,
-    quorum_write: int,
-    tourconf: str | Path | None,
-    context_name: str | None,
-) -> dict[str, Any] | None:
-    async with client(
-        "kv", endpoint="client", tourconf=tourconf, context_name=context_name
-    ) as kv_service:
-        if not isinstance(kv_service, KvService):
-            raise UnknownServiceError("Unknown service: kv")
-        version = await kv_service.put(
-            namespace=namespace, key=key, value=value, quorum_write=quorum_write
+        return to_json(
+            {
+                "address": ref.address(),
+                "quorum": _quorum_json(outcome),
+                "value": view.to_json(with_data=False),
+                "version": ts_to_json(ts),
+            }
         )
-        return None if version is None else _version_to_render_dict(version)
+    rows = [
+        ("Version", format_ts(ts)),
+        ("Value", _put_value(view)),
+        ("Quorum", _acknowledged(outcome)),
+    ]
+    return f"Stored {ref.target}.\n{fields(rows)}"
 
 
-async def _run_get(
-    *,
-    key: Any,
-    namespace: Any,
-    quorum_read: int,
-    tourconf: str | Path | None,
-    context_name: str | None,
-) -> dict[str, Any] | None:
-    async with client(
-        "kv", endpoint="client", tourconf=tourconf, context_name=context_name
-    ) as kv_service:
-        if not isinstance(kv_service, KvService):
-            raise UnknownServiceError("Unknown service: kv")
-        response = await kv_service.get(
-            namespace=namespace, key=key, quorum_read=quorum_read
+def _render_delete(ref: KeyRef, outcome: WriteOutcome, as_json: bool) -> str:
+    ts = outcome.version.meta.ts
+    if as_json:
+        return to_json(
+            {
+                "address": ref.address(),
+                "quorum": _quorum_json(outcome),
+                "version": ts_to_json(ts),
+            }
         )
-        return None if response is None else _version_to_render_dict(response)
+    rows = [
+        ("Version", f"{format_ts(ts)} (tombstone)"),
+        ("Quorum", _acknowledged(outcome)),
+    ]
+    return f"Deleted {ref.target}.\n{fields(rows)}\n\n{messages([_TOMBSTONE_NOTE])}"
 
 
-async def _run_delete(
-    *,
-    key: Any,
-    namespace: Any,
-    quorum_write: int,
-    tourconf: str | Path | None,
-    context_name: str | None,
-) -> dict[str, Any] | None:
-    async with client(
-        "kv", endpoint="client", tourconf=tourconf, context_name=context_name
-    ) as kv_service:
-        if not isinstance(kv_service, KvService):
-            raise UnknownServiceError("Unknown service: kv")
-        version = await kv_service.delete(
-            namespace=namespace, key=key, quorum_write=quorum_write
+def _absent(ref: KeyRef, outcome: ReadOutcome) -> CliError:
+    tombstone = outcome.tombstone
+    details = {
+        "answered": outcome.answered,
+        "replicas": outcome.replicas,
+        "required": outcome.required,
+        "tombstone": None if tombstone is None else ts_to_json(tombstone),
+    }
+    if tombstone is not None:
+        message = (
+            f"{ref.subject}: deleted {format_since(tombstone.wall_ms)} "
+            f"({format_ts(tombstone)})."
         )
-        return None if version is None else _version_to_render_dict(version)
+    else:
+        message = (
+            f"{ref.subject}: not found ({outcome.answered} of "
+            f"{_count(outcome.replicas, 'replica')} answered)."
+        )
+    return CliError(message, EXIT_NOT_FOUND, error="not_found", details=details)
 
 
-async def _run_repair(
-    *,
-    token: str,
-    quorum_write: int,
-    tourconf: str | Path | None,
-    context_name: str | None,
-) -> dict[str, Any]:
-    async with client(
-        "kv", endpoint="client", tourconf=tourconf, context_name=context_name
-    ) as kv_service:
-        if not isinstance(kv_service, KvService):
-            raise UnknownServiceError("Unknown service: kv")
-        result = await kv_service.repair(token=token, quorum_write=quorum_write)
-        return dict(result)
+@dataclass(frozen=True)
+class _Read:
+    ref: KeyRef
+    outcome: ReadOutcome
+    view: ValueView
+
+    @property
+    def ts(self) -> HLCTimestamp:
+        assert self.outcome.version is not None
+        return self.outcome.version.meta.ts
+
+    def to_json(self, *, with_data: bool) -> str:
+        return to_json(
+            {
+                "address": self.ref.address(),
+                "read": {
+                    "answered": self.outcome.answered,
+                    "replicas": self.outcome.replicas,
+                    "required": self.outcome.required,
+                },
+                "value": self.view.to_json(with_data=with_data),
+                "version": ts_to_json(self.ts),
+            }
+        )
+
+    def rows(self, inline: str | None) -> list[tuple[str, str]]:
+        outcome = self.outcome
+        rows = [("Key", self.ref.target)]
+        if inline is not None:
+            rows.append(("Value", inline))
+        return rows + [
+            ("Type", self.view.summary),
+            ("Version", f"{format_ts(self.ts)} ({format_since(self.ts.wall_ms)})"),
+            (
+                "Read",
+                f"{outcome.answered} of {_count(outcome.replicas, 'replica')} "
+                f"answered ({outcome.required} required)",
+            ),
+        ]
+
+
+def _file_name(key: Any) -> str:
+    stem = re.sub(r"[^\w.-]", "_", display(key)).strip("._")
+    return f"{stem or 'value'}.bin"
+
+
+def _long_value(read: _Read) -> str:
+    head = fields(read.rows(None))
+    data = read.view.text.encode("utf-8")
+    if len(data) <= TEXT_LIMIT:
+        return f"{head}\n{block('Value', read.view.text)}"
+    shown = data[:TEXT_LIMIT].decode("utf-8", errors="ignore")
+    note = (
+        f"Value truncated ({format_size(len(data))}). "
+        f"Show all with: tourctl get {read.ref.hint} --raw"
+    )
+    return f"{head}\n{block('Value', shown)}\n\n{messages([note])}"
+
+
+def _render_get_text(read: _Read) -> str:
+    if read.view.type == "bytes":
+        rows = read.rows(None) + [("Value", "not shown (binary)")]
+        note = (
+            f"Save it with: tourctl get {read.ref.hint} "
+            f"--output {_file_name(read.ref.key)}"
+        )
+        return f"{fields(rows)}\n\n{messages([note])}"
+    inline = read.view.inline()
+    if inline is None:
+        return _long_value(read)
+    return fields(read.rows(inline))
+
+
+def _save(read: _Read, output: str) -> int:
+    data = read.view.encoded
+    try:
+        Path(output).write_bytes(data)
+    except OSError as exc:
+        raise CliError(
+            f"{read.ref.subject}: cannot write {output}: {exc.strerror or exc}.",
+            EXIT_INVALID,
+            error="invalid_output",
+        ) from None
+    return len(data)
+
+
+def _render_get(
+    read: _Read, as_json: bool, raw: bool, output: str | None
+) -> str | bytes:
+    if raw:
+        return read.view.raw()
+    if output is not None:
+        size = _save(read, output)
+        if as_json:
+            return read.to_json(with_data=False)
+        return f"Saved {read.ref.target} to {output} ({format_size(size)})."
+    if as_json:
+        return read.to_json(with_data=True)
+    return _render_get_text(read)
+
+
+def _check_get_modes(as_json: bool, raw: bool, output: str | None) -> None:
+    if as_json and raw:
+        _invalid("--json and --raw cannot be combined.")
+    if raw and output is not None:
+        _invalid("--raw and --output cannot be combined.")
 
 
 async def kv_put(
     *,
     key: str,
     value: str,
-    namespace: str,
+    namespace: str | None = None,
     key_type: TypeName = "str",
     value_type: TypeName | None = None,
-    namespace_type: TypeName = "auto",
+    namespace_type: TypeName = "str",
     quorum_write: int = 1,
     as_json: bool = False,
     tourconf: str | Path | None = None,
     context_name: str | None = None,
+    stdin: BinaryIO | None = None,
 ) -> str:
     try:
-        typed_key = _parse_typed_value(key, key_type)
-        typed_namespace = _parse_typed_value(namespace, namespace_type)
-        typed_value = _parse_value(value, value_type)
-    except (
-        FileNotFoundError,
-        UnicodeDecodeError,
-        ValueError,
-        json.JSONDecodeError,
-    ) as exc:
-        _raise_user_error(f"Invalid KV input: {exc}")
-
-    try:
-        version = await _run_put(
-            key=typed_key,
-            value=typed_value,
-            namespace=typed_namespace,
-            quorum_write=quorum_write,
-            tourconf=tourconf,
-            context_name=context_name,
-        )
-    except Exception as exc:
-        _raise_user_error(_kv_error_message(exc, context_name))
-
-    return _render(version, as_json)
+        typed_value = read_value(value, value_type, stdin)
+    except ValueError as exc:
+        _invalid(f"Invalid value: {exc}")
+    args = KeyArgs(key, namespace, key_type, namespace_type)
+    ref = await _resolve("put", args, tourconf, context_name)
+    _check_quorum(ref.subject, quorum_write)
+    outcome = await _request(
+        "put",
+        ref.subject,
+        ref,
+        _KV_REJECTIONS,
+        tourconf,
+        context_name,
+        namespace=ref.namespace,
+        key=ref.key,
+        value=typed_value,
+        quorum_write=quorum_write,
+    )
+    return _render_put(ref, outcome, as_json)
 
 
 async def kv_get(
     *,
     key: str,
-    namespace: str,
+    namespace: str | None = None,
     key_type: TypeName = "str",
-    namespace_type: TypeName = "auto",
+    namespace_type: TypeName = "str",
     quorum_read: int = 1,
     as_json: bool = False,
+    raw: bool = False,
+    output: str | None = None,
     tourconf: str | Path | None = None,
     context_name: str | None = None,
-) -> str:
-    try:
-        typed_key = _parse_typed_value(key, key_type)
-        typed_namespace = _parse_typed_value(namespace, namespace_type)
-    except (ValueError, json.JSONDecodeError) as exc:
-        _raise_user_error(f"Invalid KV input: {exc}")
-
-    try:
-        version = await _run_get(
-            key=typed_key,
-            namespace=typed_namespace,
-            quorum_read=quorum_read,
-            tourconf=tourconf,
-            context_name=context_name,
-        )
-    except Exception as exc:
-        _raise_user_error(_kv_error_message(exc, context_name))
-
-    return _render(version, as_json)
+) -> str | bytes:
+    _check_get_modes(as_json, raw, output)
+    args = KeyArgs(key, namespace, key_type, namespace_type)
+    ref = await _resolve("get", args, tourconf, context_name)
+    _check_quorum(ref.subject, quorum_read)
+    outcome: ReadOutcome = await _request(
+        "get",
+        ref.subject,
+        ref,
+        _KV_REJECTIONS,
+        tourconf,
+        context_name,
+        namespace=ref.namespace,
+        key=ref.key,
+        quorum_read=quorum_read,
+    )
+    if outcome.version is None:
+        raise _absent(ref, outcome)
+    read = _Read(ref, outcome, ValueView.of(_decode(outcome.version.data)))
+    return _render_get(read, as_json, raw, output)
 
 
 async def kv_delete(
     *,
     key: str,
-    namespace: str,
+    namespace: str | None = None,
     key_type: TypeName = "str",
-    namespace_type: TypeName = "auto",
+    namespace_type: TypeName = "str",
     quorum_write: int = 1,
     as_json: bool = False,
     tourconf: str | Path | None = None,
     context_name: str | None = None,
 ) -> str:
-    try:
-        typed_key = _parse_typed_value(key, key_type)
-        typed_namespace = _parse_typed_value(namespace, namespace_type)
-    except (ValueError, json.JSONDecodeError) as exc:
-        _raise_user_error(f"Invalid KV input: {exc}")
+    args = KeyArgs(key, namespace, key_type, namespace_type)
+    ref = await _resolve("delete", args, tourconf, context_name)
+    _check_quorum(ref.subject, quorum_write)
+    outcome = await _request(
+        "delete",
+        ref.subject,
+        ref,
+        _KV_REJECTIONS,
+        tourconf,
+        context_name,
+        namespace=ref.namespace,
+        key=ref.key,
+        quorum_write=quorum_write,
+    )
+    return _render_delete(ref, outcome, as_json)
 
-    try:
-        version = await _run_delete(
-            key=typed_key,
-            namespace=typed_namespace,
-            quorum_write=quorum_write,
-            tourconf=tourconf,
-            context_name=context_name,
-        )
-    except Exception as exc:
-        _raise_user_error(_kv_error_message(exc, context_name))
 
-    return _render(version, as_json)
+def _render_repair(result: Mapping[str, Any], required: int) -> str:
+    replicas = int(result.get("replicas", 0))
+    if result.get("issue") == "repaired":
+        copies = _count(replicas, "copy", "copies")
+        return f"Repaired: the version now has {copies} ({required} required)."
+    verb = "holds" if replicas == 1 else "hold"
+    return (
+        f"Already durable: {_count(replicas, 'replica')} {verb} the version; "
+        "nothing was copied."
+    )
 
 
 async def kv_repair(
@@ -475,37 +680,27 @@ async def kv_repair(
     tourconf: str | Path | None = None,
     context_name: str | None = None,
 ) -> str:
-    if not token.strip():
-        _raise_user_error("Invalid KV input: repair token must not be empty")
-
-    try:
-        result = await _run_repair(
-            token=token.strip(),
-            quorum_write=quorum_write,
-            tourconf=tourconf,
-            context_name=context_name,
-        )
-    except Exception as exc:
-        _raise_user_error(_kv_error_message(exc, context_name))
-
-    if as_json:
-        return json.dumps(
-            _json_safe(result), ensure_ascii=False, indent=2, sort_keys=True
-        )
-    return _render_repair(result)
-
-
-def _render_repair(result: Mapping[str, Any]) -> str:
-    issue = result.get("issue")
-    replicas = result.get("replicas")
-    summary = {
-        "repaired": "Repaired.",
-        "already_durable": "Already durable, nothing to copy.",
-    }.get(str(issue), str(issue))
-    return "\n".join(
-        [
-            _format_labeled_block("Issue:", summary),
-            _format_labeled_block("Replicas:", replicas),
-            _format_labeled_block("Token:", result.get("token")),
-        ]
+    token = token.strip()
+    if not token:
+        _invalid("repair: token must not be empty.")
+    _check_quorum("repair", quorum_write)
+    result = await _request(
+        "repair",
+        "repair",
+        None,
+        _REPAIR_REJECTIONS,
+        tourconf,
+        context_name,
+        token=token,
+        quorum_write=quorum_write,
     )
+    if as_json:
+        return to_json(
+            {
+                "issue": result.get("issue"),
+                "replicas": result.get("replicas"),
+                "required": quorum_write,
+                "token": result.get("token", token),
+            }
+        )
+    return _render_repair(result, quorum_write)

@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from tourillon.core.ae.obligations import ObligationQueue
 from tourillon.core.config import (
     ClientServerConfig,
     NodeConfig,
@@ -33,7 +34,13 @@ from tourillon.core.config import (
     TransportConfig,
     TransportPoolConfig,
 )
-from tourillon.core.exceptions import BootstrapError, DrainError, JoinError
+from tourillon.core.exceptions import (
+    BootstrapError,
+    DrainError,
+    JoinError,
+    PauseError,
+    ResumeError,
+)
 from tourillon.core.gossip.gossiper import GossipStats
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.models.clock import HLCClock
@@ -173,6 +180,7 @@ def _build_lifecycle(
         peer_pool=peer_pool,
     )
     retention = RetentionPolicy(config.placement.retention)
+    obligations = ObligationQueue(config.placement.anti_entropy.hotqueue_size)
     store = StoreService(
         retention=retention,
         node_id=config.node.id,
@@ -182,6 +190,7 @@ def _build_lifecycle(
         clock=HLCClock(node_id=config.node.id),
         serializer=serializer,
         peer_pool=peer_pool,
+        obligations=obligations,
     )
     return NodeLifecycle(
         placement_strategy=placement,
@@ -199,6 +208,7 @@ def _build_lifecycle(
         gossip_stats=GossipStats(),
         telemetry=build_noop_telemetry(),
         store=store,
+        obligations=obligations,
         gc=GarbageCollector(
             storage,
             partitioner,
@@ -364,6 +374,139 @@ async def test_join_raises_when_no_seeds_configured(tmp_path: Path) -> None:
 
     with pytest.raises(JoinError, match="No seed peers provided"):
         await lifecycle.join()
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_join_on_ready_node_is_a_no_op(tmp_path: Path) -> None:
+    lifecycle = _build_lifecycle(
+        config=_build_config(tmp_path, node_id="node-a"),
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "node-a", "phase": "ready", "epoch": 3}}
+        ),
+    )
+
+    assert await lifecycle.join() is False
+    assert lifecycle.is_joining() is False
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_cancel_join_returns_to_idle_and_stops_join_services(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = _build_lifecycle(
+        config=_build_config(tmp_path, node_id="node-a"),
+        persistence=_DocumentStatePersistence(
+            {
+                "node": {
+                    "node_id": "node-a",
+                    "phase": "joining",
+                    "epoch": 4,
+                    "tokens": ["0x80"],
+                    "seeds": ["seed-a"],
+                }
+            }
+        ),
+    )
+
+    async def blocked() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(blocked())
+    lifecycle._join_task = task  # noqa: SLF001
+    await asyncio.sleep(0)
+    events: list[str] = []
+
+    async def noop() -> None:
+        events.append("started")
+
+    async def publish(state: NodeState) -> Member:
+        events.append(f"published:{state.phase.value}")
+        return lifecycle._member(state)  # noqa: SLF001
+
+    monkeypatch.setattr(lifecycle._peer_pool, "start", noop)  # noqa: SLF001
+    monkeypatch.setattr(lifecycle._gossiper, "start", noop)  # noqa: SLF001
+    monkeypatch.setattr(lifecycle._antientropy, "stop", noop)  # noqa: SLF001
+    monkeypatch.setattr(lifecycle, "_publish_state", publish)
+
+    state = await lifecycle.cancel_join()
+
+    assert state.phase == MemberPhase.IDLE
+    assert state.epoch == 5
+    assert events == ["started", "started", "published:idle", "started"]
+    assert task.cancelled()
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_cancel_join_rejects_node_not_joining(tmp_path: Path) -> None:
+    lifecycle = _build_lifecycle(
+        config=_build_config(tmp_path, node_id="node-a"),
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "node-a", "phase": "ready", "epoch": 1}}
+        ),
+    )
+
+    with pytest.raises(JoinError, match="Node is not joining"):
+        await lifecycle.cancel_join()
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_cancel_drain_returns_to_ready_and_reopens_services(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = _build_lifecycle(
+        config=_build_config(tmp_path, node_id="node-a"),
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "node-a", "phase": "draining", "epoch": 4}}
+        ),
+    )
+
+    async def blocked() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(blocked())
+    lifecycle._drain_task = task  # noqa: SLF001
+    await asyncio.sleep(0)
+    events: list[str] = []
+
+    async def start() -> None:
+        events.append("started")
+
+    async def publish(state: NodeState) -> Member:
+        events.append(f"published:{state.phase.value}")
+        return lifecycle._member(state)  # noqa: SLF001
+
+    async def start_client() -> None:
+        events.append("client")
+
+    monkeypatch.setattr(lifecycle._gossiper, "start", start)  # noqa: SLF001
+    monkeypatch.setattr(lifecycle._antientropy, "start", start)  # noqa: SLF001
+    monkeypatch.setattr(lifecycle, "_publish_state", publish)
+    monkeypatch.setattr(lifecycle, "_start_client", start_client)
+
+    state = await lifecycle.cancel_drain()
+
+    assert state.phase == MemberPhase.READY
+    assert state.epoch == 5
+    assert events == ["started", "published:ready", "client", "started"]
+    assert task.cancelled()
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_cancel_drain_rejects_node_not_draining(tmp_path: Path) -> None:
+    lifecycle = _build_lifecycle(
+        config=_build_config(tmp_path, node_id="node-a"),
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "node-a", "phase": "ready", "epoch": 1}}
+        ),
+    )
+
+    with pytest.raises(DrainError, match="Node is not draining"):
+        await lifecycle.cancel_drain()
 
 
 @pytest.mark.tourillon
@@ -542,6 +685,34 @@ async def test_start_dispatches_to_phase_specific_startup(
 
 @pytest.mark.tourillon
 @pytest.mark.asyncio
+async def test_paused_startup_keeps_client_closed_and_starts_control_services(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle = _build_lifecycle(
+        _build_config(tmp_path),
+        _DocumentStatePersistence(
+            {"node": {"node_id": "test-node", "phase": "paused"}}
+        ),
+    )
+    calls = []
+
+    async def start_peer() -> None:
+        calls.append("peer")
+
+    async def start_paused_services(state: NodeState) -> None:
+        calls.append(state.phase)
+
+    monkeypatch.setattr(lifecycle, "_start_peer", start_peer)
+    monkeypatch.setattr(lifecycle, "_start_paused_services", start_paused_services)
+
+    await lifecycle._startup_paused()
+
+    assert calls == ["peer", MemberPhase.PAUSED]
+    assert not lifecycle._client_started
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
 async def test_stop_cancels_active_join_and_stops_components(tmp_path: Path) -> None:
     lifecycle = _build_lifecycle(
         config=_build_config(tmp_path, node_id="node-a"),
@@ -667,6 +838,28 @@ async def test_publish_state_uses_advertise_address(tmp_path: Path) -> None:
     assert member.peer_address == "10.0.0.5:7001"
     assert applied[0].peer_address == "10.0.0.5:7001"
     assert announced[0].peer_address == "10.0.0.5:7001"
+
+
+@pytest.mark.tourillon
+@pytest.mark.asyncio
+async def test_local_member_reads_persisted_state(tmp_path: Path) -> None:
+    config = TourillonConfig(
+        node=NodeConfig(id="node-a"),
+        storage=StorageConfig(data_dir=str(tmp_path), group_size="8Mi"),
+        tls=TlsConfig(ca_data="", cert_data="", key_data=""),
+        server_client=ClientServerConfig(bind="127.0.0.1:7000"),
+        server_peer=PeerServerConfig(bind="0.0.0.0:7001", advertise="10.0.0.5:7001"),
+    )
+    lifecycle = _build_lifecycle(
+        config=config,
+        persistence=_DocumentStatePersistence(
+            {"node": {"node_id": "node-a", "phase": "idle", "epoch": 4}}
+        ),
+    )
+
+    member = await lifecycle.local_member()
+
+    assert member == Member("node-a", "10.0.0.5:7001", 4, MemberPhase.IDLE, ())
 
 
 @pytest.mark.tourillon
@@ -1207,6 +1400,164 @@ async def test_last_node_cannot_silently_discard_its_ranges(tmp_path: Path) -> N
     with pytest.raises(DrainError, match="another node"):
         await lifecycle.drain()
     assert (await lifecycle._load_state()).phase == MemberPhase.READY
+
+
+@pytest.mark.tourillon
+async def test_pause_stops_admission_without_draining_and_publishes_paused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle = _build_lifecycle(
+        _build_config(tmp_path, node_id="node-a"),
+        _DocumentStatePersistence(
+            {
+                "node": {
+                    "node_id": "node-a",
+                    "phase": "ready",
+                    "epoch": 2,
+                    "tokens": ["0x80"],
+                }
+            }
+        ),
+    )
+    await lifecycle._topologymgr.apply_member(
+        Member(
+            node_id="node-b",
+            peer_address="127.0.0.1:7002",
+            epoch=1,
+            phase=MemberPhase.READY,
+            tokens=("0x0",),
+        )
+    )
+
+    async def drain() -> None:
+        raise AssertionError("pause must not wait for outstanding work")
+
+    monkeypatch.setattr(lifecycle._store, "drain", drain)
+    await lifecycle.pause()
+
+    state = await lifecycle._load_state()
+    topology = await lifecycle._topologymgr.snapshot()
+    assert state.phase == MemberPhase.PAUSED
+    assert state.epoch == 3
+    assert topology.registry.get("node-a").phase == MemberPhase.PAUSED
+    assert not lifecycle._store._accepting_reads
+    assert not lifecycle._store._accepting_read_repairs
+
+
+@pytest.mark.tourillon
+async def test_pause_rejects_when_no_other_ready_peer_is_available(
+    tmp_path: Path,
+) -> None:
+    lifecycle = _build_lifecycle(
+        _build_config(tmp_path),
+        _DocumentStatePersistence({"node": {"node_id": "test-node", "phase": "ready"}}),
+    )
+
+    with pytest.raises(PauseError, match="no other reachable READY node"):
+        await lifecycle.pause()
+
+    assert (await lifecycle._load_state()).phase == MemberPhase.READY
+    assert lifecycle._store._accepting_reads
+
+
+@pytest.mark.tourillon
+async def test_resume_publishes_ready_only_after_catchup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle = _build_lifecycle(
+        _build_config(tmp_path, node_id="node-a"),
+        _DocumentStatePersistence(
+            {
+                "node": {
+                    "node_id": "node-a",
+                    "phase": "paused",
+                    "epoch": 3,
+                    "tokens": ["0x80"],
+                }
+            }
+        ),
+    )
+    await lifecycle._topologymgr.apply_member(
+        Member(
+            node_id="node-b",
+            peer_address="127.0.0.1:7002",
+            epoch=1,
+            phase=MemberPhase.READY,
+            tokens=("0x0",),
+        )
+    )
+    catchup = asyncio.Event()
+
+    async def wait_joined() -> None:
+        catchup.set()
+
+    async def start_client() -> None:
+        assert (await lifecycle._load_state()).phase == MemberPhase.PAUSED
+
+    monkeypatch.setattr(lifecycle._antientropy, "wait_joined", wait_joined)
+    monkeypatch.setattr(lifecycle, "_start_client", start_client)
+
+    await lifecycle.resume()
+
+    assert (await lifecycle._load_state()).phase != MemberPhase.READY
+    await asyncio.wait_for(lifecycle._resume_task, 1)
+    assert catchup.is_set()
+    assert (await lifecycle._load_state()).phase == MemberPhase.READY
+    assert lifecycle._store._accepting_reads
+
+
+@pytest.mark.tourillon
+async def test_resume_failure_keeps_node_paused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle = _build_lifecycle(
+        _build_config(tmp_path, node_id="node-a"),
+        _DocumentStatePersistence(
+            {
+                "node": {
+                    "node_id": "node-a",
+                    "phase": "paused",
+                    "epoch": 3,
+                    "tokens": ["0x80"],
+                }
+            }
+        ),
+    )
+    await lifecycle._topologymgr.apply_member(
+        Member(
+            node_id="node-b",
+            peer_address="127.0.0.1:7002",
+            epoch=1,
+            phase=MemberPhase.READY,
+            tokens=("0x0",),
+        )
+    )
+
+    async def fail_catchup() -> None:
+        raise RuntimeError("source unavailable")
+
+    monkeypatch.setattr(lifecycle._antientropy, "wait_joined", fail_catchup)
+
+    await lifecycle.resume()
+    await asyncio.wait_for(lifecycle._resume_task, 1)
+
+    assert (await lifecycle._load_state()).phase == MemberPhase.PAUSED
+    assert not lifecycle._store._accepting_reads
+
+
+@pytest.mark.tourillon
+async def test_resume_rejects_without_a_reachable_data_source(tmp_path: Path) -> None:
+    lifecycle = _build_lifecycle(
+        _build_config(tmp_path),
+        _DocumentStatePersistence(
+            {"node": {"node_id": "test-node", "phase": "paused"}}
+        ),
+    )
+
+    with pytest.raises(ResumeError, match="no other reachable READY node"):
+        await lifecycle.resume()
+
+    assert (await lifecycle._load_state()).phase == MemberPhase.PAUSED
 
 
 @pytest.mark.tourillon

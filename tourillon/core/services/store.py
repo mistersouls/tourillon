@@ -29,6 +29,7 @@ from tourillon.core.exceptions import (
     NoReplicaAvailableError,
     OutdatedRepairError,
     QuorumNotMetError,
+    QuorumUnreachableError,
     StoreOperationError,
     VersionNotFoundError,
 )
@@ -64,7 +65,14 @@ from tourillon.core.storage.session import GroupSessionManager
 from tourillon.core.telemetry import build_noop_telemetry
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT, MAX_CLOCK_SKEW_MS, MAX_QUORUM
 from tourlib.envelope import build_envelope
-from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest, RepairRequest
+from tourlib.models.kv import (
+    DeleteRequest,
+    GetRequest,
+    PutRequest,
+    ReadOutcome,
+    RepairRequest,
+    WriteOutcome,
+)
 from tourlib.models.version import Address, Meta, Version
 from tourlib.port import Serializer
 
@@ -92,6 +100,7 @@ class ReplicationStats:
 _REFUSALS = (
     NodeDrainingError,
     InvalidQuorumError,
+    QuorumUnreachableError,
     InvalidRepairTokenError,
     VersionNotFoundError,
 )
@@ -108,10 +117,10 @@ class StoreService:
         serializer: Serializer,
         peer_pool: PeerPool,
         retention: RetentionPolicy,
+        obligations: ObligationQueue,
         response_delay: float = REPLICATION_RESPONSE_DELAY,
         read_repair: ReadRepairConfig | None = None,
         repair: RepairConfig | None = None,
-        obligations: ObligationQueue | None = None,
         telemetry: Telemetry | None = None,
     ) -> None:
         self._node_id = node_id
@@ -138,9 +147,11 @@ class StoreService:
         self._obligations = obligations
 
     def pause(self, *, readable: bool = True) -> None:
-        """Refuse writes while draining, retaining reads until IDLE."""
+        """Stop admitting user operations according to the requested phase."""
         self._accepting_operations = False
         self._accepting_reads = readable
+        if not readable:
+            self._accepting_read_repairs = False
 
     def resume(self) -> None:
         self._accepting_operations = True
@@ -196,7 +207,7 @@ class StoreService:
             self._accepting_reads if operation == "read" else self._accepting_operations
         )
         if not accepting:
-            raise NodeDrainingError(operation)
+            raise NodeDrainingError(operation, self._node_id)
 
     @contextmanager
     def _tracked(self, operation: str) -> Iterator[None]:
@@ -238,10 +249,14 @@ class StoreService:
 
     async def get(self, request: GetRequest) -> Version | None:
         """Get the versioned value for the given address."""
+        return (await self.get_outcome(request)).version
+
+    async def get_outcome(self, request: GetRequest) -> ReadOutcome:
+        """Read a key and report how many replicas answered."""
         with self._operation("read"):
             return await self._get(request)
 
-    async def _get(self, request: GetRequest) -> Version | None:
+    async def _get(self, request: GetRequest) -> ReadOutcome:
         self._validate_quorum("read", request.quorum_read)
         addr = Address(key=request.key, namespace=request.namespace)
         preflist = await self._placement_strategy.preference_list(addr)
@@ -259,62 +274,63 @@ class StoreService:
         version, _ = self._select_version(self._visible_versions(records))
         # A replica answering "I hold nothing" is still an answer: absence is
         # information. A handoff and its owner count as one logical replica.
-        self._ensure_quorum(
-            self._read_response_count(targets, answers),
-            request.quorum_read,
-            "read",
-            errors,
-        )
+        answered = self._read_response_count(targets, answers)
+        self._ensure_quorum(answered, request.quorum_read, "read", errors)
         self._schedule_read_repair(answers, preflist.preferences, version)
+        tombstone = None
         if self._is_tombstone(version, records):
-            return None
-        return version
+            tombstone, version = version.meta.ts, None
+        return ReadOutcome(
+            version=version,
+            tombstone=tombstone,
+            answered=answered,
+            required=request.quorum_read,
+            replicas=len(preflist.preferences),
+        )
 
     async def put(self, request: PutRequest) -> Version | None:
-        with self._operation("write"):
-            return await self._put(request)
+        return (await self.put_outcome(request)).version
 
-    async def _put(self, request: PutRequest) -> Version | None:
-        self._validate_quorum("write", request.quorum_write)
-        addr = Address(key=request.key, namespace=request.namespace)
-        preflist = await self._placement_strategy.preference_list(addr)
-        record = self._write_record(
-            addr,
-            request.value,
-            preflist.placement.partition.pid,
-            False,
-            request.quorum_write,
-        )
-        records, errors = await self._replicate_write(
-            record, preflist.preferences, request.quorum_write, kind="kv.put"
-        )
-        if not records and errors:
-            raise self._replication_error("write", errors)
-        version, version_count = self._select_version(
-            self._versions_from_records(records)
-        )
-        self._ensure_quorum(
-            version_count,
-            request.quorum_write,
-            "write",
-            errors,
-            encode_token(record.key),
-        )
-        return version
+    async def put_outcome(self, request: PutRequest) -> WriteOutcome:
+        """Write a key and report how many replicas acknowledged it."""
+        with self._operation("write"):
+            return await self._mutate(
+                Address(key=request.key, namespace=request.namespace),
+                request.value,
+                request.quorum_write,
+                kind="kv.put",
+            )
 
     async def delete(self, request: DeleteRequest) -> Version | None:
-        with self._operation("delete"):
-            return await self._delete(request)
+        return (await self.delete_outcome(request)).version
 
-    async def _delete(self, request: DeleteRequest) -> Version | None:
-        self._validate_quorum("write", request.quorum_write)
-        addr = Address(key=request.key, namespace=request.namespace)
+    async def delete_outcome(self, request: DeleteRequest) -> WriteOutcome:
+        """Write a tombstone and report how many replicas acknowledged it."""
+        with self._operation("delete"):
+            return await self._mutate(
+                Address(key=request.key, namespace=request.namespace),
+                None,
+                request.quorum_write,
+                kind="kv.delete",
+            )
+
+    async def _mutate(
+        self, addr: Address, value: bytes | None, quorum: int, *, kind: str
+    ) -> WriteOutcome:
+        """Write a value, or a tombstone when ``value`` is None."""
+        self._validate_quorum("write", quorum)
         preflist = await self._placement_strategy.preference_list(addr)
+        if quorum > preflist.replication_factor:
+            raise QuorumUnreachableError("write", quorum, preflist.replication_factor)
         record = self._write_record(
-            addr, b"", preflist.placement.partition.pid, True, request.quorum_write
+            addr,
+            b"" if value is None else value,
+            preflist.placement.partition.pid,
+            value is None,
+            quorum,
         )
         records, errors = await self._replicate_write(
-            record, preflist.preferences, request.quorum_write, kind="kv.delete"
+            record, preflist.preferences, quorum, kind=kind
         )
         if not records and errors:
             raise self._replication_error("write", errors)
@@ -322,13 +338,15 @@ class StoreService:
             self._versions_from_records(records)
         )
         self._ensure_quorum(
-            version_count,
-            request.quorum_write,
-            "write",
-            errors,
-            encode_token(record.key),
+            version_count, quorum, "write", errors, encode_token(record.key)
         )
-        return version
+        assert version is not None
+        return WriteOutcome(
+            version=version,
+            acknowledged=version_count,
+            required=quorum,
+            replicas=len(preflist.preferences),
+        )
 
     async def read(self, addr: PartitionAddress) -> Record | None:
         return await self._local_read(addr, kind="replication.read")
@@ -406,8 +424,7 @@ class StoreService:
         self._telemetry.obligations_total.add(
             len(obligations), attributes={"event": "recorded"}
         )
-        if self._obligations is not None:
-            self._obligations.submit(obligations)
+        self._obligations.submit(obligations)
 
     async def _write(self, record: Record) -> Record:
         """Apply a replicated write received from a peer.

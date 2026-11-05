@@ -19,6 +19,7 @@ from typing import cast
 
 import pytest
 
+from tests.helpers.inspect import make_status
 from tourclient.core.services.node import NodeService
 from tourclient.core.transport import Transport
 from tourclient.exception import RequestRejectedError
@@ -113,3 +114,53 @@ async def test_node_drain_rejects_wrong_service(
     monkeypatch.setattr("tourctl.core.nodedrain.client", client_context)
     with pytest.raises(SystemExit, match="Unknown service: node"):
         await drain("127.0.0.1:7701", tourconf=None, context_name=None)
+
+
+async def test_drain_cancel_wait_uses_the_same_peer_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serializer = MsgPackSerializer()
+
+    class _WaitTransport:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def request(self, kind: str, document: object) -> Envelope:
+            self.calls.append(kind)
+            payload = (
+                {"message": "node-a: DRAINING -> READY"}
+                if kind == "node.drain.cancel"
+                else make_status(phase="READY").to_document()
+            )
+            response_kind = (
+                "node.drain.cancel.accept"
+                if kind == "node.drain.cancel"
+                else "node.inspect.accept"
+            )
+            return build_envelope(
+                kind=response_kind,
+                payload=serializer.encode(payload),
+                schema_id=serializer.schema_id,
+            )
+
+    transport = _WaitTransport()
+    service = NodeService(cast(Transport, transport), serializer)
+    contexts = []
+
+    @asynccontextmanager
+    async def client_context(*args, **kwargs) -> AsyncIterator[NodeService]:
+        contexts.append((args, kwargs))
+        yield service
+
+    monkeypatch.setattr("tourctl.core.nodedrain.client", client_context)
+    output = await drain(
+        "127.0.0.1:7701",
+        wait=True,
+        cancel=True,
+        tourconf=None,
+        context_name=None,
+    )
+
+    assert "node-3 is READY." in output
+    assert transport.calls == ["node.drain.cancel", "node.inspect"]
+    assert len(contexts) == 1

@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tourctl.bootstrap.main import app
+from tourctl.bootstrap.main import main
 
-app()
+main()

@@ -56,3 +56,105 @@ class DrainResponse:
         if not isinstance(document, Mapping) or set(document) != {"message"}:
             raise ValidationError("node.drain response must contain a message")
         return cls(message=document["message"])
+
+
+@dataclass(frozen=True)
+class CancelJoinRequest:
+    @classmethod
+    def from_document(cls, document: Any) -> "CancelJoinRequest":
+        if not isinstance(document, Mapping) or document:
+            raise ValidationError("node.join.cancel request must be an empty mapping")
+        return cls()
+
+
+@dataclass(frozen=True)
+class CancelJoinResponse:
+    message: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.message, str) or not self.message:
+            raise ValidationError("node.join.cancel response message must be non-empty")
+
+    @classmethod
+    def from_document(cls, document: Any) -> "CancelJoinResponse":
+        if not isinstance(document, Mapping) or set(document) != {"message"}:
+            raise ValidationError("node.join.cancel response must contain a message")
+        return cls(message=document["message"])
+
+
+@dataclass(frozen=True)
+class CancelDrainRequest:
+    @classmethod
+    def from_document(cls, document: Any) -> "CancelDrainRequest":
+        if not isinstance(document, Mapping) or document:
+            raise ValidationError("node.drain.cancel request must be an empty mapping")
+        return cls()
+
+
+@dataclass(frozen=True)
+class CancelDrainResponse:
+    message: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.message, str) or not self.message:
+            raise ValidationError(
+                "node.drain.cancel response message must be non-empty"
+            )
+
+    @classmethod
+    def from_document(cls, document: Any) -> "CancelDrainResponse":
+        if not isinstance(document, Mapping) or set(document) != {"message"}:
+            raise ValidationError("node.drain.cancel response must contain a message")
+        return cls(message=document["message"])
+
+
+@dataclass(frozen=True)
+class PauseRequest:
+    """Pause user operations while keeping the node on the ring."""
+
+    @classmethod
+    def from_document(cls, document: Any) -> "PauseRequest":
+        if not isinstance(document, Mapping) or document:
+            raise ValidationError("node.pause request must be an empty mapping")
+        return cls()
+
+
+@dataclass(frozen=True)
+class PauseResponse:
+    message: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.message, str) or not self.message:
+            raise ValidationError("node.pause response message must be non-empty")
+
+    @classmethod
+    def from_document(cls, document: Any) -> "PauseResponse":
+        if not isinstance(document, Mapping) or set(document) != {"message"}:
+            raise ValidationError("node.pause response must contain a message")
+        return cls(message=document["message"])
+
+
+@dataclass(frozen=True)
+class ResumeRequest:
+    """Resume a paused node after it catches up through anti-entropy."""
+
+    @classmethod
+    def from_document(cls, document: Any) -> "ResumeRequest":
+        if not isinstance(document, Mapping) or document:
+            raise ValidationError("node.resume request must be an empty mapping")
+        return cls()
+
+
+@dataclass(frozen=True)
+class ResumeResponse:
+    message: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.message, str) or not self.message:
+            raise ValidationError("node.resume response message must be non-empty")
+
+    @classmethod
+    def from_document(cls, document: Any) -> "ResumeResponse":
+        if not isinstance(document, Mapping) or set(document) != {"message"}:
+            raise ValidationError("node.resume response must contain a message")
+        return cls(message=document["message"])

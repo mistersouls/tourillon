@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from time import monotonic
+from time import time as wall_clock
 from typing import Any
 from uuid import uuid4
 
@@ -78,6 +79,7 @@ class GarbageCollector:
         self._pending = False
         self._status = CollectionStatus()
         self._results: OrderedDict[str, CollectionStatus] = OrderedDict()
+        self._next_pass_at: float | None = None
         self.overflowed = 0
 
     @property
@@ -110,14 +112,19 @@ class GarbageCollector:
         document["record_bytes"] = document.pop("bytes_removed")
         return GcStatus.from_document(document)
 
-    def result(self, job_id: str) -> GcStatus:
-        if job_id == self._status.job_id:
-            return self._wire_status(self._status)
-        if job_id not in self._results:
-            raise ValueError(
-                "Unknown or expired GC job; inspect the node for its latest pass"
-            )
-        return self._wire_status(self._results[job_id])
+    def jobs(self) -> tuple[GcStatus, ...]:
+        """Retained passes, newest first, including the one in progress."""
+        passes = list(self._results.values())
+        if self._status.state != "idle" and self._status.job_id not in self._results:
+            passes.append(self._status)
+        return tuple(self._wire_status(status) for status in reversed(passes))
+
+    @property
+    def next_pass_at(self) -> str | None:
+        """When the next periodic pass starts, or None if the worker is stopped."""
+        if self._task is None or self._task.done() or self._next_pass_at is None:
+            return None
+        return datetime.fromtimestamp(self._next_pass_at, UTC).isoformat()
 
     def _finish(self, state: str, error: str | None = None) -> None:
         self._status = self._status.updated(
@@ -159,6 +166,7 @@ class GarbageCollector:
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
+            self._next_pass_at = wall_clock() + self.config.interval
             self._task = asyncio.create_task(self._run(), name="gc.worker")
             self._telemetry.gc_hot_queue_size.set(len(self._hot))
             logger.info(
@@ -183,12 +191,14 @@ class GarbageCollector:
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
         next_pass = loop.time() + self.config.interval
+        self._next_pass_at = wall_clock() + self.config.interval
 
         while True:
             await self._wait(max(0.0, next_pass - loop.time()))
             if self._pending or loop.time() >= next_pass:
                 await self._pass()
                 next_pass = loop.time() + self.config.interval
+                self._next_pass_at = wall_clock() + self.config.interval
             else:
                 await self._hot_step()
 

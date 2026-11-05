@@ -14,6 +14,7 @@
 
 from collections.abc import AsyncIterator, Callable
 
+from tourillon.core.gossip.heartbeat import HeartbeatTable
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.models.gossip import (
     GossipDelta,
@@ -46,10 +47,12 @@ class GossipService:
         node_id: str,
         topologymgr: TopologyManager,
         relay: GossipRelay | None = None,
+        heartbeats: HeartbeatTable | None = None,
     ) -> None:
         self._node_id = node_id
         self._topologymgr = topologymgr
         self._relay = relay
+        self._heartbeats = heartbeats or HeartbeatTable(node_id)
 
     async def accept(self, request: GossipPush) -> GossipPushAccept:
         accepted: list[Member] = []
@@ -134,7 +137,9 @@ class GossipService:
         fingerprint = await self._topologymgr.member_fingerprint()
         member_count = len(topology.registry)
         same = request.fingerprint == fingerprint and request.count == member_count
+        self._heartbeats.merge(request.heartbeats)
         return GossipPong(
             sender=self._node_id,
             same=same,
+            heartbeats=self._heartbeats.table(),
         )

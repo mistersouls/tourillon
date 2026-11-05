@@ -22,6 +22,7 @@ from tourillon.core.models.storageschema import (
     Keyspace,
     KVPair,
     KVRef,
+    StorageUsage,
 )
 from tourlib.models.types import SupportsBytes
 
@@ -155,6 +156,9 @@ class SessionProvider(Protocol):
     def session(self, write: bool = False) -> AsyncIterator[Session]:
         """Provide a session context manager for read or write operations."""
 
+    async def usage(self) -> StorageUsage:
+        """Return the space and version counts of this group."""
+
     async def close(self) -> None:
         """Close the session provider and release any resources."""
 
@@ -165,6 +169,9 @@ class Storage(Protocol):
 
     async def latest_hlc(self, total_groups: int) -> HLCTimestamp:
         """Return the latest hybrid logical clock timestamp."""
+
+    async def usage(self, total_groups: int) -> StorageUsage:
+        """Return the space and version counts summed over every group."""
 
     async def close(self) -> None:
         """Close the storage and release any resources."""

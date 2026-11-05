@@ -17,7 +17,7 @@ from pathlib import Path
 
 from tourillon.core.models.clock import HLCTimestamp
 from tourillon.core.models.config import StorageConfig
-from tourillon.core.models.storageschema import Key, Keyspace
+from tourillon.core.models.storageschema import Key, Keyspace, StorageUsage
 from tourillon.core.ports.storage import SessionProvider, Storage, StorageProvider
 from tourillon.infra.storage.lmdb_session import LmdbConfig, LmdbSessionProvider
 
@@ -46,6 +46,13 @@ class LMDBStorage(Storage):
                         latest = key.ts
 
         return latest
+
+    async def usage(self, total_groups: int) -> StorageUsage:
+        total = StorageUsage()
+        for group in range(total_groups):
+            provider = await self.session_provider_for(group)
+            total += await provider.usage()
+        return total
 
     async def close(self) -> None:
         if self._closed:

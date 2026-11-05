@@ -20,7 +20,7 @@ from pathlib import Path
 
 import lmdb
 
-from tourillon.core.models.storageschema import Keyspace, KVPair, KVRef
+from tourillon.core.models.storageschema import Keyspace, KVPair, KVRef, StorageUsage
 from tourillon.core.ports.storage import Batch, Session, SessionProvider
 from tourillon.infra.storage.lmdb_batch import LmdbBatch
 from tourillon.infra.storage.lmdb_transaction import LmdbTransaction
@@ -199,6 +199,22 @@ class LmdbSessionProvider(SessionProvider):
             else:
                 finalize = txn.commit if write else txn.abort
                 await asyncio.shield(executor.execute(finalize))
+
+    async def usage(self) -> StorageUsage:
+        if self._closed:
+            raise RuntimeError("LMDB session provider closed")
+        return await asyncio.to_thread(self._usage)
+
+    def _usage(self) -> StorageUsage:
+        info = self._env.info()
+        page_size = self._env.stat()["psize"]
+        with self._env.begin() as txn:
+            versions = txn.stat(self._dbi_logs)["entries"]
+        return StorageUsage(
+            map_size=info["map_size"],
+            used=(info["last_pgno"] + 1) * page_size,
+            versions=versions,
+        )
 
     async def close(self) -> None:
         if self._closed:

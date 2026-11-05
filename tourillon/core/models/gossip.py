@@ -13,9 +13,10 @@
 # limitations under the License.
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+from tourillon.core.gossip.heartbeat import parse_heartbeats
 from tourillon.core.models.member import Member
 from tourlib.exceptions import ValidationError
 from tourlib.validation import require_str
@@ -66,6 +67,7 @@ class GossipPing:
     sender: str
     fingerprint: str
     count: int
+    heartbeats: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_document(cls, data: Mapping[str, Any]) -> "GossipPing":
@@ -73,6 +75,7 @@ class GossipPing:
             sender=require_str(data, "sender"),
             fingerprint=require_str(data, "fingerprint"),
             count=GossipPush.as_int(data.get("count"), "count", min_value=0),
+            heartbeats=parse_heartbeats(data.get("heartbeats")),
         )
 
 
@@ -80,6 +83,7 @@ class GossipPing:
 class GossipPong:
     sender: str
     same: bool
+    heartbeats: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass

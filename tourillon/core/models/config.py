@@ -187,6 +187,10 @@ class TlsConfig:
             key_data=require_str(document, "key_data"),
         )
 
+    def certificate_pem(self) -> bytes:
+        """The PEM certificate this node presents."""
+        return self._decode(self.cert_data, "cert_data")
+
     async def tls_server(self) -> ssl.SSLContext:
         return await self._with_material(self._build_server_context)
 

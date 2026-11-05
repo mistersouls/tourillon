@@ -227,19 +227,22 @@ async def test_partition_gc_is_bounded_and_keeps_previous_job_results(
     await gc.start()
     first = gc.request(dry_run=True, partition=0)
     await _completed(gc)
-    assert gc.result(first.job_id).scanned == 4
-    assert gc.result(first.job_id).collected == 3
+    (estimate,) = gc.jobs()
+    assert (estimate.job_id, estimate.scanned, estimate.collected) == (
+        first.job_id,
+        4,
+        3,
+    )
     second = gc.request(partition=0)
     await _completed(gc)
-    assert gc.result(first.job_id).dry_run
-    assert gc.result(second.job_id).collected == 3
+    newest, oldest = gc.jobs()
+    assert newest.job_id == second.job_id and newest.collected == 3
+    assert oldest.job_id == first.job_id and oldest.dry_run
     assert gc.inspect().status.partition == 0
     assert gc.inspect().status.finished_at is not None
     async with manager.session() as session:
         assert await session.read(other.key) == other
         assert await session.read(_record(4).key) == _record(4)
-    with pytest.raises(ValueError, match="Unknown or expired"):
-        gc.result("missing")
 
 
 @pytest.mark.parametrize("partition", [-1, 2, True])
@@ -259,8 +262,24 @@ async def test_gc_results_expire_explicitly_after_bounded_history(
     for _ in range(64):
         gc.request()
         await _completed(gc)
-    with pytest.raises(ValueError, match="expired"):
-        gc.result(first.job_id)
+    jobs = gc.jobs()
+    assert len(jobs) == 64
+    assert first.job_id not in {job.job_id for job in jobs}
+
+
+async def test_gc_jobs_include_the_pass_in_progress_and_next_pass_time(
+    gc: GarbageCollector,
+) -> None:
+    assert gc.jobs() == ()
+    assert gc.next_pass_at is None
+    await gc.start()
+    assert gc.next_pass_at is not None
+    queued = gc.request(dry_run=True)
+    (current,) = gc.jobs()
+    assert current.job_id == queued.job_id
+    assert current.state in {"queued", "running", "completed"}
+    await gc.stop()
+    assert gc.next_pass_at is None
 
 
 async def test_gc_failure_is_visible_and_can_be_retried(

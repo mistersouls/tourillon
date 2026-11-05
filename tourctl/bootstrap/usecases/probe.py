@@ -24,14 +24,19 @@ probe_app = App(name="probe", help="Probe and health commands.")
 
 @probe_app.command(name="ping")
 async def probe_ping(
-    endpoint: Literal["client", "peer"], opts: GlobalOptions | None = None
-) -> str:
+    endpoint: Literal["client", "peer"],
+    json: bool = False,
+    opts: GlobalOptions | None = None,
+) -> None:
     """
-    Ping a Tourillon node and render the response as JSON.
+    Ping a Tourillon node and report which node answered and how fast.
     """
     opts = opts or GlobalOptions()
-    return await ping_probe(
-        endpoint=endpoint,
-        tourconf=opts.tourconf,
-        context_name=opts.context,
+    print(
+        await ping_probe(
+            endpoint=endpoint,
+            tourconf=opts.tourconf,
+            context_name=opts.context,
+            as_json=json,
+        )
     )

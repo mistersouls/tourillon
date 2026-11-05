@@ -302,6 +302,21 @@ async def test_tls_config_rejects_invalid_base64_material() -> None:
 
 
 @pytest.mark.tourillon
+def test_tls_config_decodes_the_node_certificate() -> None:
+    tls = TlsConfig(ca_data="", cert_data="Y2VydA==", key_data="")
+
+    assert tls.certificate_pem() == b"cert"
+
+
+@pytest.mark.tourillon
+def test_tls_config_rejects_an_invalid_certificate_encoding() -> None:
+    tls = TlsConfig(ca_data="", cert_data="not-base64!", key_data="")
+
+    with pytest.raises(ValueError, match="cert_data must be valid base64 data"):
+        tls.certificate_pem()
+
+
+@pytest.mark.tourillon
 @pytest.mark.asyncio
 async def test_toml_persistence_round_trips_typed_values(tmp_path: Path) -> None:
     path = tmp_path / "generic.toml"

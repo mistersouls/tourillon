@@ -473,3 +473,23 @@ class KVPair:
     key: bytes
     value: bytes
     keyspace: Keyspace
+
+
+@dataclass(frozen=True, slots=True)
+class StorageUsage:
+    """Space and version counts of the storage, summed over groups.
+
+    ``used`` is the high-water mark of the files: pages freed by the garbage
+    collector are reused, but the files never shrink.
+    """
+
+    map_size: int = 0
+    used: int = 0
+    versions: int = 0
+
+    def __add__(self, other: "StorageUsage") -> "StorageUsage":
+        return StorageUsage(
+            map_size=self.map_size + other.map_size,
+            used=self.used + other.used,
+            versions=self.versions + other.versions,
+        )

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime as dt
 from typing import Protocol
 
 
@@ -40,3 +41,6 @@ class MtlsCrypto(Protocol):
         client_only: bool = False,
     ) -> tuple[bytes, bytes]:
         """Build a leaf certificate and private key signed by the given CA."""
+
+    def certificate_expiry(self, certificate_pem: bytes) -> dt.datetime:
+        """Return the UTC instant after which the certificate is no longer valid."""

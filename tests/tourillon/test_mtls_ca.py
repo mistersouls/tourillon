@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -182,3 +183,27 @@ def test_cli_tourillon_config_ca(tmp_path: Path) -> None:
     assert "Generated mTLS CA files" in result
     assert cert_path.exists()
     assert key_path.exists()
+
+
+@pytest.mark.tourillon
+def test_certificate_expiry_reads_the_not_after_date() -> None:
+    adapter = CryptographyMtlsAdapter()
+    ca_cert, _ = adapter.generate_ca(
+        common_name="ca",
+        organization="org",
+        country=None,
+        validity_days=10,
+        key_size=2048,
+    )
+
+    expiry = adapter.certificate_expiry(ca_cert)
+    left = expiry - datetime.now(UTC)
+
+    assert expiry.tzinfo is not None
+    assert timedelta(days=9) < left <= timedelta(days=10)
+
+
+@pytest.mark.tourillon
+def test_certificate_expiry_rejects_garbage() -> None:
+    with pytest.raises(ValueError, match="PEM encoded X.509"):
+        CryptographyMtlsAdapter().certificate_expiry(b"not a certificate")

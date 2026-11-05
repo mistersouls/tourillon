@@ -30,6 +30,7 @@ from tourillon.core.exceptions import (
     NoReplicaAvailableError,
     OutdatedRepairError,
     QuorumNotMetError,
+    QuorumUnreachableError,
     StoreOperationError,
     VersionNotFoundError,
 )
@@ -80,8 +81,14 @@ from tourlib.port import Serializer
 
 
 class _PlacementStub:
-    def __init__(self, preferences: tuple[Preference, ...], pid: int = 7) -> None:
+    def __init__(
+        self,
+        preferences: tuple[Preference, ...],
+        pid: int = 7,
+        replication_factor: int = 3,
+    ) -> None:
         self._preferences = preferences
+        self._rf = replication_factor
         self._placement = PartitionPlacement(
             group=0,
             vnode=VNode(
@@ -91,7 +98,11 @@ class _PlacementStub:
         )
 
     async def preference_list(self, addr: Address) -> PreferenceList:
-        return PreferenceList(placement=self._placement, preferences=self._preferences)
+        return PreferenceList(
+            placement=self._placement,
+            preferences=self._preferences,
+            replication_factor=self._rf,
+        )
 
     async def placement_for(self, addr: Address) -> PartitionPlacement:
         return self._placement
@@ -563,6 +574,7 @@ def _build_store(
     obligations: ObligationQueue | None = None,
     telemetry: RecordingTelemetry | None = None,
     retention_versions: int = 2,
+    replication_factor: int = 3,
 ) -> tuple[
     StoreService, _StorageStub, _PeerPoolStub, MsgPackSerializer, _PeerClientStub
 ]:
@@ -576,14 +588,18 @@ def _build_store(
         retention=RetentionPolicy(RetentionConfig(versions=retention_versions)),
         partitioner=cast(Partitioner, cast(object, _PartitionerStub(partitioner_pid))),
         placement_strategy=cast(
-            PlacementStrategy, cast(object, _PlacementStub(preferences))
+            PlacementStrategy,
+            cast(
+                object,
+                _PlacementStub(preferences, replication_factor=replication_factor),
+            ),
         ),
         clock=HLCClock(node_id),
         serializer=cast(Serializer, serializer),
         peer_pool=cast(PeerPool, cast(object, peer_pool)),
         response_delay=response_delay,
         read_repair=read_repair,
-        obligations=obligations,
+        obligations=obligations if obligations is not None else ObligationQueue(64),
         telemetry=None if telemetry is None else telemetry.as_port(),
     )
     return service, storage, peer_pool, serializer, client
@@ -626,6 +642,86 @@ async def test_omitted_quorums_record_one_and_allow_absent_reads() -> None:
     deleted = await store.delete(DeleteRequest(namespace=b"ns", key=b"key"))
     assert deleted is not None
     assert deleted.meta.quorum_write == 1
+    await store.close()
+
+
+@pytest.mark.tourillon
+async def test_outcomes_report_quorum_accounting_and_tombstone() -> None:
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    absent = await store.get_outcome(GetRequest(namespace=b"ns", key=b"key"))
+    assert (absent.version, absent.tombstone) == (None, None)
+    assert (absent.answered, absent.required, absent.replicas) == (1, 1, 1)
+
+    written = await store.put_outcome(
+        PutRequest(namespace=b"ns", key=b"key", value=b"value")
+    )
+    assert (written.acknowledged, written.required, written.replicas) == (1, 1, 1)
+    assert written.version.data == b"value"
+
+    deleted = await store.delete_outcome(DeleteRequest(namespace=b"ns", key=b"key"))
+    read = await store.get_outcome(GetRequest(namespace=b"ns", key=b"key"))
+    assert read.version is None
+    assert read.tombstone == deleted.version.meta.ts
+    await store.close()
+
+
+@pytest.mark.tourillon
+@pytest.mark.parametrize("operation", ["put", "delete"])
+async def test_write_quorum_above_replication_factor_is_refused_before_writing(
+    operation: str,
+) -> None:
+    local = _StoreStub()
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
+        members={},
+        local_store=local,
+        remote_responses={},
+        replication_factor=3,
+    )
+    with pytest.raises(QuorumUnreachableError) as exc_info:
+        if operation == "put":
+            await store.put(
+                PutRequest(namespace=b"ns", key=b"key", value=b"v", quorum_write=4)
+            )
+        else:
+            await store.delete(
+                DeleteRequest(namespace=b"ns", key=b"key", quorum_write=4)
+            )
+    assert exc_info.value.to_dict()["replication_factor"] == 3
+    assert exc_info.value.code == "quorum_unreachable"
+    assert await store.get(GetRequest(namespace=b"ns", key=b"key")) is None
+    await store.close()
+
+
+@pytest.mark.tourillon
+async def test_write_quorum_above_current_replicas_still_writes() -> None:
+    """A short preference list may grow, so only the configured factor refuses."""
+    store, *_ = _build_store(
+        node_id="node-a",
+        preferences=(
+            Preference(node_id="node-a", readable=True, handoff=None, writable=True),
+        ),
+        members={},
+        local_store=_StoreStub(),
+        remote_responses={},
+    )
+    with pytest.raises(QuorumNotMetError) as exc_info:
+        await store.put(
+            PutRequest(namespace=b"ns", key=b"key", value=b"v", quorum_write=2)
+        )
+    assert exc_info.value.token is not None
+    assert await store.get(GetRequest(namespace=b"ns", key=b"key")) is not None
     await store.close()
 
 
@@ -1124,6 +1220,7 @@ async def test_put_raises_when_remote_response_kind_is_invalid() -> None:
         clock=HLCClock("node-a"),
         serializer=cast(Serializer, serializer),
         peer_pool=cast(PeerPool, cast(object, peer_pool)),
+        obligations=ObligationQueue(64),
     )
 
     with pytest.raises(
@@ -1647,6 +1744,7 @@ async def test_incoming_hint_is_refused_while_draining() -> None:
     with pytest.raises(NodeDrainingError) as exc:
         await store.hint(_record(Address(namespace=b"ns", key=b"key")), "owner")
     assert exc.value.operation == "replication.hint"
+    assert exc.value.to_dict()["node_id"] == exc.value.node_id
     assert storage.store.written == []
 
 
@@ -2397,7 +2495,7 @@ async def test_draining_rejects_new_work(operation: str) -> None:
         "write": record,
     }
     store.pause()
-    with pytest.raises(NodeDrainingError, match="node is draining"):
+    with pytest.raises(NodeDrainingError, match="is draining"):
         await getattr(store, operation)(requests[operation])
     assert not client.requests
 

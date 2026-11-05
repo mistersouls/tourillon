@@ -17,7 +17,7 @@ import contextlib
 import logging
 import signal
 import ssl
-from collections.abc import AsyncIterator
+from datetime import datetime
 
 from tourillon.core.ae.obligations import ObligationQueue
 from tourillon.core.config import TourillonConfig
@@ -25,22 +25,40 @@ from tourillon.core.gossip.gossiper import GossipStats
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.log import logger
 from tourillon.core.models.clock import HLCClock
+from tourillon.core.models.state import NodeState
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import SimplePlacementStrategy
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports import Telemetry, TelemetryProvider
 from tourillon.core.ports.storage import StorageProvider
 from tourillon.core.probe.detector import FailureDetectorProvider
+from tourillon.core.services.aeinspector import AntiEntropyInspector
 from tourillon.core.services.antientropy import AntiEntropyService
 from tourillon.core.services.gc import GarbageCollector
 from tourillon.core.services.gossip import GossipService
 from tourillon.core.services.inspector import NodeInspector
 from tourillon.core.services.lifecycle import NodeLifecycle
+from tourillon.core.services.memberinspector import MemberInspector
+from tourillon.core.services.report import NodeReport
 from tourillon.core.services.store import StoreService
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.transports.dispatcher import Dispatcher
-from tourlib.models.inspect import NodeInfo, NodeInspectRequest
+from tourillon.core.transports.handshakes import HandshakeMonitor
+from tourlib.models.ae import (
+    AeStatus,
+    AeStatusRequest,
+    ObligationsPage,
+    ObligationsRequest,
+)
+from tourlib.models.health import NodeHealth
+from tourlib.models.inspect import (
+    AntiEntropyInfo,
+    MembersPage,
+    MembersRequest,
+    NodeStatus,
+)
+from tourlib.models.member import MemberReport
 from tourlib.port import Persistence, Serializer
 
 
@@ -62,8 +80,11 @@ class Manager:
         serializer: Serializer,
         storage_provider: StorageProvider,
         telemetry_provider: TelemetryProvider,
+        certificate_expires_at: datetime,
     ) -> None:
         self._config = config
+        self._handshakes = HandshakeMonitor()
+        self._handshakes.install(tls_server)
         self._partitioner = Partitioner(
             hashspace=HashSpace(bits=128), pshift=17, gshift=2
         )
@@ -131,6 +152,7 @@ class Manager:
             obligations=self._obligations,
             gc=self._gc,
         )
+        heartbeats = self._lifecycle.gossiper.heartbeats
         self._inspector = NodeInspector(
             gc_snapshot=self._gc.inspect,
             node_id=self._config.node.id,
@@ -138,11 +160,40 @@ class Manager:
             partitioner=self._partitioner,
             topologymgr=self._topologymgr,
             peer_pool=self._peer_pool,
+            heartbeats=heartbeats,
+            antientropy=self._antientropy_info,
+            local_member=self._lifecycle.local_member,
+        )
+        self._ae_inspector = AntiEntropyInspector(
+            node_id=self._config.node.id,
+            antientropy=self._lifecycle.antientropy,
+            total_groups=self._partitioner.total_groups,
+            topologymgr=self._topologymgr,
+            members=self._inspector,
+        )
+        self._member_inspector = MemberInspector(
+            node_id=config.node.id,
+            replication_factor=config.placement.replication_factor,
+            partitioner=self._partitioner,
+            topologymgr=self._topologymgr,
+            members=self._inspector,
+            peer_pool=self._peer_pool,
+            serializer=serializer,
+        )
+        self._report = NodeReport(
+            inspector=self._inspector,
+            ae_inspector=self._ae_inspector,
+            antientropy=self._lifecycle.antientropy,
+            storage=self._storage,
+            total_groups=self._partitioner.total_groups,
+            handshakes=self._handshakes,
+            certificate_expires_at=certificate_expires_at,
         )
         self._gossip = GossipService(
             node_id=self._config.node.id,
             topologymgr=self._topologymgr,
             relay=self._lifecycle.gossiper.relay,
+            heartbeats=heartbeats,
         )
         self._serializer = serializer
 
@@ -260,12 +311,55 @@ class Manager:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, event.set)
 
-    async def inspect(self, request: NodeInspectRequest) -> AsyncIterator[NodeInfo]:
-        async for info in self._inspector.inspect(request):
-            yield info
+    async def inspect(self) -> NodeStatus:
+        return await self._report.status()
 
-    async def join(self, seeds: list[str] | None = None) -> None:
-        await self._lifecycle.join(seeds=seeds)
+    async def health(self) -> NodeHealth:
+        return await self._report.health()
+
+    async def members(self, request: MembersRequest) -> MembersPage:
+        return await self._inspector.members(request)
+
+    async def ae_status(self, request: AeStatusRequest) -> AeStatus:
+        return await self._ae_inspector.status(request)
+
+    async def ae_obligations(self, request: ObligationsRequest) -> ObligationsPage:
+        return await self._ae_inspector.obligations(request)
+
+    async def member(self, node_id: str) -> MemberReport:
+        return await self._member_inspector.inspect(node_id)
+
+    def _antientropy_info(self) -> AntiEntropyInfo:
+        stats = self._lifecycle.antientropy.stats
+        queue = self._obligations.to_dict()
+        return AntiEntropyInfo(
+            queued=int(queue["queued"]),
+            inflight=int(queue["inflight"]),
+            backlog=bool(queue["backlog"]),
+            sweeps=stats.sweeps,
+            last_sweep_at=stats.last_sweep_at,
+            last_sweep_diverged=stats.last_sweep_diverged,
+            delivered=stats.obligations_delivered,
+            errors=stats.errors,
+            last_failure=stats.last_failure,
+        )
+
+    async def join(self, seeds: list[str] | None = None) -> bool:
+        return await self._lifecycle.join(seeds=seeds)
+
+    async def cancel_join(self) -> NodeState:
+        """Cancel an active join and leave the node out of placement."""
+        return await self._lifecycle.cancel_join()
 
     async def drain(self) -> None:
         await self._lifecycle.drain()
+
+    async def cancel_drain(self) -> NodeState:
+        """Cancel an active drain and restore service in the READY phase."""
+        return await self._lifecycle.cancel_drain()
+
+    async def pause(self) -> None:
+        await self._lifecycle.pause()
+
+    async def resume(self) -> None:
+        await self._lifecycle.resume()

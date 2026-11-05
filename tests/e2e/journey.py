@@ -277,15 +277,18 @@ class Journey:
         return json.loads(result.stdout)
 
     def inspect(self, node: Node) -> dict[str, Any]:
-        chunks = self.ctl(node, "node", "inspect", node.peer, "--json")
-        assert len(chunks) == 1, chunks
-        info = chunks[0]
+        info = self.ctl(node, "node", "status", node.peer, "--json")
         assert info["node_id"] == node.name
-        assert info["has_more"] is False
         return info
 
+    def members(self, node: Node) -> list[dict[str, Any]]:
+        page = self.ctl(node, "cluster", "status", "-a", node.peer, "--all", "--json")
+        assert page["node_id"] == node.name
+        assert page["cursor"] is None
+        return page["items"]
+
     def probe(self, node: Node, endpoint: str) -> dict[str, Any]:
-        result = self.ctl(node, "probe", "ping", endpoint)
+        result = self.ctl(node, "probe", "ping", endpoint, "--json")
         assert result["node_id"] == node.name
         assert type(result["timestamp_ms"]) is int
         assert type(result["recv_ms"]) is int
@@ -296,7 +299,7 @@ class Journey:
         assert node.process.poll() is None, f"{node.name} exited; logs: {self.root}"
         self.probe(node, "client")
         self.probe(node, "peer")
-        assert self.inspect(node)["self_member"]["phase"] == "READY"
+        assert self.inspect(node)["phase"] == "READY"
         return True
 
     def kv(
@@ -329,32 +332,54 @@ class Journey:
         kind: str = "str",
         expected: Any = None,
     ) -> Any:
-        version = self.kv(
+        written = self.kv(
             node, "put", key, value, "--value-type", kind, namespace=namespace
         )
-        assert_version(version, key, value if expected is None else expected, namespace)
-        return version
+        assert set(written) == {"address", "quorum", "value", "version"}
+        assert written["address"] == {"key": key, "namespace": namespace}
+        assert written["value"]["type"] == kind
+        assert written["quorum"]["acknowledged"] >= written["quorum"]["required"]
+        assert isinstance(written["version"]["node_id"], str)
+        return written
 
     def check(
         self, node: Node, key: str, expected: Any, namespace: str = "journey"
     ) -> Any:
-        version = self.kv(node, "get", key, namespace=namespace)
         if expected is None:
-            assert version is None, version
-        else:
-            assert_version(version, key, expected, namespace)
-        return version
+            self.check_absent(node, key, namespace)
+            return None
+        document = self.kv(node, "get", key, namespace=namespace)
+        assert_read(document, key, expected, namespace)
+        return document
+
+    def check_absent(self, node: Node, key: str, namespace: str) -> None:
+        result = self.ctl_result(
+            node,
+            "get",
+            key,
+            "--namespace",
+            namespace,
+            "--namespace-type",
+            "str",
+            "--json",
+        )
+        assert result.returncode == 4, result.stdout + result.stderr
+        assert result.stdout == "", result.stdout
+        assert json.loads(result.stderr)["error"]["code"] == "not_found"
 
 
-def assert_version(version: Any, key: str, expected: Any, namespace: str) -> None:
-    assert set(version) == {"address", "data", "meta"}
-    assert version["address"] == {"key": key, "namespace": namespace}
-    assert type(version["data"]) is type(expected)
-    try:
-        assert version["data"] == expected
-    except AssertionError:
-        print(f"Assertion failed for version: {version['data']}!={expected}")
-        raise
-    assert type(version["meta"]["quorum_write"]) is int
-    assert version["meta"]["quorum_write"] >= 0
-    assert isinstance(version["meta"]["ts"]["node_id"], str)
+def stored_value(document: Any) -> Any:
+    value = document["value"]
+    if value["type"] == "bytes":
+        return {"base64": value["base64"]}
+    return value["data"]
+
+
+def assert_read(document: Any, key: str, expected: Any, namespace: str) -> None:
+    assert set(document) == {"address", "read", "value", "version"}
+    assert document["address"] == {"key": key, "namespace": namespace}
+    actual = stored_value(document)
+    assert type(actual) is type(expected), (actual, expected)
+    assert actual == expected, (actual, expected)
+    assert document["read"]["answered"] >= document["read"]["required"]
+    assert isinstance(document["version"]["node_id"], str)
