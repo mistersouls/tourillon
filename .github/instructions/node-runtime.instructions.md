@@ -31,7 +31,7 @@ async with provider.session(write=True) as session:
     async with session.batch() as batch:
         batch.put(kv)
         batch.get(ref)
-        results = await batch.result()
+        results = await batch.get()
 ```
 
 - Every operation is scoped to a **partition group**. Never bypass `session_provider_for`.

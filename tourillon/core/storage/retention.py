@@ -20,7 +20,6 @@ from typing import Literal
 from tourillon.core.models.config import RetentionConfig
 from tourillon.core.models.repair import VersionLookup
 from tourillon.core.models.storageschema import Key, KeyTag, PartitionAddress, Record
-from tourillon.core.storage.session import GroupSession
 
 WriteDisposition = Literal["applied", "already_present", "ignored_retention"]
 

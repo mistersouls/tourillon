@@ -31,7 +31,6 @@ from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.ports.storage import Storage
 from tourillon.core.ports.telemetry import Telemetry
 from tourillon.core.storage.retention import RetentionPolicy
-from tourillon.core.storage.session import GroupSession, GroupSessionManager
 
 
 @dataclass(frozen=True)

@@ -45,7 +45,7 @@ from tourillon.core.peer.pool import PeerPool
 from tourillon.core.probe.detector import FailureDetectorProvider
 from tourillon.core.services.gc import GarbageCollector
 from tourillon.core.services.lifecycle import NodeLifecycle, _background_task
-from tourillon.core.services.store import StoreService
+from tourillon.core.services.store import StorageService
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.telemetry import build_noop_telemetry
@@ -173,7 +173,7 @@ def _build_lifecycle(
         peer_pool=peer_pool,
     )
     retention = RetentionPolicy(config.placement.retention)
-    store = StoreService(
+    store = StorageService(
         retention=retention,
         node_id=config.node.id,
         storage=storage,

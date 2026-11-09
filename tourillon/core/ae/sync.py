@@ -53,12 +53,11 @@ the data and its digests *are* the state.
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import groupby
 from typing import Any
 
-from tourillon.core.ae.local import LocalStore
 from tourillon.core.ae.view import ReplicaView
 from tourillon.core.log import logger
 from tourillon.core.models.antientropy import (
@@ -84,6 +83,7 @@ from tourillon.core.storage.session import (
     DigestCell,
     bucket_bounds,
 )
+from tourillon.core.storage.store import Store
 
 # Sends one request and returns the decoded ``.accept`` payload; raises
 # AntiEntropyRejectError on ``.reject``.
@@ -133,7 +133,7 @@ class SyncProgress:
 class PeerSync:
     def __init__(
         self,
-        local: LocalStore,
+        store: Store,
         peer: str,
         call: Call,
         view: ReplicaView,
@@ -144,7 +144,7 @@ class PeerSync:
         *,
         progress: SyncProgress,
     ) -> None:
-        self._local = local
+        self._store = store
         self._peer = peer
         self._call = call
         self._view = view
@@ -225,7 +225,7 @@ class PeerSync:
         )
 
     async def _sync_root_page(self, pids: Sequence[int]) -> int:
-        local = await self._local.roots(pids)
+        local = await self._store.roots(pids)
 
         request = RootsRequest(
             self._scope(pids), tuple(local[pid].to_bytes() for pid in pids)
@@ -264,7 +264,7 @@ class PeerSync:
             )
 
             theirs = {b: DigestCell.from_bytes(c) for b, c in page.cells}
-            mine = await self._local.buckets_until(pid, after, page.cursor, self._page)
+            mine = await self._store.buckets_until(pid, after, page.cursor, self._page)
             self._note_recent(pid, mine, page.cursor, cutoff_bucket)
 
             for bucket in sorted(theirs.keys() | mine.keys()):
@@ -285,7 +285,7 @@ class PeerSync:
             after = page.cursor
 
     def _note_recent(
-        self, pid: int, mine: dict[int, DigestCell], cursor: int | None, cutoff: int
+        self, pid: int, mine: Mapping[int, DigestCell], cursor: int | None, cutoff: int
     ) -> None:
         """Flag ``pid`` when local versions may lie beyond the comparable part.
 
@@ -328,7 +328,7 @@ class PeerSync:
 
         remote = DigestCell.from_bytes(response["cell"])
 
-        if remote != await self._local.range_digest(start, horizon):
+        if remote != await self._store.range_digest(start, horizon):
             await self._sync_range(scope, pid, start, horizon)
 
     async def _sync_range(
@@ -464,7 +464,7 @@ class PeerSync:
 
     def _scope(self, pids: Sequence[int]) -> Scope:
         return Scope(
-            tuple(pids), self._view.view_hash(pids), self._local.retention_versions
+            tuple(pids), self._view.view_hash(pids), self._store.retention_versions
         )
 
     async def _rpc(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:

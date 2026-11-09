@@ -19,7 +19,7 @@ from tourillon.core.log import logger
 from tourillon.core.manager import Manager
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourillon.infra.adapter.telemetry.otel_provider import OpenTelemetryProvider
-from tourillon.infra.storage.lmdb_storage import LMDBStorageProvider
+from tourillon.infra.storage.lmdb_storage import LmdbStorageProvider
 from tourlib.adapter import CryptographyMtlsAdapter, MsgPackSerializer, TomlPersistence
 
 
@@ -44,7 +44,7 @@ def get_app() -> Application:
         serializer=MsgPackSerializer(),
         peer_dispatcher=peer_dispatcher(),
         client_dispatcher=client_dispatcher(),
-        storage_provider=LMDBStorageProvider(),
+        storage_provider=LmdbStorageProvider(),
         telemetry_provider=OpenTelemetryProvider(),
     )
 

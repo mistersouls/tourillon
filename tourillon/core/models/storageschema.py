@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import Any
@@ -38,6 +39,20 @@ class MetaKind(Enum):
     DIGEST = b"\x02"
 
 
+@dataclass(frozen=True, slots=True)
+class RawPrefix:
+    """A literal key prefix accepted by the storage ``prefix`` parameters."""
+
+    value: bytes
+
+    def to_bytes(self) -> bytes:
+        return self.value
+
+    @classmethod
+    def from_bytes(cls, b: bytes) -> "RawPrefix":
+        return cls(b)
+
+
 @dataclass(frozen=True, slots=True, eq=True)
 class ObligationPrefix:
     """
@@ -57,6 +72,16 @@ class ObligationPrefix:
         if self.target is None:
             return MetaKind.OBLIGATION.value
         return MetaKind.OBLIGATION.value + _length_prefixed(self.target.encode("utf-8"))
+
+    @classmethod
+    def from_bytes(cls, b: bytes) -> "ObligationPrefix":
+        walker = BytesWalker(b)
+        if walker.read(1, "metadata kind") != MetaKind.OBLIGATION.value:
+            raise ValueError("metadata key is not a replication obligation")
+        if walker.read_remaining():
+            target = walker.read_field("obligation target").decode("utf-8")
+            return cls(target=target)
+        return cls()
 
 
 def _length_prefixed(value: bytes) -> bytes:
@@ -461,6 +486,10 @@ class Record(KeyTag):
         tag = Tag.from_dict(data["tag"])
         return cls(key=key, value=value, tag=tag)
 
+    def size(self) -> int:
+        """Return the size of the Record in bytes."""
+        return len(self.to_bytes(Keyspace.LOGS)) + len(self.to_bytes(Keyspace.TAGS))
+
 
 @dataclass(frozen=True, slots=True, order=True, eq=True)
 class KVRef:
@@ -473,3 +502,15 @@ class KVPair:
     key: bytes
     value: bytes
     keyspace: Keyspace
+
+
+@dataclass(frozen=True, slots=True, order=True, eq=True)
+class KVList:
+    keyspace: Keyspace
+    items: Sequence[tuple[bytes, bytes]]
+
+
+@dataclass(frozen=True, slots=True, order=True, eq=True)
+class KeyList:
+    keyspace: Keyspace
+    items: Sequence[bytes]

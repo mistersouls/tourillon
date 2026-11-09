@@ -85,13 +85,12 @@ import hashlib
 import logging
 import random
 import time
-from collections.abc import Callable, Coroutine, Iterable, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import groupby
 from typing import Any
 
-from tourillon.core.ae.local import LocalStore
 from tourillon.core.ae.obligations import ObligationQueue
 from tourillon.core.ae.responder import AntiEntropyResponder
 from tourillon.core.ae.sync import (
@@ -129,9 +128,8 @@ from tourillon.core.models.storageschema import (
 )
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer.pool import PeerPool
-from tourillon.core.ports.storage import Storage
 from tourillon.core.ports.telemetry import Telemetry
-from tourillon.core.storage.retention import RetentionPolicy
+from tourillon.core.storage.store import Store
 from tourillon.core.telemetry import build_noop_telemetry
 from tourlib import Serializer
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT
@@ -338,7 +336,7 @@ class AntiEntropyService:
     def __init__(
         self,
         node_id: str,
-        storage: Storage,
+        store: Store,
         partitioner: Partitioner,
         topologymgr: TopologyManager,
         peer_pool: PeerPool,
@@ -346,7 +344,6 @@ class AntiEntropyService:
         replication_factor: int,
         config: AntiEntropyConfig,
         *,
-        retention: RetentionPolicy,
         obligations: ObligationQueue | None = None,
         clock: Callable[[], float] = time.time,
         backoff: BackoffRetry | None = None,
@@ -361,7 +358,7 @@ class AntiEntropyService:
         self._serializer = serializer
         self._config = config
         self._clock = clock
-        self.local = LocalStore(storage, partitioner, notify, retention)
+        self._store = store
         self.obligations = obligations or ObligationQueue(config.hotqueue_size)
 
         self.tracker = ViewTracker(
@@ -374,7 +371,7 @@ class AntiEntropyService:
         )
 
         self.responder = AntiEntropyResponder(
-            self.local, self.tracker, config.concurrency
+            self._store, self.tracker, config.concurrency
         )
 
         self._backoff = PeerBackoff(backoff or BackoffRetry(), time.monotonic)
@@ -578,9 +575,8 @@ class AntiEntropyService:
         after: int | None = None
 
         while True:
-            roots, after = await self.local.root_page(
-                after, self._config.pids_per_cycle
-            )
+            roots = await self._store.list_root(after, self._config.pids_per_cycle)
+            after = roots[-1][0] if roots else None
             pids = [pid for pid, _ in roots]
             result = await self._exchange(
                 _targets(view, pids),
@@ -594,8 +590,6 @@ class AntiEntropyService:
 
             if after is None or stale.is_set():
                 return complete and not stale.is_set()
-
-    # -- sweep ---------------------------------------------------------------
 
     async def _run(self) -> None:
         while True:
@@ -714,7 +708,7 @@ class AntiEntropyService:
     ) -> dict[int, tuple[bytes, bytes]]:
         """Find stored pids of ``span`` this node does not replicate."""
         lo, hi = span
-        roots, _ = await self.local.root_page(lo - 1 if lo else None, hi - lo)
+        roots = await self._store.list_root(lo - 1 if lo else None, hi - lo)
         marks: dict[int, tuple[bytes, bytes]] = {}
 
         for pid, cell in roots:
@@ -815,28 +809,20 @@ class AntiEntropyService:
         """
         queue = self.obligations
         queue.backlog = False
-        pending = False
-
-        for group in range(self._partitioner.total_groups):
-            pending = await self._reload_group(group) or pending
-
-            if queue.backlog:
-                return
-
-        queue.backlog = pending
-
-    async def _reload_group(self, group: int) -> bool:
         after: bytes | None = None
         pending = False
 
         while True:
-            page, after = await self.local.obligation_page(group, after, self._batch)
+            page = await self._store.list_obligations(after, self._batch)
+            after = page[-1].to_bytes() if len(page) == self._batch else None
             ready = [ob for ob in page if not self._backoff.deferred(ob.target)]
             pending = pending or len(ready) < len(page)
             self.obligations.submit(ready)
 
             if after is None or self.obligations.backlog:
-                return pending
+                break
+
+        queue.backlog = pending
 
     async def deliver(self, batch: Sequence[ObligationKey], view: ReplicaView) -> None:
         """Push the versions of ``batch`` to their targets, then forget them.
@@ -846,7 +832,7 @@ class AntiEntropyService:
         the preference list makes a debt obsolete without delivery.
         """
         owed = {ob for ob in batch if self._owed(ob, view)}
-        records = await self.local.latest_records(list(owed))
+        records = await self._store.record_from_obligations(list(owed))
         obsolete = [ob for ob in batch if ob not in owed]
         unavailable = [ob for ob in owed if ob.key not in records]
         if unavailable:
@@ -881,7 +867,7 @@ class AntiEntropyService:
         self,
         target: str,
         obligations: list[ObligationKey],
-        records: dict[Key, Record],
+        records: Mapping[Key, Record],
         view: ReplicaView,
     ) -> None:
         if not await self._eligible(target):
@@ -919,7 +905,7 @@ class AntiEntropyService:
         target: str,
         pid: int,
         obligations: list[ObligationKey],
-        records: dict[Key, Record],
+        records: Mapping[Key, Record],
         view: ReplicaView,
     ) -> bool:
         call = self._caller(target)
@@ -966,7 +952,7 @@ class AntiEntropyService:
         )
 
         return PeerSync(
-            self.local,
+            self._store,
             peer,
             self._caller(peer),
             view,
@@ -1136,7 +1122,7 @@ def _delivery_order(obligation: ObligationKey) -> tuple[str, bytes]:
 
 
 def _chunks(
-    obligations: list[ObligationKey], records: dict[Key, Record], max_bytes: int
+    obligations: list[ObligationKey], records: Mapping[Key, Record], max_bytes: int
 ) -> list[list[ObligationKey]]:
     """Split obligations into push batches of at most ``max_bytes`` of records."""
     chunks: list[list[ObligationKey]] = []

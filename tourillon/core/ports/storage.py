@@ -1,81 +1,43 @@
-# Copyright 2026 Tourillon Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-from collections.abc import AsyncIterator, Callable
+import builtins
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
-from typing import Protocol
+from typing import Any, Protocol
 
-from tourillon.core.models.clock import HLCTimestamp
 from tourillon.core.models.config import StorageConfig
-from tourillon.core.models.storageschema import (
-    Keyspace,
-    KVPair,
-    KVRef,
-)
+from tourillon.core.models.storageschema import KeyList, Keyspace, KVList, KVPair, KVRef
+from tourillon.core.partition.partitioner import Partitioner
+from tourillon.core.utils.defer import Result
+from tourlib.models.ts import HLCTimestamp
 from tourlib.models.types import SupportsBytes
 
 
-class Batch(Protocol):
-    def keys(
-        self,
-        keyspace: Keyspace,
-        prefix: SupportsBytes | None = None,
-        start: bytes | None = None,
-        limit: int = 64,
-        reverse: bool = False,
-    ) -> None:
-        """Schedule a bounded page of KVRef without materializing values."""
+class Transaction(Protocol):
+    async def results(self) -> list[Any]:
+        """Wait for the transaction operations to complete and return the results."""
 
-    async def __aenter__(self) -> "Batch":
-        """Enter the batch context manager."""
+    def exists(self, ref: KVRef) -> Result[bool]:
+        """Check key-presence."""
 
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: BaseException | None,
-    ) -> bool:
-        """Exit the batch context manager."""
-
-    async def result[T](self) -> T:
-        """Wait for the batch operations to complete and return the result."""
-
-    def get(self, ref: KVRef) -> None:
-        """Schedule a get operation for a key-value pair by its reference."""
-
-    def exists(self, ref: KVRef) -> None:
-        """Schedule a key-presence check without retrieving its value."""
-
-    def put(self, kv: KVPair, overwrite: bool = True) -> None:
-        """
-        Schedule a put operation for a key-value pair into the storage,
-        optionally overwriting existing values.
-        """
-
-    def delete(self, ref: KVRef) -> None:
-        """Schedule a delete operation for a key-value pair by its reference."""
+    def get(self, ref: KVRef) -> Result[KVPair | None]:
+        """Get a key-value pair by its reference."""
 
     def last(
         self,
         keyspace: Keyspace,
         prefix: SupportsBytes | None = None,
         predicate: Callable[[KVPair], bool] | None = None,
-    ) -> None:
-        """
-        Schedule a get operation for the last key-value pair in the given keyspace,
-        optionally filtered by prefix and predicate.
-        """
+    ) -> Result[KVPair | None]:
+        """Get the last key-value pair matching the given criteria."""
+
+    def keys(
+        self,
+        keyspace: Keyspace,
+        prefix: SupportsBytes | None = None,
+        start: bytes | None = None,
+        limit: int = 128,
+        reverse: bool = False,
+    ) -> Result[list[KVRef]]:
+        """Get a bounded page of KVRef without materializing values."""
 
     def list(
         self,
@@ -84,86 +46,50 @@ class Batch(Protocol):
         start: bytes | None = None,
         limit: int | None = None,
         reverse: bool = False,
-    ) -> None:
+    ) -> Result[list[KVPair]]:
+        """Get a bounded page of KVPair matching the given criteria."""
+
+    def put(self, kv: KVPair, overwrite: bool = True) -> Result[bool]:
+        """Put a key-value pair into the storage, optionally overwriting existing values."""
+
+    def delete(self, ref: KVRef) -> Result[KVPair | None]:
         """
-        Schedule a list operation for key-value pairs in the given keyspace,
-        optionally filtered by prefix, start key, limit, and order.
-
-        For forward scans, start is exclusive: pass the last returned key
-        unchanged to resume, even if that key has since been deleted.
-        """
-
-
-class Session(Protocol):
-    async def keys(
-        self,
-        keyspace: Keyspace,
-        prefix: SupportsBytes | None = None,
-        start: bytes | None = None,
-        limit: int = 64,
-        reverse: bool = False,
-    ) -> list[KVRef]:
-        """Read a bounded reference page, with the same bounds as Batch.list."""
-
-    async def exists(self, ref: KVRef) -> bool:
-        """Check exact key presence without retrieving its value."""
-
-    def batch(self) -> Batch:
-        """Return a batch context manager for heavy multiple operations."""
-
-    async def get(self, ref: KVRef) -> KVPair | None:
-        """Get a key-value pair by its reference."""
-
-    async def put(self, kv: KVPair, overwrite: bool = True) -> bool:
-        """
-        Put a key-value pair into the storage, optionally overwriting existing values.
-        Returns True if the value was inserted or overwritten, False otherwise.
+        Delete a key-value pair from the storage by its reference.
+        Returns the deleted KVPair if it existed, otherwise None.
         """
 
-    async def delete(self, ref: KVRef) -> None:
-        """Delete a key-value pair by its reference."""
+    def get_many(self, refs: Sequence[KeyList]) -> Result[builtins.list[KVPair]]:
+        """Get multiple key-value pairs by their references."""
 
-    async def last(
-        self,
-        keyspace: Keyspace,
-        prefix: SupportsBytes | None = None,
-        predicate: Callable[[KVPair], bool] | None = None,
-    ) -> KVPair | None:
+    def put_many(
+        self, kvs: Sequence[KVList], overwrite: bool = True
+    ) -> Result[tuple[int, int]]:
+        """Put multiple key-value pairs into the storage, optionally overwriting existing values."""
+
+    def delete_many(
+        self, refs: Sequence[KeyList]
+    ) -> Result[builtins.list[KVPair | None]]:
         """
-        Get the last key-value pair in the given keyspace,
-        optionally filtered by prefix and predicate.
+        Delete multiple key-value pairs from the storage by their references.
+        Returns a list of deleted KVPairs if they existed, otherwise None
+        for each non-existent reference.
         """
 
-    def iter(
-        self,
-        keyspace: Keyspace,
-        prefix: SupportsBytes | None = None,
-        start: bytes | None = None,
-        reverse: bool = False,
-        batch_size: int = 32,
-        limit: int | None = None,
-    ) -> AsyncIterator[KVPair]:
-        """Iterate over key-value pairs in the given keyspace."""
 
-
-class SessionProvider(Protocol):
-    @property
-    def group_id(self) -> int:
-        """Return the group ID associated with this session provider."""
-
+class Transactional(Protocol):
     @asynccontextmanager
-    def session(self, write: bool = False) -> AsyncIterator[Session]:
-        """Provide a session context manager for read or write operations."""
+    def transaction(self, write: bool = False) -> AsyncIterator[Transaction]:
+        """Enter a transactional context."""
 
     async def close(self) -> None:
-        """Close the session provider and release any resources."""
+        """Close the transactional storage, releasing any resources."""
 
 
 class Storage(Protocol):
-    async def session_provider_for(self, group: int) -> SessionProvider:
-        """Return a session provider for the given group ID."""
+    async def transactional_for(self, group: int) -> Transactional:
+        """Return a transactional for the given group ID."""
 
-    async def latest_hlc(self, total_groups: int) -> HLCTimestamp:
+    async def latest_hlc(self, partitioner: Partitioner) -> HLCTimestamp:
         """Return the latest hybrid logical clock timestamp."""
 
     async def close(self) -> None:

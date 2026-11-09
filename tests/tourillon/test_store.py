@@ -67,7 +67,7 @@ from tourillon.core.partition.placement import (
 from tourillon.core.partition.types import LogicalPartition, PartitionPlacement
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports.storage import Storage
-from tourillon.core.services.store import StoreService
+from tourillon.core.services.store import StorageService
 from tourillon.core.spaces.vnode import VNode
 from tourillon.core.storage.retention import RetentionPolicy
 from tourlib.adapter import MsgPackSerializer
@@ -564,13 +564,13 @@ def _build_store(
     telemetry: RecordingTelemetry | None = None,
     retention_versions: int = 2,
 ) -> tuple[
-    StoreService, _StorageStub, _PeerPoolStub, MsgPackSerializer, _PeerClientStub
+    StorageService, _StorageStub, _PeerPoolStub, MsgPackSerializer, _PeerClientStub
 ]:
     serializer = MsgPackSerializer()
     client = _PeerClientStub(serializer, remote_responses, remote_delays)
     peer_pool = _PeerPoolStub(client, known_peers=set(members))
     storage = _StorageStub(local_store)
-    service = StoreService(
+    service = StorageService(
         node_id=node_id,
         storage=cast(Storage, cast(object, storage)),
         retention=RetentionPolicy(RetentionConfig(versions=retention_versions)),
@@ -1103,7 +1103,7 @@ async def test_put_raises_when_remote_response_kind_is_invalid() -> None:
         cast(_PeerClientStub, cast(object, client)), known_peers={"node-b"}
     )
     storage = _StorageStub(_StoreStub())
-    service = StoreService(
+    service = StorageService(
         node_id="node-a",
         storage=cast(Storage, cast(object, storage)),
         retention=RetentionPolicy(RetentionConfig(versions=2)),

@@ -36,7 +36,6 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 
-from tourillon.core.ae.local import LocalStore
 from tourillon.core.ae.tracker import ViewTracker
 from tourillon.core.exceptions import AntiEntropyRejectError
 from tourillon.core.models.antientropy import (
@@ -54,6 +53,7 @@ from tourillon.core.models.antientropy import (
 )
 from tourillon.core.models.storageschema import Key, Keyspace
 from tourillon.core.storage.session import OWNED_KINDS, DigestCell
+from tourillon.core.storage.store import Store
 
 # Hint returned with ``busy``: long enough for in-flight requests to finish.
 BUSY_RETRY_AFTER = 1.0
@@ -62,11 +62,11 @@ BUSY_RETRY_AFTER = 1.0
 class AntiEntropyResponder:
     def __init__(
         self,
-        local: LocalStore,
+        store: Store,
         tracker: ViewTracker,
         concurrency: int,
     ) -> None:
-        self._local = local
+        self._store = store
         self._tracker = tracker
         self._slots = concurrency
         self._active = 0
@@ -86,7 +86,7 @@ class AntiEntropyResponder:
 
     async def roots(self, request: RootsRequest) -> RootsResponse:
         async with self._admit(request.scope):
-            local = await self._local.roots(request.scope.pids)
+            local = await self._store.roots(request.scope.pids)
 
             diffs = tuple(
                 (pid, local[pid].to_bytes())
@@ -169,7 +169,7 @@ class AntiEntropyResponder:
                 self._idle.set()
 
     def _check(self, scope: Scope, write: bool) -> None:
-        if scope.retention_versions != self._local.retention_versions:
+        if scope.retention_versions != self._store.retention_versions:
             self.rejected += 1
             raise AntiEntropyRejectError(
                 AntiEntropyRejectError.INVALID,

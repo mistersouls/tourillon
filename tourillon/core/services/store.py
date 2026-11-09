@@ -57,10 +57,9 @@ from tourillon.core.models.storageschema import (
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import PlacementStrategy, Preference
 from tourillon.core.peer.pool import PeerPool
-from tourillon.core.ports.storage import Storage
 from tourillon.core.ports.telemetry import Telemetry
 from tourillon.core.storage.retention import RetentionPolicy
-from tourillon.core.storage.session import GroupSessionManager
+from tourillon.core.storage.store import Store
 from tourillon.core.telemetry import build_noop_telemetry
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT, MAX_CLOCK_SKEW_MS, MAX_QUORUM
 from tourlib.envelope import build_envelope
@@ -97,11 +96,11 @@ _REFUSALS = (
 )
 
 
-class StoreService:
+class StorageService:
     def __init__(
         self,
         node_id: str,
-        storage: Storage,
+        store: Store,
         partitioner: Partitioner,
         placement_strategy: PlacementStrategy,
         clock: HLCClock,
@@ -116,7 +115,7 @@ class StoreService:
     ) -> None:
         self._node_id = node_id
         self._telemetry = telemetry or build_noop_telemetry()
-        self._storage = storage
+        self._store = store
         self._retention = retention
         self._partitioner = partitioner
         self._placement_strategy = placement_strategy
@@ -543,7 +542,7 @@ class StoreService:
         token: str,
     ) -> None:
         """Let the client decide again whether the durability reached is enough."""
-        StoreService._ensure_quorum(
+        StorageService._ensure_quorum(
             durable, request.quorum_write, "repair", errors, token
         )
 
@@ -1073,7 +1072,7 @@ class StoreService:
     ) -> list[tuple[str, str | None]]:
         targets: list[tuple[str, str | None]] = []
         for entry in preferences:
-            target = StoreService._write_target(entry)
+            target = StorageService._write_target(entry)
             if target is not None:
                 targets.append(target)
         return targets

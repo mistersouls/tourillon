@@ -36,9 +36,11 @@ from tourillon.core.services.gc import GarbageCollector
 from tourillon.core.services.gossip import GossipService
 from tourillon.core.services.inspector import NodeInspector
 from tourillon.core.services.lifecycle import NodeLifecycle
-from tourillon.core.services.store import StoreService
+from tourillon.core.services.store import StorageService
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.storage.retention import RetentionPolicy
+from tourillon.core.storage.session import DEFAULT_BUCKET_SHIFT
+from tourillon.core.storage.store import Store
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourlib.models.inspect import NodeInfo, NodeInspectRequest
 from tourlib.port import Persistence, Serializer
@@ -98,9 +100,11 @@ class Manager:
             node_id=config.node.id,
             telemetry=self._telemetry,
         )
-        self._store = StoreService(
+        retention = RetentionPolicy(config.placement.retention)
+        store = Store(self._storage, self._partitioner, retention, DEFAULT_BUCKET_SHIFT)
+        self._store = StorageService(
             node_id=config.node.id,
-            storage=self._storage,
+            store=store,
             retention=RetentionPolicy(config.placement.retention),
             partitioner=self._partitioner,
             placement_strategy=self._placement_strategy,
@@ -171,7 +175,7 @@ class Manager:
         return self._telemetry
 
     @property
-    def store(self) -> StoreService:
+    def store(self) -> StorageService:
         """Get the store service."""
         return self._store
 
@@ -193,7 +197,7 @@ class Manager:
         if seeds:
             logger.debug("Startup seeds override provided: %s", seeds)
         try:
-            latest = await self._storage.latest_hlc(self._partitioner.total_groups)
+            latest = await self._storage.latest_hlc(self._partitioner)
         except Exception:
             logger.exception(
                 "Failed to load latest HLC from storage for node '%s'", self.node_id

@@ -40,8 +40,10 @@ from tourillon.core.ports import Telemetry
 from tourillon.core.ports.storage import Storage
 from tourillon.core.services.antientropy import AntiEntropyService
 from tourillon.core.services.gc import GarbageCollector
-from tourillon.core.services.store import StoreService
+from tourillon.core.services.store import StorageService
 from tourillon.core.storage.retention import RetentionPolicy
+from tourillon.core.storage.session import DEFAULT_BUCKET_SHIFT
+from tourillon.core.storage.store import Store
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourillon.core.transports.server import EnvelopeServer
 from tourlib import Serializer, ValidationError
@@ -80,7 +82,7 @@ class NodeLifecycle:
         storage: Storage,
         gossip_stats: GossipStats,
         telemetry: Telemetry,
-        store: StoreService,
+        store: StorageService,
         placement_strategy: PlacementStrategy,
         gc: GarbageCollector,
         obligations: ObligationQueue | None = None,
@@ -120,16 +122,17 @@ class NodeLifecycle:
 
         # The only mechanism that copies versions between nodes: it delivers
         # obligations, fills a joining node and empties a draining one.
+        retention = RetentionPolicy(config.placement.retention)
+        store = Store(storage, partitioner, retention, DEFAULT_BUCKET_SHIFT)
         self._antientropy = AntiEntropyService(
             node_id=config.node.id,
-            storage=storage,
+            store=store,
             partitioner=partitioner,
             topologymgr=topologymgr,
             peer_pool=peer_pool,
             serializer=serializer,
             replication_factor=config.placement.replication_factor,
             config=config.placement.anti_entropy,
-            retention=RetentionPolicy(config.placement.retention),
             obligations=obligations,
             telemetry=telemetry,
             notify=gc.submit,
