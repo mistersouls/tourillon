@@ -27,14 +27,16 @@ from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import SimplePlacementStrategy
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports import Telemetry, TelemetryProvider
+from tourillon.core.ports.deprecated_storage import DeprecatedStorageProvider
 from tourillon.core.ports.storage import StorageProvider
 from tourillon.core.probe.detector import FailureDetectorProvider
 from tourillon.core.services.gossip import GossipService
 from tourillon.core.services.inspector import NodeInspector
 from tourillon.core.services.lifecycle import NodeLifecycle
-from tourillon.core.services.store import StoreService
+from tourillon.core.services.store import StorageService
 from tourillon.core.services.transfer import TransferService
 from tourillon.core.spaces.hashspace import HashSpace
+from tourillon.core.storage.local import LocalStore
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourlib.models.inspect import NodeInfo, NodeInspectRequest
 from tourlib.port import Persistence, Serializer
@@ -56,6 +58,7 @@ class Manager:
         tls_client: ssl.SSLContext,
         persistence: Persistence,
         serializer: Serializer,
+        deprecated_storage_provider: DeprecatedStorageProvider,
         storage_provider: StorageProvider,
         telemetry_provider: TelemetryProvider,
     ) -> None:
@@ -65,8 +68,14 @@ class Manager:
         )
         self._topologymgr = TopologyManager()
         self._gossip_stats = GossipStats()
+        self._deprecated_storage = deprecated_storage_provider.create(config.storage)
         self._storage = storage_provider.create(config.storage)
         self._telemetry = telemetry_provider.create(config.telemetry)
+        self._local_store = LocalStore(
+            storage=self._storage,
+            partitioner=self._partitioner,
+            telemetry=self._telemetry
+        )
         self._clock = HLCClock(node_id=self._config.node.id)
         self._fd_provider = FailureDetectorProvider(serializer=serializer)
         self._peer_pool = PeerPool(
@@ -85,9 +94,10 @@ class Manager:
             partitioner=self._partitioner,
             peer_pool=self._peer_pool,
         )
-        self._store = StoreService(
+        self._store = StorageService(
             node_id=config.node.id,
-            storage=self._storage,
+            deprecated_storage=self._deprecated_storage,
+            local_store=self._local_store,
             partitioner=self._partitioner,
             placement_strategy=self._placement_strategy,
             clock=self._clock,
@@ -108,7 +118,7 @@ class Manager:
             gossip_stats=self._gossip_stats,
             partitioner=self._partitioner,
             topologymgr=self._topologymgr,
-            storage=self._storage,
+            deprecated_storage=self._deprecated_storage,
             telemetry=self._telemetry,
         )
         self._inspector = NodeInspector(
@@ -125,7 +135,7 @@ class Manager:
         self._transfer = TransferService(
             topologymgr=self._topologymgr,
             serializer=serializer,
-            storage=self._storage,
+            deprecated_storage=self._deprecated_storage,
             partitioner=self._partitioner,
         )
         self._serializer = serializer
@@ -174,7 +184,7 @@ class Manager:
         if seeds:
             logger.debug("Startup seeds override provided: %s", seeds)
         try:
-            latest = await self._storage.latest_hlc(self._partitioner.total_groups)
+            ts = await self._local_store.timestamp()
         except Exception:
             logger.exception(
                 "Failed to load latest HLC from storage for node '%s'", self.node_id
@@ -183,11 +193,11 @@ class Manager:
         logger.info(
             "Latest persisted HLC for node '%s': wall_ms=%s counter=%s source_node=%s",
             self.node_id,
-            latest.wall_ms,
-            latest.counter,
-            latest.node_id,
+            ts.wall_ms,
+            ts.counter,
+            ts.node_id,
         )
-        self._clock.restore(latest.wall_ms, latest.counter)
+        self._clock.restore(ts.wall_ms, ts.counter)
         await self._lifecycle.start(seeds=seeds)
         logger.info("Manager started for node '%s'", self.node_id)
 
@@ -199,6 +209,7 @@ class Manager:
             # storage they depend on are still open.
             self._store.close,
             self._peer_pool.shutdown,
+            self._deprecated_storage.close,
             self._storage.close,
             self._telemetry.close,
         ):
@@ -235,6 +246,11 @@ class Manager:
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, event.set)
+
+    def _create_local_store(self, storage_provider: StorageProvider) -> LocalStore:
+        """Create a LocalStore instance using the provided storage provider."""
+        storage = storage_provider.create(self._config.storage)
+        return LocalStore(storage=storage, partitioner=self._partitioner)
 
     async def inspect(self, request: NodeInspectRequest) -> AsyncIterator[NodeInfo]:
         async for info in self._inspector.inspect(request):

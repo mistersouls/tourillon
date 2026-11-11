@@ -39,7 +39,7 @@ from tourillon.core.models.transfer import (
 )
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer import PeerPool
-from tourillon.core.ports.storage import Storage
+from tourillon.core.ports.deprecated_storage import DeprecatedStorage
 from tourillon.core.transfer.stream import (
     DEFAULT_CHUNK_SIZE,
     TransferReceiver,
@@ -102,7 +102,7 @@ class TransferApplicator:
         self,
         node_id: str,
         peer_pool: PeerPool,
-        storage: Storage,
+        storage: DeprecatedStorage,
         serializer: Serializer,
         partitioner: Partitioner,
         max_concurrency: int = 4,

@@ -4,6 +4,7 @@ requires-python = ">=3.14"
 
 [manifest]
 members = [
+    "tourclient",
     "tourctl",
     "tourillon",
     "tourlib",
@@ -975,9 +976,9 @@ wheels = [
 ]
 
 [[package]]
-name = "tourctl"
-version = "0.1.0.dev2"
-source = { editable = "tourctl" }
+name = "tourclient"
+version = "0.0.0"
+source = { editable = "tourclient" }
 dependencies = [
     { name = "tourlib" },
 ]
@@ -986,8 +987,23 @@ dependencies = [
 requires-dist = [{ name = "tourlib", virtual = "tourlib" }]
 
 [[package]]
+name = "tourctl"
+version = "0.1.0.dev4"
+source = { editable = "tourctl" }
+dependencies = [
+    { name = "tourclient" },
+    { name = "tourlib" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "tourclient", editable = "tourclient" },
+    { name = "tourlib", virtual = "tourlib" },
+]
+
+[[package]]
 name = "tourillon"
-version = "0.1.0.dev2"
+version = "0.1.0.dev4"
 source = { editable = "tourillon" }
 dependencies = [
     { name = "lmdb" },
@@ -1027,7 +1043,7 @@ requires-dist = [
 
 [[package]]
 name = "tourproject"
-version = "0.1.0.dev2"
+version = "0.1.0.dev4"
 source = { virtual = "." }
 
 [package.optional-dependencies]

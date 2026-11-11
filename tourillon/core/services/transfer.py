@@ -30,7 +30,7 @@ from tourillon.core.models.transfer import (
     TransferInitAccept,
 )
 from tourillon.core.partition.partitioner import Partitioner
-from tourillon.core.ports.storage import Storage
+from tourillon.core.ports.deprecated_storage import DeprecatedStorage
 from tourillon.core.transfer.stream import (
     DEFAULT_CHUNK_SIZE,
     TransferReceiver,
@@ -71,7 +71,7 @@ class TransferService:
         self,
         topologymgr: TopologyManager,
         serializer: Serializer,
-        storage: Storage,
+        deprecated_storage: DeprecatedStorage,
         partitioner: Partitioner,
         max_chunk_size: int = DEFAULT_CHUNK_SIZE,
         max_window: int = MAX_WINDOW_SIZE,
@@ -85,7 +85,7 @@ class TransferService:
             raise ValueError("session_ttl must be > 0")
 
         self._topologymgr = topologymgr
-        self._storage = storage
+        self._storage = deprecated_storage
         self._serializer = serializer
         self._partitioner = partitioner
         self._max_chunk_size = max_chunk_size

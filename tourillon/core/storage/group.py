@@ -29,7 +29,7 @@ from tourillon.core.models.storageschema import (
     Value,
 )
 from tourillon.core.partition.partitioner import Partitioner
-from tourillon.core.ports.storage import Session, SessionProvider
+from tourillon.core.ports.deprecated_storage import Session, SessionProvider
 
 logger = _logger.storage()
 

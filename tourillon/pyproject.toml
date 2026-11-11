@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tourillon"
-version = "0.1.0.dev2"
+version = "0.1.0.dev4"
 description = "Leaderless peer-to-peer distributed key-value database runtime."
 requires-python = ">=3.14"
 dependencies = [
@@ -25,9 +25,8 @@ package = true
 tourlib = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
-only-include = []
+include = ["**/*.py"]
 dev-mode-dirs = [".."]
 
-[tool.hatch.build.targets.wheel.force-include]
-"." = "tourillon"
-"../tourlib" = "tourlib"
+[tool.hatch.build.targets.wheel.sources]
+"" = "tourillon"

@@ -28,7 +28,7 @@ from tourillon.core.models.state import NodeState
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports import Telemetry
-from tourillon.core.ports.storage import Storage
+from tourillon.core.ports.deprecated_storage import DeprecatedStorage
 from tourillon.core.replay.hint import HintReplayer
 from tourillon.core.spaces.ring import Ring
 from tourillon.core.transfer.runner import TransferRunner
@@ -53,7 +53,7 @@ class NodeLifecycle:
         peer_pool: PeerPool,
         topologymgr: TopologyManager,
         partitioner: Partitioner,
-        storage: Storage,
+        deprecated_storage: DeprecatedStorage,
         gossip_stats: GossipStats,
         telemetry: Telemetry,
     ) -> None:
@@ -67,7 +67,7 @@ class NodeLifecycle:
         self._gossip_stats = gossip_stats
         self._telemetry = telemetry
         self._hint_replayer = HintReplayer(
-            storage=storage,
+            storage=deprecated_storage,
             peer_pool=peer_pool,
             serializer=serializer,
             total_groups=partitioner.total_groups,
@@ -99,7 +99,7 @@ class NodeLifecycle:
             partitioner=partitioner,
             peer_pool=peer_pool,
             serializer=serializer,
-            storage=storage,
+            storage=deprecated_storage,
         )
 
         self._state_file = Path(self._config.storage.data_dir) / NODE_STATE_FILENAME

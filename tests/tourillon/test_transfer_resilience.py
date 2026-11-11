@@ -48,7 +48,7 @@ from tourillon.core.models.transfer import (
     TransferState,
 )
 from tourillon.core.partition.partitioner import Partitioner
-from tourillon.core.ports.storage import Storage
+from tourillon.core.ports.deprecated_storage import DeprecatedStorage
 from tourillon.core.services.transfer import TransferService
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.storage.group import PartitionGroupStaging, PartitionGroupStore
@@ -97,12 +97,12 @@ def _dataset() -> tuple[list[Record], list[Record]]:
     return transferable, left_behind
 
 
-def _storage(tmp_path: Path, name: str) -> Storage:
+def _storage(tmp_path: Path, name: str) -> DeprecatedStorage:
     config = StorageConfig(data_dir=str(tmp_path / name), group_size="8Mi")
     return LMDBStorageProvider().create(config)
 
 
-async def _seed(storage: Storage, records: list[Record]) -> None:
+async def _seed(storage: DeprecatedStorage, records: list[Record]) -> None:
     for record in records:
         provider = await storage.session_provider_for(
             PARTITIONER.group_for(record.key.pid.value)
@@ -110,7 +110,7 @@ async def _seed(storage: Storage, records: list[Record]) -> None:
         await PartitionGroupStore(provider).put(record)
 
 
-async def _tags(storage: Storage) -> dict[bytes, Tag]:
+async def _tags(storage: DeprecatedStorage) -> dict[bytes, Tag]:
     tags: dict[bytes, Tag] = {}
     for group in range(PARTITIONER.total_groups):
         provider = await storage.session_provider_for(group)
@@ -122,7 +122,7 @@ async def _tags(storage: Storage) -> dict[bytes, Tag]:
     return tags
 
 
-async def _staged_keys(storage: Storage) -> dict[int, Key]:
+async def _staged_keys(storage: DeprecatedStorage) -> dict[int, Key]:
     staged: dict[int, Key] = {}
     for group in range(PARTITIONER.total_groups):
         provider = await storage.session_provider_for(group)
@@ -133,7 +133,7 @@ async def _staged_keys(storage: Storage) -> dict[int, Key]:
     return staged
 
 
-async def _assert_transferred(storage: Storage, records: list[Record]) -> None:
+async def _assert_transferred(storage: DeprecatedStorage, records: list[Record]) -> None:
     assert await _tags(storage) == {
         record.key.to_bytes(Keyspace.TAGS): record.tag for record in records
     }
@@ -146,13 +146,13 @@ async def _assert_transferred(storage: Storage, records: list[Record]) -> None:
         assert await PartitionGroupStore(provider).get(address) == record
 
 
-def _decode(storage: Storage, chunks: list[TransferChunk]) -> list[Record]:
+def _decode(storage: DeprecatedStorage, chunks: list[TransferChunk]) -> list[Record]:
     streamer = TransferStreamer(RANGE, storage, SERIALIZER, PARTITIONER)
     frames, _ = _read_frames(b"".join(chunk.raw for chunk in chunks))
     return [streamer.decode_record(frame) for frame in frames]
 
 
-def _service(storage: Storage, **kwargs) -> TransferService:
+def _service(storage: DeprecatedStorage, **kwargs) -> TransferService:
     return TransferService(
         topologymgr=_TopologyManager("serial"),  # type: ignore[arg-type]
         serializer=SERIALIZER,
@@ -163,7 +163,7 @@ def _service(storage: Storage, **kwargs) -> TransferService:
 
 
 def _applicator(
-    pool: _FakePeerPool, storage: Storage, max_retries: int = 0, **kwargs
+    pool: _FakePeerPool, storage: DeprecatedStorage, max_retries: int = 0, **kwargs
 ) -> TransferApplicator:
     return TransferApplicator(
         node_id=RANGE.dst,

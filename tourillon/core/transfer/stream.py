@@ -18,7 +18,7 @@ from tourillon.core.exceptions import ProcessError, TransferError
 from tourillon.core.models.storageschema import Key, Record, TagKind
 from tourillon.core.models.transfer import RangeTransfer, TransferChunk
 from tourillon.core.partition.partitioner import Partitioner
-from tourillon.core.ports.storage import SessionProvider, Storage
+from tourillon.core.ports.deprecated_storage import SessionProvider, DeprecatedStorage
 from tourillon.core.storage.group import PartitionGroupStaging
 from tourlib import Serializer
 from tourlib.constant import MAX_ENVELOPE_PAYLOAD, MAX_USER_ENVELOPE_PAYLOAD
@@ -93,7 +93,7 @@ class TransferStreamer:
     def __init__(
         self,
         transfer: RangeTransfer,
-        storage: Storage,
+        storage: DeprecatedStorage,
         serializer: Serializer,
         partitioner: Partitioner,
         max_chunk_size: int = DEFAULT_CHUNK_SIZE,

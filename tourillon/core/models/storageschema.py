@@ -15,7 +15,7 @@
 import hashlib
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
-from typing import Any
+from typing import Any, Iterable
 
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
@@ -30,6 +30,40 @@ class Keyspace(StrEnum):
     LOGS = "logs"
     TAGS = "tags"
     META = "meta"
+
+
+@dataclass(frozen=True, slots=True, order=True, eq=True)
+class KVRef:
+    key: bytes
+    keyspace: Keyspace
+
+
+@dataclass(frozen=True, slots=True, order=True, eq=True)
+class KVPair:
+    key: bytes
+    value: bytes
+    keyspace: Keyspace
+
+    def pairs(self) -> tuple[Keyspace, bytes, bytes]:
+        """Return a tuple of (keyspace, key, value)."""
+        return self.keyspace, self.key, self.value
+
+    def item(self) -> tuple[bytes, bytes]:
+        """Return a tuple of (key, value)."""
+        return self.key, self.value
+
+
+
+@dataclass(frozen=True, slots=True, order=True, eq=True)
+class KVList:
+    keyspace: Keyspace
+    items: Iterable[tuple[bytes, bytes]]
+
+
+@dataclass(frozen=True, slots=True, order=True, eq=True)
+class KeyList:
+    keyspace: Keyspace
+    items: Iterable[bytes]
 
 
 @dataclass(frozen=True, slots=True, eq=True, order=True)
@@ -111,6 +145,11 @@ class MetaKey:
         return cls(pid=pid, address=address)
 
 
+class MetaKind(Enum):
+    OBLIGATION = b"\x01"
+    DIGEST = b"\x02"
+
+
 @dataclass(frozen=True, slots=True, eq=True)
 class Key:
     pid: Pid
@@ -188,7 +227,7 @@ class Key:
         return key + b"\x00"
 
     def __str__(self) -> str:
-        return hashlib.sha256(self.to_bytes(Keyspace.LOGS)).hexdigest()
+        return hashlib.blake2b(self.to_bytes(Keyspace.LOGS)).hexdigest()
 
 
 @dataclass(frozen=True, slots=True, eq=True)
@@ -242,6 +281,11 @@ class TagKind(Enum):
     PHANTOM = b"\x05"
     RESERVED = b"\x06"
     META = b"\x07"
+
+    @classmethod
+    def owned(cls) -> frozenset["TagKind"]:
+        """Return a frozenset of TagKinds that are considered 'owned'."""
+        return frozenset({TagKind.LIVE, TagKind.TOMBSTONE})
 
 
 @dataclass(frozen=True, slots=True, eq=True)
@@ -307,6 +351,9 @@ class TagPayload:
 class Tag:
     kind: TagKind
     payload: TagPayload = field(default_factory=TagPayload)
+
+    def owned(self) -> bool:
+        return self.kind in frozenset({TagKind.LIVE, TagKind.TOMBSTONE})
 
     @classmethod
     def hint(cls, original: "Tag", node_id: str) -> "Tag":
@@ -474,6 +521,18 @@ class Record(KeyTag):
         tag = Tag.from_dict(data["tag"])
         return cls(key=key, value=value, tag=tag)
 
+    def kv(self, ks: Keyspace) -> KVPair:
+        """Return a KVPair representation of the Record's key-value pair."""
+        if ks not in (Keyspace.LOGS, Keyspace.TAGS):
+            raise ValueError("Keyspace must be either LOGS or TAGS")
+
+        value = self.value.to_bytes() if ks == Keyspace.LOGS else self.tag.to_bytes()
+        return KVPair(
+            key=self.key.to_bytes(ks),
+            value=value,
+            keyspace=ks
+        )
+
 
 @dataclass
 class MetaStaging:
@@ -508,16 +567,3 @@ class MetaValue:
             source: MetaStaging.from_dict(meta) for source, meta in staging_data.items()
         }
         return cls(staging=staging)
-
-
-@dataclass(frozen=True, slots=True, order=True, eq=True)
-class KVRef:
-    key: bytes
-    keyspace: Keyspace
-
-
-@dataclass(frozen=True, slots=True, order=True, eq=True)
-class KVPair:
-    key: bytes
-    value: bytes
-    keyspace: Keyspace

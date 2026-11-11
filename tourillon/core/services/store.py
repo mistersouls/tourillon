@@ -50,8 +50,9 @@ from tourillon.core.models.storageschema import (
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import PlacementStrategy, Preference
 from tourillon.core.peer.pool import PeerPool
-from tourillon.core.ports.storage import Storage
+from tourillon.core.ports.deprecated_storage import DeprecatedStorage
 from tourillon.core.storage.group import PartitionGroupStore
+from tourillon.core.storage.local import LocalStore
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT, MAX_CLOCK_SKEW_MS, MAX_QUORUM
 from tourlib.envelope import build_envelope
 from tourlib.models.kv import DeleteRequest, GetRequest, PutRequest, RepairRequest
@@ -78,11 +79,12 @@ class ReplicationStats:
     repairs_rejected: int = 0
 
 
-class StoreService:
+class StorageService:
     def __init__(
         self,
         node_id: str,
-        storage: Storage,
+        local_store: LocalStore,
+        deprecated_storage: DeprecatedStorage,
         partitioner: Partitioner,
         placement_strategy: PlacementStrategy,
         clock: HLCClock,
@@ -93,7 +95,8 @@ class StoreService:
         repair: RepairConfig | None = None,
     ) -> None:
         self._node_id = node_id
-        self._storage = storage
+        self._local_store = local_store
+        self._storage = deprecated_storage
         self._partitioner = partitioner
         self._placement_strategy = placement_strategy
         self._clock = clock
@@ -291,7 +294,7 @@ class StoreService:
         token: str,
     ) -> None:
         """Let the client decide again whether the durability reached is enough."""
-        StoreService._ensure_quorum(
+        StorageService._ensure_quorum(
             durable, request.quorum_write, "repair", errors, token
         )
 
@@ -345,7 +348,7 @@ class StoreService:
         """
         fanout: list[tuple[str, str, str | None]] = []
         for entry in preferences:
-            target = StoreService._write_target(entry)
+            target = StorageService._write_target(entry)
             if target is not None:
                 fanout.append((entry.node_id, target[0], target[1]))
         return fanout
@@ -731,7 +734,7 @@ class StoreService:
     ) -> list[tuple[str, str | None]]:
         targets: list[tuple[str, str | None]] = []
         for entry in preferences:
-            target = StoreService._write_target(entry)
+            target = StorageService._write_target(entry)
             if target is not None:
                 targets.append(target)
         return targets
@@ -762,10 +765,7 @@ class StoreService:
         return StoreOperationError(operation=operation, errors=errors, message=message)
 
     async def _local_read(self, addr: PartitionAddress) -> Record | None:
-        group = self._partitioner.group_for(addr.pid.value)
-        session_provider = await self._storage.session_provider_for(group)
-        store = PartitionGroupStore(session_provider)
-        return await store.get(addr)
+        return await self._local_store.get(addr)
 
     async def _local_read_at(self, key: Key) -> Record | None:
         group = self._partitioner.group_for(key.pid.value)
@@ -774,10 +774,7 @@ class StoreService:
         return await store.get_at(key)
 
     async def _local_write(self, record: Record) -> Record:
-        group = self._partitioner.group_for(record.key.pid.value)
-        session_provider = await self._storage.session_provider_for(group)
-        store = PartitionGroupStore(session_provider)
-        await store.put(record)
+        await self._local_store.put(record)
         return record
 
     @staticmethod

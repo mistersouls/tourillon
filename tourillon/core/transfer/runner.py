@@ -18,7 +18,7 @@ from tourillon.core.models.retry import BackoffRetry
 from tourillon.core.models.transfer import TransferPlan
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer import PeerPool
-from tourillon.core.ports.storage import Storage
+from tourillon.core.ports.deprecated_storage import DeprecatedStorage
 from tourillon.core.spaces.ring import Ring
 from tourillon.core.transfer.applicator import DEFAULT_WINDOW_SIZE, TransferApplicator
 from tourillon.core.transfer.planner import TransferPlanner
@@ -33,7 +33,7 @@ class TransferRunner:
         replication_factor: int,
         partitioner: Partitioner,
         peer_pool: PeerPool,
-        storage: Storage,
+        storage: DeprecatedStorage,
         serializer: Serializer,
         max_concurrency: int = 4,
         max_chunk_size: int = DEFAULT_CHUNK_SIZE,

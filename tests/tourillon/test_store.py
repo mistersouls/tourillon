@@ -53,7 +53,7 @@ from tourillon.core.partition.placement import (
 )
 from tourillon.core.partition.types import LogicalPartition, PartitionPlacement
 from tourillon.core.peer.pool import PeerPool
-from tourillon.core.ports.storage import Storage
+from tourillon.core.ports.deprecated_storage import DeprecatedStorage
 from tourillon.core.services.store import StoreService
 from tourillon.core.spaces.vnode import VNode
 from tourlib.adapter import MsgPackSerializer
@@ -377,7 +377,7 @@ def _build_store(
     storage = _StorageStub(local_store)
     service = StoreService(
         node_id=node_id,
-        storage=cast(Storage, cast(object, storage)),
+        storage=cast(DeprecatedStorage, cast(object, storage)),
         partitioner=cast(Partitioner, cast(object, _PartitionerStub(partitioner_pid))),
         placement_strategy=cast(
             PlacementStrategy, cast(object, _PlacementStub(preferences))
@@ -763,7 +763,7 @@ async def test_put_raises_when_remote_response_kind_is_invalid() -> None:
     storage = _StorageStub(_StoreStub())
     service = StoreService(
         node_id="node-a",
-        storage=cast(Storage, cast(object, storage)),
+        storage=cast(DeprecatedStorage, cast(object, storage)),
         partitioner=cast(Partitioner, cast(object, _PartitionerStub())),
         placement_strategy=cast(
             PlacementStrategy,

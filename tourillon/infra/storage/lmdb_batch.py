@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from tourillon.core.models.storageschema import Keyspace, KVPair, KVRef
-from tourillon.core.ports.storage import Batch
+from tourillon.core.ports.deprecated_storage import Batch
 from tourillon.infra.storage.lmdb_transaction import LmdbTransaction
 from tourlib.contrib.threadpool import AsyncExecutor
 from tourlib.models.types import SupportsBytes

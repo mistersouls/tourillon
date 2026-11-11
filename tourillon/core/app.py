@@ -24,6 +24,7 @@ from tourillon.core.log import logger
 from tourillon.core.manager import Manager
 from tourillon.core.mtls import CertIssuer
 from tourillon.core.ports import TelemetryProvider
+from tourillon.core.ports.deprecated_storage import DeprecatedStorageProvider
 from tourillon.core.ports.storage import StorageProvider
 from tourillon.core.telemetry import build_noop_telemetry_provider
 from tourillon.core.transports.dispatcher import Dispatcher
@@ -52,12 +53,14 @@ class Application:
         serializer: Serializer,
         peer_dispatcher: Dispatcher,
         client_dispatcher: Dispatcher,
+        deprecated_storage_provider: DeprecatedStorageProvider,
         storage_provider: StorageProvider,
         telemetry_provider: TelemetryProvider | None = None,
     ) -> None:
         self._crypto = crypto
         self._persistence = persistence
         self._serializer = serializer
+        self._deprecated_storage_provider = deprecated_storage_provider
         self._storage_provider = storage_provider
         self._telemetry_provider = telemetry_provider or build_noop_telemetry_provider()
 
@@ -86,6 +89,7 @@ class Application:
         logger.info("Creating manager for node '%s'", config.node.id)
         tls_server = await config.tls_server()
         tls_client = await config.tls_client()
+
         manager = Manager(
             config=config,
             peer_dispatcher=self.peer_dispatcher,
@@ -94,6 +98,7 @@ class Application:
             tls_client=tls_client,
             persistence=self._persistence,
             serializer=self._serializer,
+            deprecated_storage_provider=self._deprecated_storage_provider,
             storage_provider=self._storage_provider,
             telemetry_provider=self._telemetry_provider,
         )

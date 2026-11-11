@@ -21,7 +21,7 @@ from pathlib import Path
 import lmdb
 
 from tourillon.core.models.storageschema import Keyspace, KVPair, KVRef
-from tourillon.core.ports.storage import Batch, Session, SessionProvider
+from tourillon.core.ports.deprecated_storage import Batch, Session, SessionProvider
 from tourillon.infra.storage.lmdb_batch import LmdbBatch
 from tourillon.infra.storage.lmdb_transaction import LmdbTransaction
 from tourlib.contrib.threadpool import AsyncExecutor, AsyncThreadPool

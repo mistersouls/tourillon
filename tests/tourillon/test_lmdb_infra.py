@@ -32,7 +32,7 @@ from tourillon.infra.storage.lmdb_session import (
     LmdbSession,
     LmdbSessionProvider,
 )
-from tourillon.infra.storage.lmdb_storage import LMDBStorage, LMDBStorageProvider
+from tourillon.infra.storage.lmdb_storage import LMDBDeprecatedStorage, LMDBStorageProvider
 from tourillon.infra.storage.lmdb_transaction import LmdbTransaction
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
@@ -233,7 +233,7 @@ async def test_lmdb_storage_caches_providers_reports_latest_hlc_and_closes(
     tmp_path,
 ) -> None:
     config = StorageConfig(data_dir=str(tmp_path), group_size="8Mi")
-    storage = LMDBStorage(config)
+    storage = LMDBDeprecatedStorage(config)
 
     provider0 = await storage.session_provider_for(0)
     provider1 = await storage.session_provider_for(1)
@@ -263,7 +263,7 @@ async def test_lmdb_storage_wraps_provider_initialization_failures(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = StorageConfig(data_dir=str(tmp_path), group_size="8Mi")
-    storage = LMDBStorage(config)
+    storage = LMDBDeprecatedStorage(config)
 
     def boom(*args, **kwargs):
         raise OSError("broken")
@@ -286,7 +286,7 @@ def test_lmdb_storage_provider_creates_directory_and_storage(tmp_path) -> None:
     storage = provider.create(config)
 
     assert (tmp_path / "data").exists()
-    assert isinstance(storage, LMDBStorage)
+    assert isinstance(storage, LMDBDeprecatedStorage)
 
 
 @pytest.mark.tourillon

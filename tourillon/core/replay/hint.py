@@ -25,7 +25,7 @@ from tourillon.core.log import logger
 from tourillon.core.models.retry import BackoffRetry
 from tourillon.core.models.storageschema import Record, Tag
 from tourillon.core.peer import PeerPool
-from tourillon.core.ports.storage import SessionProvider, Storage
+from tourillon.core.ports.deprecated_storage import SessionProvider, DeprecatedStorage
 from tourillon.core.storage.group import PartitionGroupHint
 from tourlib import Serializer
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT
@@ -81,7 +81,7 @@ class _TargetBackoff:
 class HintReplayer:
     def __init__(
         self,
-        storage: Storage,
+        storage: DeprecatedStorage,
         peer_pool: PeerPool,
         serializer: Serializer,
         total_groups: int,
