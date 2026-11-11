@@ -40,7 +40,7 @@ from tourillon.core.services.store import StorageService
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.storage.session import DEFAULT_BUCKET_SHIFT
-from tourillon.core.storage.store import Store
+from tourillon.core.storage.store import LocalStore
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourlib.models.inspect import NodeInfo, NodeInspectRequest
 from tourlib.port import Persistence, Serializer
@@ -93,19 +93,23 @@ class Manager:
             peer_pool=self._peer_pool,
         )
         self._obligations = ObligationQueue(config.placement.anti_entropy.hotqueue_size)
+        self._local_store = LocalStore(
+            storage=self._storage,
+            partitioner=self._partitioner,
+            retention=RetentionPolicy(config.placement.retention),
+            bucket_shift=DEFAULT_BUCKET_SHIFT,
+            telemetry=self._telemetry,
+        )
         self._gc = GarbageCollector(
-            self._storage,
+            self._local_store,
             self._partitioner,
             config.placement.retention,
             node_id=config.node.id,
             telemetry=self._telemetry,
         )
-        retention = RetentionPolicy(config.placement.retention)
-        store = Store(self._storage, self._partitioner, retention, DEFAULT_BUCKET_SHIFT)
         self._store = StorageService(
             node_id=config.node.id,
-            store=store,
-            retention=RetentionPolicy(config.placement.retention),
+            store=self._local_store,
             partitioner=self._partitioner,
             placement_strategy=self._placement_strategy,
             clock=self._clock,
@@ -129,7 +133,7 @@ class Manager:
             gossip_stats=self._gossip_stats,
             partitioner=self._partitioner,
             topologymgr=self._topologymgr,
-            storage=self._storage,
+            local_store=self._local_store,
             telemetry=self._telemetry,
             store=self._store,
             obligations=self._obligations,
@@ -196,15 +200,15 @@ class Manager:
         logger.debug("Starting manager for node '%s'", self.node_id)
         if seeds:
             logger.debug("Startup seeds override provided: %s", seeds)
+
         try:
-            latest = await self._storage.latest_hlc(self._partitioner)
+            latest = await self._local_store.latest_hlc()
         except Exception:
             logger.exception(
                 "Failed to load latest HLC from storage for node '%s'", self.node_id
             )
             raise
-        # A restored clock matters when diagnosing ordering after a restart;
-        # a fresh one is the normal first boot.
+
         logger.log(
             logging.INFO if latest.wall_ms else logging.DEBUG,
             "HLC restored wall_ms=%s counter=%s source_node=%s",

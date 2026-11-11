@@ -1,9 +1,24 @@
+# Copyright 2026 Tourillon Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import hashlib
 from collections import defaultdict
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
+from tourillon.core.log import logger
 from tourillon.core.models.storageschema import (
     PID_SIZE,
     Key,
@@ -25,6 +40,7 @@ from tourillon.core.models.storageschema import (
 )
 from tourillon.core.ports.storage import Storage, Transaction
 from tourillon.core.utils.defer import Result
+from tourlib.models.ts import HLCTimestamp
 from tourlib.models.types import SupportsBytes
 
 _ROOT = b"\x00"
@@ -121,7 +137,9 @@ class Session:
             return None
 
         key = Key.from_bytes(kv_log.key, Keyspace.LOGS)
-        kv_tag = await self._txn.get(KVRef(kv_log.key, Keyspace.TAGS)).get()
+        kv_tag = await self._txn.get(
+            KVRef(key.to_bytes(Keyspace.TAGS), Keyspace.TAGS)
+        ).get()
         if kv_tag is None:
             return None
 
@@ -133,7 +151,7 @@ class Session:
         self, addr: PartitionAddress, limit: int
     ) -> list[Record]:
         latest_records = await self.get_latest_record_many([addr], limit)
-        return latest_records[addr]
+        return latest_records.get(addr, [])
 
     async def get_latest_record_many(
         self, addresses: Sequence[PartitionAddress], limit: int
@@ -185,24 +203,24 @@ class Session:
             for tag, log in zip(results[::2], results[1::2], strict=True)
         ]
 
-    async def put_record(self, record: Record, overwrite: bool = True) -> bool:
-        (written,) = await self.put_record_many([record], overwrite=overwrite)
+    async def put_record(self, record: Record) -> bool:
+        (written,) = await self.put_record_many([record])
         return written
 
-    async def put_record_many(
-        self, records: Sequence[Record], overwrite: bool = True
-    ) -> list[bool]:
+    async def put_record_many(self, records: Sequence[Record]) -> list[bool]:
         if not records:
             return []
 
-        written = await self._insert_many(records, overwrite=overwrite)
+        written = await self._insert_many(records)
         for record, ok in zip(records, written, strict=True):
             if ok and record.tag.kind in OWNED_KINDS:
                 self._update_digest(record.key)
 
         return written
 
-    async def remove_records(self, keys: Sequence[Key]) -> tuple[int, int]:
+    async def remove_records(
+        self, keys: Sequence[Key], *, dry_run: bool = False
+    ) -> tuple[int, int]:
         """
         Remove owned records and their digest contributions atomically.
 
@@ -210,7 +228,11 @@ class Session:
         Returned bytes include LOGS/TAGS keys and values, not backend overhead
         or digest changes.
         """
-        records = await self._remove_many(keys)
+        if dry_run:
+            found = await self.read_record_many(keys)
+            records = [r for r in found if r is not None]
+        else:
+            records = await self._remove_many(keys)
         size = sum(record.size() for record in records)
         return len(records), size
 
@@ -226,12 +248,28 @@ class Session:
         limit: int = 64,
     ) -> list[ObligationKey]:
         if limit < 1:
-            return []
+            raise ValueError("limit must be >= 1")
 
-        result = self._txn.keys(
-            Keyspace.META, prefix=ObligationPrefix(), start=after, limit=limit
-        )
-        return [ObligationKey.from_bytes(ref.key) for ref in await result.get()]
+        obligations: list[ObligationKey] = []
+        cursor = after
+        while len(obligations) < limit:
+            remaining = limit - len(obligations)
+            page = await self._txn.keys(
+                Keyspace.META, prefix=ObligationPrefix(), start=cursor, limit=remaining
+            ).get()
+            for ref in page:
+                try:
+                    obligations.append(ObligationKey.from_bytes(ref.key))
+                except ValueError:
+                    logger.exception(
+                        "storage.obligation unreadable key=%s", ref.key.hex()
+                    )
+
+            if len(page) < remaining:
+                break
+            cursor = page[-1].key
+
+        return obligations
 
     async def put_obligation_many(
         self, obligations: Sequence[ObligationKey]
@@ -266,7 +304,7 @@ class Session:
         self, after: int | None = None, limit: int = 64
     ) -> list[tuple[int, DigestCell]]:
         if limit < 1:
-            return []
+            raise ValueError("limit must be >= 1")
 
         start = None if after is None else root_key(after)
         result = self._txn.list(
@@ -303,6 +341,55 @@ class Session:
         self._txn.delete_many([KeyList(Keyspace.META, deletes)])
         self._txn.put_many([KVList(Keyspace.META, updates)])
         await self._txn.results()
+        self._deltas.clear()
+        self._stored.clear()
+
+    async def latest_identities(
+        self, address: PartitionAddress, limit: int
+    ) -> list[KeyTag]:
+        return (await self.latest_identities_many([address], limit))[address]
+
+    async def latest_identities_many(
+        self, addresses: Sequence[PartitionAddress], limit: int
+    ) -> dict[PartitionAddress, list[KeyTag]]:
+        unique = list(dict.fromkeys(addresses))
+        for address in unique:
+            self._txn.keys(Keyspace.LOGS, prefix=address, limit=limit, reverse=True)
+
+        pages = await self._txn.results()
+        keys = [
+            (address, Key.from_bytes(ref.key, Keyspace.LOGS))
+            for address, page in zip(unique, pages, strict=True)
+            for ref in page
+        ]
+        for _, key in keys:
+            self._txn.get(KVRef(key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
+
+        tags = await self._txn.results()
+        identities: dict[PartitionAddress, list[KeyTag]] = {a: [] for a in unique}
+        for (address, key), pair in zip(keys, tags, strict=True):
+            if pair is not None:
+                tag = Tag.from_bytes(pair.value)
+                if tag.kind in OWNED_KINDS:
+                    identities[address].append(KeyTag(key, tag))
+
+        return identities
+
+    async def oldest_keys(self, address: PartitionAddress, limit: int) -> list[Key]:
+        refs = await self._txn.keys(Keyspace.LOGS, prefix=address, limit=limit).get()
+        return [Key.from_bytes(ref.key, Keyspace.LOGS) for ref in refs]
+
+    async def latest_timestamp(self, pids: Sequence[int]) -> HLCTimestamp:
+        for pid in pids:
+            self._txn.last(
+                Keyspace.TAGS, prefix=RawPrefix(pid.to_bytes(PID_SIZE, "big"))
+            )
+
+        pairs = await self._txn.results()
+        return max(
+            (Key.from_bytes(pair.key, Keyspace.TAGS).ts for pair in pairs if pair),
+            default=HLCTimestamp(0, 0, ""),
+        )
 
     def _update_digest(self, key: Key, remove: bool = False) -> None:
         cell = DigestCell.of(key)
@@ -311,19 +398,16 @@ class Session:
             current = self._deltas.get(ref, DigestCell())
             self._deltas[ref] = current - cell if remove else current + cell
 
-    async def _insert_many(
-        self, records: Sequence[Record], overwrite: bool = True
-    ) -> list[bool]:
-        refs = self._unknown_cells(
-            [r.key for r in records if r.tag.kind in OWNED_KINDS]
-        )
+    async def _insert_many(self, records: Sequence[Record]) -> list[bool]:
+        refs = self._unknown_cells([r.key for r in records])
         results: list[Result[bool]] = []
 
         for record in records:
-            self._txn.put(_log_kv(record), overwrite=overwrite)
-            self._txn.put(_tag_kv(record), overwrite=overwrite)
+            results.append(self._txn.put(_log_kv(record), overwrite=False))
+            self._txn.put(_tag_kv(record), overwrite=False)
 
         pairs = self._txn.get_many([KeyList(Keyspace.META, refs)])
+        self._stored.update(dict.fromkeys(refs, DigestCell()))
         for pair in await pairs.get():
             self._stored[pair.key] = _cell(pair)
 
@@ -334,6 +418,7 @@ class Session:
 
         refs = self._unknown_cells(keys)
         pairs = self._txn.get_many([KeyList(Keyspace.META, refs)])
+        self._stored.update(dict.fromkeys(refs, DigestCell()))
         for pair in await pairs.get():
             self._stored[pair.key] = _cell(pair)
 
@@ -348,12 +433,13 @@ class Session:
             record = _record(tag, log)
             if record is not None:
                 records.append(record)
-                self._update_digest(record.key, remove=True)
+                if record.tag.kind in OWNED_KINDS:
+                    self._update_digest(record.key, remove=True)
 
         return records
 
     def _unknown_cells(self, keys: Sequence[Key]) -> list[bytes]:
-        refs = {ref for key in keys for ref in _cell_keys(key)}
+        refs = {ref for key in keys for ref in _cell_keys(key, self._bucket_shift)}
         return sorted(refs - self._stored.keys())
 
 

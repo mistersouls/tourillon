@@ -15,6 +15,7 @@
 import asyncio
 import signal
 import ssl
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ from tourillon.core.gossip.bootstrapper import GossipBootstrapper
 from tourillon.core.gossip.topology import TopologyManager
 from tourillon.core.manager import Manager
 from tourillon.core.models.member import Member, MemberPhase
+from tourillon.core.models.storageschema import Key, Keyspace, KVPair, Pid, Tag, TagKind
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import SimplePlacementStrategy
 from tourillon.core.partition.types import PartitionPlacement
@@ -64,12 +66,30 @@ class _Storage:
         self.closed = False
         self.latest = HLCTimestamp(wall_ms=12, counter=3, node_id="seed")
 
-    async def session_provider_for(self, group: int):
-        raise AssertionError(f"unexpected group lookup {group}")
+    async def transactional_for(self, group: int):
+        owner = self
 
-    async def latest_hlc(self, total_groups: int) -> HLCTimestamp:
-        assert total_groups > 0
-        return self.latest
+        class Transactional:
+            @asynccontextmanager
+            async def transaction(self, write=False):
+                class Transaction:
+                    def last(self, keyspace, prefix=None):
+                        pass
+
+                    async def results(self):
+                        return [
+                            KVPair(
+                                Key(
+                                    Pid(0), Address(b"ns", b"key"), owner.latest
+                                ).to_bytes(Keyspace.TAGS),
+                                Tag(TagKind.LIVE).to_bytes(),
+                                Keyspace.TAGS,
+                            )
+                        ]
+
+                yield Transaction()
+
+        return Transactional()
 
     async def close(self) -> None:
         self.closed = True
@@ -385,6 +405,10 @@ async def test_manager_start_stop_inspect_join_and_serve_forever(
     assert manager.gossip is manager._gossip  # noqa: SLF001
     assert manager.telemetry is manager._telemetry  # noqa: SLF001
     assert manager.store is manager._store  # noqa: SLF001
+    assert manager.store._store is manager._local_store
+    assert manager.gc._store is manager._local_store
+    assert manager.antientropy._store is manager._local_store
+    assert manager.antientropy.responder._store is manager._local_store
 
     await manager.start(seeds=["seed:9000"])
     assert restored == [(12, 3)]

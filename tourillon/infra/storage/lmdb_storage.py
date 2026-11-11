@@ -1,3 +1,17 @@
+# Copyright 2026 Tourillon Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import builtins
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -10,15 +24,12 @@ import lmdb
 
 from tourillon.core.models.config import StorageConfig
 from tourillon.core.models.storageschema import (
-    Key,
     KeyList,
     Keyspace,
     KVList,
     KVPair,
     KVRef,
-    Pid,
 )
-from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.ports.storage import (
     Storage,
     StorageProvider,
@@ -27,7 +38,6 @@ from tourillon.core.ports.storage import (
 )
 from tourillon.core.utils.defer import Result
 from tourlib.contrib.threadpool import AsyncExecutor, AsyncThreadPool
-from tourlib.models.ts import HLCTimestamp
 from tourlib.models.types import SupportsBytes
 
 
@@ -91,9 +101,7 @@ class LmdbOperation:
         with self._txn.cursor(db=self._dbis[keyspace]) as cursor:
             prefix_bytes = prefix.to_bytes() if prefix is not None else None
 
-            if prefix_bytes is not None and not self._cursor_range(
-                cursor, prefix_bytes, reverse=True
-            ):
+            if not self._position_cursor(cursor, prefix_bytes, None, True):
                 return None
 
             while True:
@@ -273,6 +281,10 @@ class LmdbOperation:
         reverse: bool,
     ) -> bool:
         if start is not None:
+            if reverse:
+                if cursor.set_range(start):
+                    return cursor.prev()
+                return cursor.last()
             return self._cursor_range(cursor, start, reverse)
         if prefix is not None:
             return self._cursor_range(cursor, prefix, reverse)
@@ -369,7 +381,7 @@ class LmdbTransaction(Transaction):
     ) -> Result[builtins.list[KVPair | None]]:
         return self._enqueue(self._op.delete_many, refs)
 
-    async def resolve(self) -> builtins.list[Result[Any]]:
+    async def resolve(self) -> builtins.list[Any]:
         if self._failure is not None:
             self.cancel()
             raise self._failure
@@ -389,10 +401,11 @@ class LmdbTransaction(Transaction):
             for item in batch:
                 if not item.future.done():
                     item.future.set_exception(error)
+                    item.future.exception()
 
             raise error from exc
 
-        for item, value in zip(batch, values):
+        for item, value in zip(batch, values, strict=True):
             if not item.future.done():
                 item.future.set_result(value)
 
@@ -427,6 +440,7 @@ class LmdbTransaction(Transaction):
 class LmdbTransactional(Transactional):
     def __init__(self, config: LmdbConfig) -> None:
         self._closed = False
+        config.path.mkdir(parents=True, exist_ok=True)
         self._env = lmdb.open(
             path=str(config.path),
             map_size=config.map_size,
@@ -500,28 +514,21 @@ class LmdbStorage(Storage):
     async def transactional_for(self, group: int) -> Transactional:
         return await self._transactional_for(group)
 
-    async def latest_hlc(self, partitioner: Partitioner) -> HLCTimestamp:
-        latest = HLCTimestamp(wall_ms=0, counter=0, node_id="")
-        for group in range(partitioner.total_groups):
-            start_pid, end_pid = partitioner.group_bounds(group)
-            transactional = await self._transactional_for(group)
-
-            async with transactional.transaction(write=False) as txn:
-                for pid in range(start_pid, end_pid + 1):
-                    txn.last(Keyspace.TAGS, prefix=Pid(pid))
-
-                for kv in await txn.results():
-                    if kv is None:
-                        continue
-
-                    key = Key.from_bytes(kv.key, Keyspace.TAGS)
-                    if key.ts > latest:
-                        latest = key.ts
-
-        return latest
-
     async def close(self) -> None:
         """Close the storage and release any resources."""
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            stores = list(self._stores.values())
+            self._stores.clear()
+
+        results = await asyncio.gather(
+            *(store.close() for store in stores), return_exceptions=True
+        )
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures:
+            raise ExceptionGroup("Failed to close storage groups", failures)
 
     def _get_lmdb_config(self, group: int) -> LmdbConfig:
         return LmdbConfig(

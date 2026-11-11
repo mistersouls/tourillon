@@ -244,8 +244,8 @@ META value := empty
 - The version itself is stored as a plain `LIVE` or `TOMBSTONE` record. There
   is no hint tag, no staging and no activation: a version is either present
   or absent, and the digests count it as soon as it is stored.
-- `GroupSession.put_obligations` writes the obligation in the same
-  transaction as the version (`StoreService._oblige`). Recording the same
+- `Store.put(record, obligations)` writes obligations in the same
+  transaction as the version (`StorageService._oblige`). Recording the same
   obligation twice is a no-op. An obligation never targets the local node.
 - Only then is it submitted to the `ObligationQueue`, a bounded in-memory
   hotqueue (`hotqueue_size`, 4096 by default). An obligation that does not
@@ -338,7 +338,7 @@ replicates.
 ### Digests
 
 Every group maintains digest cells in its `META` keyspace, updated in the same
-transaction as the data (`GroupSession.put_many` / `flush`):
+transaction as the data (`Session.put_record_many` / `flush`, internal to `Store`):
 
 | Key | Cell |
 | --- | --- |
@@ -559,53 +559,48 @@ Handlers are async generators registered once per kind on the peer or client dis
 ## 12. Storage model
 
 ```
-Storage ──session_provider_for(group)──▶ SessionProvider ──session(write=)──▶ Session ──batch()──▶ Batch
+Services (StorageService, AE, GC) ──▶ Store ──▶ SessionProvider
+SessionProvider ──Storage.transactional_for(group)──▶ Transactional ──transaction(write=)──▶ Transaction
 ```
 
-- One session provider per **group**; sessions are short-lived and scoped to read or write.
-- `Session` offers `get`, `put`, `delete`, `last`, `iter` and bounded `keys` pages of `KVRef` (key and keyspace); `Batch` offers the scheduling API resolved by one `await batch.result()`. Both key-only APIs use the native cursor with `values=False`, without materializing values or intermediate `KVPair` objects.
+- One transactional backend per **group**; transactions are short-lived and scoped to read or write.
+- Raw `Transaction` operations return deferred results, resolved through `await result.get()` or `await transaction.results()`. Key-only pages use the native cursor with `values=False`, without materializing payloads.
 - Keyspaces and record layout live in `tourillon/core/models/storageschema.py`. Keys are length-prefixed byte compositions — never ad-hoc strings.
-- `Storage.latest_hlc(total_groups)` is read at boot to restore the hybrid logical clock so timestamps never move backwards across restarts.
+- `Store.latest_hlc()` is read at boot to restore the hybrid logical clock so timestamps never move backwards across restarts.
 
-`core/storage/session.py` provides a typed `GroupSession` through
-`GroupSessionManager.session(write=...)`. Its `read` and `get_many` methods
-read exact versions and `get` reads the latest version. `put` and `put_many`
-insert `LIVE` or `TOMBSTONE` versions without ever rewriting an existing one,
-and fold only newly inserted versions into the per-bucket count/XOR digest.
-`put_obligations`, `has_obligations`, `obligation_page` and
-`remove_obligations` encapsulate replication obligations without allowing
-arbitrary `META` writes. `roots`, `root_page`, `bucket_page` and `owned_keys`
-serve anti-entropy. The caller retains responsibility for placement. The
-manager flushes digests before committing the underlying transaction; errors
-roll back records, obligations and digests together. `GroupSession` does not
-expose its underlying raw session. Paged scans log and skip unreadable
-entries while still advancing their cursor; no transaction stays open while
-the caller consumes a page.
+`core/storage/store.py` is the only entry point for local data access.
+`Manager` creates one shared `Store`, injected into `StorageService`, AE and
+GC through the lifecycle wiring. Services never open sessions or transactions.
+`Store` owns partition-group routing, bounded pages and write batches, exact
+reads and writes, replication obligations, digests and retention operations.
+Placement and quorum coordination remain in their respective services.
 
-`GroupSession` and `GroupSessionManager` have no retention policy. They expose
-bounded `latest_identities`/`latest_identities_many` reads and atomic `remove`
-operations; the caller selects what may be removed.
+`core/storage/session.py` provides the internal typed `Session` through
+`SessionProvider.session(group=..., write=...)`. Record and obligation writes
+share a transaction. The provider flushes root and bucket digest changes before
+commit; errors roll back records, obligations and digests together. Exact
+versions are immutable: duplicates are neither rewritten nor counted twice.
+No transaction stays open across network calls.
 
 `core/storage/retention.py` provides `RetentionPolicy`, an explicit collaborator
-that neither opens transactions nor wraps storage. Callers open
-`GroupSessionManager.session(write=...)` and pass that session to the policy
-only when their use case needs it:
+that neither opens transactions nor wraps storage. Only `Store` invokes it,
+inside the same transaction as the corresponding reads and mutations:
 
-- Store inserts exact writes and hints with `session.put`, without a retention
+- Store inserts exact writes and hints with `session.put_record`, without a retention
   preflight. An acknowledgement means the exact version was stored, not that
   it will be retained forever. Records, obligations and digests remain atomic.
-- AE calls `policy.apply(session, records)` to prevent repeated reintroduction
+- AE calls `Store.apply_result(pid, records)` to prevent repeated reintroduction
   of collected history. It reports `applied`, `already_present` or
   `ignored_retention` per input and carries X in scopes to detect mismatches.
-- GC calls `policy.collect(session, keys)` to select versions covered by X
+- GC calls `Store.collect_page` or `Store.collect_address` to select versions covered by X
   newer durable local versions, then removes them atomically.
-- Exact repair lookup calls `policy.lookup(session, key)` for the source and
+- Exact repair lookup calls `Store.lookup(key)` for the source and
   retention evidence. Ordinary reads and writes do not incur these reads.
 
-Policy decisions and mutations use the same caller-owned transaction.
+Policy decisions and mutations use the same Store-owned transaction.
 Admission reads are grouped by distinct address into two metadata batches,
 without loading their payloads. There is one rule implementation, but no
-mandatory wrapper or retention-aware raw session.
+retention-aware raw transaction exposed to services.
 
 Configuration and node state are persisted through the `Persistence` port, TOML by default, with per-path locking and atomic replace.
 
@@ -615,11 +610,11 @@ Configuration and node state are persisted through the `Persistence` port, TOML 
 
 Collection deletes `LOGS` and `TAGS` and subtracts root/bucket count-XOR contributions in the same write transaction. Empty digest cells are removed; rollback preserves all three surfaces. No `STALE` tag, time floor, remote vote or pre-collection quorum check is used. Reads of the newest X identities use bounded, key-only storage pages without materializing their payloads.
 
-One mandatory worker owns periodic passes, a deduplicated bounded hot queue and internally requested passes. `submit(PartitionAddress)` is a generic notification API with no AE types or network dependency; AE is its first producer. `Manager` owns its start and stop; `NodeLifecycle` requires the GC collaborator to wire notifications to AE. Overflow falls back to the periodic scan. Each transaction handles at most `batch_size` candidates and yields between pages. The manager starts the worker after clock restoration and stops it before closing storage.
+One mandatory worker owns periodic passes, a deduplicated bounded hot queue and internally requested passes. `GarbageCollector` implements the `CollectionScheduler` port (`core/ports/gc.py`), whose `submit(PartitionAddress)` method has no AE types or network dependency. `NodeLifecycle` injects this collaborator into AE, which shares it with its responder and peer sessions and submits addresses only after the Store operation commits. `Manager` owns the worker's start and stop. Overflow falls back to the periodic scan. Each transaction handles at most `batch_size` candidates and yields between pages. The manager starts the worker after clock restoration and stops it before closing storage.
 
 AE and GC are mandatory, and their retention configuration is validated.
 This does not impose admission filtering on exact writes: history can exceed X
-until GC runs. The GC notification callback is required.
+until GC runs. The `CollectionScheduler` collaborator is required; no notification callback is passed between services.
 
 ```toml
 [placement.retention]

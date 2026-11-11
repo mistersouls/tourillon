@@ -48,6 +48,7 @@ from tourillon.core.services.lifecycle import NodeLifecycle, _background_task
 from tourillon.core.services.store import StorageService
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.storage.retention import RetentionPolicy
+from tourillon.core.storage.store import LocalStore
 from tourillon.core.telemetry import build_noop_telemetry
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourlib.adapter import MsgPackSerializer
@@ -173,10 +174,10 @@ def _build_lifecycle(
         peer_pool=peer_pool,
     )
     retention = RetentionPolicy(config.placement.retention)
+    local_store = LocalStore(storage, partitioner, retention)
     store = StorageService(
-        retention=retention,
         node_id=config.node.id,
-        storage=storage,
+        store=local_store,
         partitioner=partitioner,
         placement_strategy=placement,
         clock=HLCClock(node_id=config.node.id),
@@ -195,12 +196,12 @@ def _build_lifecycle(
         peer_pool=peer_pool,
         topologymgr=topologymgr,
         partitioner=Partitioner(hashspace=HashSpace(bits=128), pshift=17, gshift=5),
-        storage=storage,
+        local_store=local_store,
         gossip_stats=GossipStats(),
         telemetry=build_noop_telemetry(),
         store=store,
         gc=GarbageCollector(
-            storage,
+            local_store,
             partitioner,
             config.placement.retention,
             node_id=config.node.id,

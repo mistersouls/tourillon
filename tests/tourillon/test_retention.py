@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from tourillon.core.config import StorageConfig
 from tourillon.core.models.config import RetentionConfig
 from tourillon.core.models.storageschema import (
     Key,
@@ -31,8 +32,8 @@ from tourillon.core.models.storageschema import (
     Value,
 )
 from tourillon.core.storage.retention import RetentionPolicy
-from tourillon.core.storage.session import DigestCell, GroupSessionManager
-from tourillon.infra.storage.lmdb_session import LmdbConfig, LmdbSessionProvider
+from tourillon.core.storage.session import DigestCell, SessionProvider
+from tourillon.infra.storage.lmdb_storage import LmdbStorage
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
 
@@ -41,12 +42,12 @@ policy = RetentionPolicy(RetentionConfig(versions=2))
 
 
 @pytest.fixture
-async def storage(tmp_path: Path) -> AsyncIterator[GroupSessionManager]:
-    provider = LmdbSessionProvider(LmdbConfig(tmp_path / "group", map_size=1 << 24), 0)
+async def storage(tmp_path: Path) -> AsyncIterator[LmdbStorage]:
+    storage = LmdbStorage(StorageConfig(data_dir=str(tmp_path), group_size="16Mi"))
     try:
-        yield GroupSessionManager(provider)
+        yield storage
     finally:
-        await provider.close()
+        await storage.close()
 
 
 def _record(index: int) -> Record:
@@ -59,11 +60,13 @@ def _record(index: int) -> Record:
     )
 
 
-async def test_shared_policy_reports_exact_dispositions_and_lookup(
-    storage: GroupSessionManager,
+async def test_shared_policy_reports_dispositions_and_lookup(
+    storage: LmdbStorage,
 ) -> None:
-    old, middle, latest = [_record(i) for i in range(1, 4)]
-    async with storage.session(write=True) as session:
+    sessions = SessionProvider(storage)
+    old, middle, latest = [_record(index) for index in range(1, 4)]
+
+    async with sessions.session(group=0, write=True) as session:
         assert await policy.apply(session, [middle, latest]) == ["applied", "applied"]
         assert await policy.apply(session, [old, latest]) == [
             "ignored_retention",
@@ -78,17 +81,17 @@ async def test_shared_policy_reports_exact_dispositions_and_lookup(
             KeyTag(middle.key, middle.tag),
         )
         assert await policy.collect(session, [old.key]) == (0, 0)
-    async with storage.session() as session:
-        assert (
-            await session.get(PartitionAddress(latest.key.pid, latest.key.address))
-            == latest
-        )
+
+    async with sessions.session(group=0) as session:
+        assert await session.read_record(latest.key) == latest
 
 
 async def test_admission_is_recomputed_after_another_write_in_same_transaction(
-    storage: GroupSessionManager,
+    storage: LmdbStorage,
 ) -> None:
-    async with storage.session(write=True) as session:
+    sessions = SessionProvider(storage)
+
+    async with sessions.session(group=0, write=True) as session:
         assert await policy.apply(session, [_record(1)]) == ["applied"]
         assert await policy.apply(session, [_record(2), _record(3)]) == [
             "applied",
@@ -97,62 +100,74 @@ async def test_admission_is_recomputed_after_another_write_in_same_transaction(
         assert await policy.apply(session, [_record(1)]) == ["ignored_retention"]
         count, _ = await policy.collect(session, [_record(1).key] * 2)
         assert count == 1
-    async with storage.session() as session:
-        assert await session.read(_record(1).key) is None
-        assert await session.read(_record(3).key) == _record(3)
+
+    async with sessions.session(group=0) as session:
+        assert await session.read_record(_record(1).key) is None
+        assert await session.read_record(_record(3).key) == _record(3)
         assert await session.roots([1]) == [
-            DigestCell.of(_record(2).key) + DigestCell.of(_record(3).key)
+            (1, DigestCell.of(_record(2).key) + DigestCell.of(_record(3).key))
         ]
 
 
 async def test_policy_and_raw_mutations_rollback_together(
-    storage: GroupSessionManager,
+    storage: LmdbStorage,
 ) -> None:
-    async with storage.session(write=True) as session:
+    sessions = SessionProvider(storage)
+
+    async with sessions.session(group=0, write=True) as session:
         await policy.apply(session, [_record(1), _record(2)])
+
     debt = ObligationKey("target", _record(1).key)
     with pytest.raises(RuntimeError, match="rollback"):
-        async with storage.session(write=True) as session:
-            await session.put(_record(3))
-            await session.put_obligations([debt])
+        async with sessions.session(group=0, write=True) as session:
+            await session.put_record(_record(3))
+            await session.put_obligation_many([debt])
             count, _ = await policy.collect(session, [_record(1).key])
             assert count == 1
             await session.flush()
             raise RuntimeError("rollback")
-    async with storage.session() as session:
+
+    async with sessions.session(group=0) as session:
         lookup = await policy.lookup(session, _record(1).key)
         assert lookup.record == _record(1)
         assert not lookup.outside_retention
-        assert await session.read(_record(3).key) is None
-        assert not await session.has_obligations()
+        assert await session.read_record(_record(3).key) is None
+        assert await session.obligation_keys(limit=10) == []
         assert await session.roots([1]) == [
-            DigestCell.of(_record(1).key) + DigestCell.of(_record(2).key)
+            (1, DigestCell.of(_record(1).key) + DigestCell.of(_record(2).key))
         ]
 
 
-async def test_raw_group_sessions_have_no_policy_and_metadata_pages_keep_addresses_separate(
-    storage: GroupSessionManager,
+async def test_raw_records_have_no_retention_and_identity_pages_separate_addresses(
+    storage: LmdbStorage,
 ) -> None:
-    manager = storage
+    sessions = SessionProvider(storage)
     other = replace(
         _record(3),
         key=replace(_record(3).key, address=Address(namespace=b"other", key=b"key")),
     )
-    async with manager.session(write=True) as records:
-        # Primitives can seed history; only the version layer decides retention.
-        assert (
-            await records.put_many([_record(3), _record(2), _record(1), other])
-            == [True] * 4
+    address = PartitionAddress(_record(1).key.pid, _record(1).key.address)
+    other_address = PartitionAddress(other.key.pid, other.key.address)
+
+    async with sessions.session(group=0, write=True) as records:
+        assert await records.put_record_many(
+            [_record(3), _record(2), _record(1), other]
+        ) == [
+            True,
+            True,
+            True,
+            True,
+        ]
+        identities = await records.latest_identities_many(
+            [address, other_address, address, other_address], 2
         )
-        addresses = [
-            PartitionAddress(r.key.pid, r.key.address) for r in [_record(1), other]
+        assert identities[address] == [
+            KeyTag(_record(3).key, _record(3).tag),
+            KeyTag(_record(2).key, _record(2).tag),
         ]
-        identities = await records.latest_identities_many(addresses + addresses, 2)
-        assert identities[addresses[0]] == [
-            KeyTag(r.key, r.tag) for r in [_record(3), _record(2)]
-        ]
-        assert identities[addresses[1]] == [KeyTag(other.key, other.tag)]
-    async with storage.session(write=True) as session:
+        assert identities[other_address] == [KeyTag(other.key, other.tag)]
+
+    async with sessions.session(group=0, write=True) as session:
         count, _ = await policy.collect(session, [_record(1).key])
         assert count == 1
-        assert await session.read(other.key) == other
+        assert await session.read_record(other.key) == other

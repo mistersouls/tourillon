@@ -76,14 +76,21 @@ from tourillon.core.models.antientropy import (
     RootsResponse,
     Scope,
 )
-from tourillon.core.models.storageschema import PID_SIZE, Key, Keyspace, Record
+from tourillon.core.models.storageschema import (
+    PID_SIZE,
+    Key,
+    Keyspace,
+    PartitionAddress,
+    Record,
+)
+from tourillon.core.ports.gc import CollectionScheduler
 from tourillon.core.storage.session import (
     DEFAULT_BUCKET_SHIFT,
     OWNED_KINDS,
     DigestCell,
     bucket_bounds,
 )
-from tourillon.core.storage.store import Store
+from tourillon.core.storage.store import LocalStore
 
 # Sends one request and returns the decoded ``.accept`` payload; raises
 # AntiEntropyRejectError on ``.reject``.
@@ -133,7 +140,7 @@ class SyncProgress:
 class PeerSync:
     def __init__(
         self,
-        store: Store,
+        store: LocalStore,
         peer: str,
         call: Call,
         view: ReplicaView,
@@ -143,8 +150,10 @@ class PeerSync:
         goal: str | None = None,
         *,
         progress: SyncProgress,
+        gc: CollectionScheduler,
     ) -> None:
         self._store = store
+        self._gc = gc
         self._peer = peer
         self._call = call
         self._view = view
@@ -356,7 +365,7 @@ class PeerSync:
                 )
             )
 
-            local, local_cursor = await self._local.keys(cursor, stop, limit)
+            local, local_cursor = await self._store.keys(cursor, stop, limit)
             self._spend_scan(len(page.keys) + len(local))
             ends = [c for c in (page.cursor, local_cursor) if c is not None]
             cursor = min(ends) if ends else None
@@ -425,7 +434,7 @@ class PeerSync:
     async def _push(self, scope: Scope, pid: int, keys: list[Key]) -> None:
         while keys:
             self._spend_repairs()
-            records, consumed = await self._local.read(pid, keys, self._batch_bytes)
+            records, consumed = await self._store.read(pid, keys, self._batch_bytes)
             keys = keys[consumed:]
 
             if not records:
@@ -456,10 +465,10 @@ class PeerSync:
             keys = keys[min(response.consumed, len(chunk)) :]
             records = [r for r in response.records if _wanted(r, pid, requested)]
 
+            result = await self._store.apply_result(pid, records)
+            self.tally.pulled += result["applied"]
             for record in records:
-                self._local.foreign(record)
-
-            self.tally.pulled += await self._local.apply(pid, records)
+                self._gc.submit(PartitionAddress(record.key.pid, record.key.address))
             self.tally.pulled_bytes += _size(records)
 
     def _scope(self, pids: Sequence[int]) -> Scope:

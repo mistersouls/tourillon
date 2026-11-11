@@ -44,8 +44,10 @@ from tourillon.core.models.repair import (
 )
 from tourillon.core.models.storageschema import (
     Key,
+    KeyList,
     Keyspace,
     KeyTag,
+    KVList,
     KVPair,
     KVRef,
     MetaKind,
@@ -70,6 +72,8 @@ from tourillon.core.ports.storage import Storage
 from tourillon.core.services.store import StorageService
 from tourillon.core.spaces.vnode import VNode
 from tourillon.core.storage.retention import RetentionPolicy
+from tourillon.core.storage.store import LocalStore
+from tourillon.core.utils.defer import Result
 from tourlib.adapter import MsgPackSerializer
 from tourlib.constant import MAX_CLOCK_SKEW_MS, MAX_QUORUM
 from tourlib.envelope import Envelope, build_envelope
@@ -144,9 +148,6 @@ class _SessionStub:
     async def exists(self, ref: KVRef) -> bool:
         return (ref.keyspace, ref.key) in self._pairs
 
-    def batch(self) -> "_WriteBatch":
-        return _WriteBatch(self)
-
     async def put(self, kv: KVPair, overwrite: bool = True) -> bool:
         if not overwrite and (kv.keyspace, kv.key) in self._pairs:
             return False
@@ -191,68 +192,87 @@ class _SessionStub:
             return None
         return max(pairs, key=lambda pair: pair.key)
 
+    async def keys(self, keyspace, prefix=None, start=None, limit=64, reverse=False):
+        self.key_pages += 1
+        prefix_bytes = b"" if prefix is None else prefix.to_bytes()
+        keys = sorted(
+            (
+                key
+                for space, key in self._pairs
+                if space == keyspace
+                and key.startswith(prefix_bytes)
+                and (start is None or (key < start if reverse else key > start))
+            ),
+            reverse=reverse,
+        )
+        return [KVRef(key, keyspace) for key in keys[:limit]]
 
-class _WriteBatch:
+    async def list(self, keyspace, prefix=None, start=None, limit=64, reverse=False):
+        refs = await self.keys(keyspace, prefix, start, limit, reverse)
+        return [self._pairs[(ref.keyspace, ref.key)] for ref in refs]
+
+    async def get_many(self, refs: list[KeyList]):
+        return [
+            self._pairs[(ref.keyspace, key)]
+            for ref in refs
+            for key in ref.items
+            if (ref.keyspace, key) in self._pairs
+        ]
+
+    async def put_many(self, kvs: list[KVList], overwrite=True):
+        pairs = [
+            KVPair(key, value, kv.keyspace) for kv in kvs for key, value in kv.items
+        ]
+        added = 0
+        for pair in pairs:
+            added += await self.put(pair, overwrite=overwrite)
+        return len(pairs), added
+
+    async def delete_many(self, refs: list[KeyList]):
+        return [
+            self._pairs.pop((ref.keyspace, key), None)
+            for ref in refs
+            for key in ref.items
+        ]
+
+
+class _TransactionStub:
     def __init__(self, session: _SessionStub) -> None:
         self._session = session
-        self._ops: list[tuple[str, Any, bool]] = []
+        self._ops = []
 
-    async def __aenter__(self) -> "_WriteBatch":
-        return self
+    def __getattr__(self, name):
+        def enqueue(*args, **kwargs):
+            future = asyncio.get_running_loop().create_future()
+            self._ops.append((name, args, kwargs, future))
+            return Result(self, future)
 
-    async def __aexit__(self, *args: Any) -> bool:
-        return False
+        return enqueue
 
-    def put(self, kv: KVPair, overwrite: bool = True) -> None:
-        self._ops.append(("put", kv, overwrite))
+    async def results(self):
+        return await self.resolve()
 
-    def get(self, ref: KVRef) -> None:
-        self._ops.append(("get", ref, False))
-
-    def exists(self, ref: KVRef) -> None:
-        self._ops.append(("exists", ref, False))
-
-    def keys(self, keyspace, prefix=None, start=None, limit=64, reverse=False) -> None:
-        self._session.key_pages += 1
-        self._ops.append(("keys", (keyspace, prefix, start, limit), reverse))
-
-    async def result(self) -> list[Any]:
+    async def resolve(self):
+        ops, self._ops = self._ops, []
         results = []
-        for kind, item, overwrite in self._ops:
-            if kind == "put":
-                assert isinstance(item, KVPair)
-                results.append(await self._session.put(item, overwrite=overwrite))
-            elif kind == "exists":
-                assert isinstance(item, KVRef)
-                results.append(await self._session.exists(item))
-            elif kind == "keys":
-                ks, prefix, start, limit = item
-                prefix_bytes = b"" if prefix is None else prefix.to_bytes()
-                keys = sorted(
-                    (
-                        key
-                        for space, key in self._session._pairs
-                        if space == ks
-                        and key.startswith(prefix_bytes)
-                        and (start is None or key > start)
-                    ),
-                    reverse=overwrite,
-                )
-                results.append([KVRef(key, ks) for key in keys[:limit]])
-            else:
-                results.append(await self._session.get(item))
+        for name, args, kwargs, future in ops:
+            value = await getattr(self._session, name)(*args, **kwargs)
+            future.set_result(value)
+            results.append(value)
         return results
 
 
-class _SessionProviderStub:
+class _TransactionalStub:
     def __init__(self, group_id: int, session: _SessionStub) -> None:
         self.group_id = group_id
         self._session = session
 
     @asynccontextmanager
-    async def session(self, write: bool = False) -> Any:
+    async def transaction(self, write: bool = False) -> Any:
         _ = write
-        yield self._session
+        txn = _TransactionStub(self._session)
+        yield txn
+        await txn.results()
 
     async def close(self) -> None:
         return None
@@ -264,9 +284,9 @@ class _StorageStub:
         self._session = _SessionStub(store)
         self.open_calls: list[int] = []
 
-    async def session_provider_for(self, group: int) -> _SessionProviderStub:
+    async def transactional_for(self, group: int) -> _TransactionalStub:
         self.open_calls.append(group)
-        return _SessionProviderStub(group, self._session)
+        return _TransactionalStub(group, self._session)
 
     async def latest_hlc(self, total_groups: int) -> HLCTimestamp:
         _ = total_groups
@@ -572,8 +592,12 @@ def _build_store(
     storage = _StorageStub(local_store)
     service = StorageService(
         node_id=node_id,
-        storage=cast(Storage, cast(object, storage)),
-        retention=RetentionPolicy(RetentionConfig(versions=retention_versions)),
+        store=LocalStore(
+            cast(Storage, cast(object, storage)),
+            cast(Partitioner, cast(object, _PartitionerStub(partitioner_pid))),
+            RetentionPolicy(RetentionConfig(versions=retention_versions)),
+            telemetry=None if telemetry is None else telemetry.as_port(),
+        ),
         partitioner=cast(Partitioner, cast(object, _PartitionerStub(partitioner_pid))),
         placement_strategy=cast(
             PlacementStrategy, cast(object, _PlacementStub(preferences))
@@ -1105,8 +1129,11 @@ async def test_put_raises_when_remote_response_kind_is_invalid() -> None:
     storage = _StorageStub(_StoreStub())
     service = StorageService(
         node_id="node-a",
-        storage=cast(Storage, cast(object, storage)),
-        retention=RetentionPolicy(RetentionConfig(versions=2)),
+        store=LocalStore(
+            cast(Storage, cast(object, storage)),
+            cast(Partitioner, cast(object, _PartitionerStub())),
+            RetentionPolicy(RetentionConfig(versions=2)),
+        ),
         partitioner=cast(Partitioner, cast(object, _PartitionerStub())),
         placement_strategy=cast(
             PlacementStrategy,

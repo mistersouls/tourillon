@@ -58,8 +58,7 @@ from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import PlacementStrategy, Preference
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports.telemetry import Telemetry
-from tourillon.core.storage.retention import RetentionPolicy
-from tourillon.core.storage.store import Store
+from tourillon.core.storage.store import LocalStore
 from tourillon.core.telemetry import build_noop_telemetry
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT, MAX_CLOCK_SKEW_MS, MAX_QUORUM
 from tourlib.envelope import build_envelope
@@ -100,13 +99,12 @@ class StorageService:
     def __init__(
         self,
         node_id: str,
-        store: Store,
+        store: LocalStore,
         partitioner: Partitioner,
         placement_strategy: PlacementStrategy,
         clock: HLCClock,
         serializer: Serializer,
         peer_pool: PeerPool,
-        retention: RetentionPolicy,
         response_delay: float = REPLICATION_RESPONSE_DELAY,
         read_repair: ReadRepairConfig | None = None,
         repair: RepairConfig | None = None,
@@ -116,7 +114,6 @@ class StorageService:
         self._node_id = node_id
         self._telemetry = telemetry or build_noop_telemetry()
         self._store = store
-        self._retention = retention
         self._partitioner = partitioner
         self._placement_strategy = placement_strategy
         self._clock = clock
@@ -343,13 +340,7 @@ class StorageService:
         with self._telemetry.start_span(
             "storage.operation", attributes={"group": group, "kind": kind}
         ):
-            return await self._lookup_local(key, group)
-
-    async def _lookup_local(self, key: Key, group: int) -> VersionLookup:
-        provider = await self._storage.session_provider_for(group)
-        manager = GroupSessionManager(provider)
-        async with manager.session() as session:
-            return await self._retention.lookup(session, key)
+            return await self._store.lookup(key)
 
     async def write(self, record: Record) -> Record:
         with self._operation("replication.write"):
@@ -389,18 +380,8 @@ class StorageService:
                 "storage.operation",
                 attributes={"group": group, "kind": kind},
             ),
-            self._telemetry.start_span(
-                "storage.transaction", attributes={"group": group}
-            ),
         ):
-            provider = await self._storage.session_provider_for(group)
-            manager = GroupSessionManager(provider)
-            async with manager.session(write=True) as session:
-                with self._telemetry.start_span("storage.record.put"):
-                    await session.put(record)
-                if obligations:
-                    with self._telemetry.start_span("storage.obligations.put"):
-                        await session.put_obligations(obligations)
+            await self._store.put(record, obligations)
         self._stats.obligations_recorded += len(obligations)
         self._telemetry.obligations_total.add(
             len(obligations), attributes={"event": "recorded"}
@@ -1107,20 +1088,14 @@ class StorageService:
         with self._telemetry.start_span(
             "storage.operation", attributes={"group": group, "kind": kind}
         ):
-            provider = await self._storage.session_provider_for(group)
-            manager = GroupSessionManager(provider)
-            async with manager.session() as session:
-                return await session.get(addr)
+            return await self._store.get(addr)
 
     async def _local_read_at(self, key: Key, *, kind: str) -> Record | None:
         group = self._partitioner.group_for(key.pid.value)
         with self._telemetry.start_span(
             "storage.operation", attributes={"group": group, "kind": kind}
         ):
-            provider = await self._storage.session_provider_for(group)
-            manager = GroupSessionManager(provider)
-            async with manager.session() as session:
-                return await session.read(key)
+            return await self._store.read_at(key)
 
     async def _local_write(self, record: Record, *, kind: str) -> Record:
         if record.tag.kind not in _OWNED_KINDS:
@@ -1132,15 +1107,8 @@ class StorageService:
                 "storage.operation",
                 attributes={"group": group, "kind": kind},
             ),
-            self._telemetry.start_span(
-                "storage.transaction", attributes={"group": group}
-            ),
         ):
-            provider = await self._storage.session_provider_for(group)
-            manager = GroupSessionManager(provider)
-            async with manager.session(write=True) as session:
-                with self._telemetry.start_span("storage.record.put"):
-                    await session.put(record)
+            await self._store.put(record)
         return record
 
     async def _drain_parallel_tasks(

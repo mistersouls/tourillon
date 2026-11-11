@@ -51,9 +51,10 @@ from tourillon.core.models.antientropy import (
     RootsResponse,
     Scope,
 )
-from tourillon.core.models.storageschema import Key, Keyspace
+from tourillon.core.models.storageschema import Key, Keyspace, PartitionAddress
+from tourillon.core.ports.gc import CollectionScheduler
 from tourillon.core.storage.session import OWNED_KINDS, DigestCell
-from tourillon.core.storage.store import Store
+from tourillon.core.storage.store import LocalStore
 
 # Hint returned with ``busy``: long enough for in-flight requests to finish.
 BUSY_RETRY_AFTER = 1.0
@@ -62,11 +63,13 @@ BUSY_RETRY_AFTER = 1.0
 class AntiEntropyResponder:
     def __init__(
         self,
-        store: Store,
+        store: LocalStore,
         tracker: ViewTracker,
         concurrency: int,
+        gc: CollectionScheduler,
     ) -> None:
         self._store = store
+        self._gc = gc
         self._tracker = tracker
         self._slots = concurrency
         self._active = 0
@@ -98,7 +101,7 @@ class AntiEntropyResponder:
 
     async def buckets(self, request: BucketsRequest) -> BucketsResponse:
         async with self._admit(request.scope):
-            cells, cursor = await self._local.bucket_page(
+            cells, cursor = await self._store.bucket_page(
                 request.scope.pid, request.after, request.limit
             )
             return BucketsResponse(
@@ -107,11 +110,11 @@ class AntiEntropyResponder:
 
     async def range(self, request: RangeRequest) -> DigestCell:
         async with self._admit(request.scope):
-            return await self._local.range_digest(request.start, request.stop)
+            return await self._store.range_digest(request.start, request.stop)
 
     async def keys(self, request: KeysRequest) -> KeysResponse:
         async with self._admit(request.scope):
-            keys, cursor = await self._local.keys(
+            keys, cursor = await self._store.keys(
                 request.start, request.stop, request.limit
             )
             return KeysResponse(
@@ -122,7 +125,7 @@ class AntiEntropyResponder:
         async with self._admit(request.scope):
             keys = [Key.from_bytes(raw, Keyspace.TAGS) for raw in request.keys]
 
-            records, consumed = await self._local.read(
+            records, consumed = await self._store.read(
                 request.scope.pid, keys, request.max_bytes
             )
 
@@ -136,10 +139,9 @@ class AntiEntropyResponder:
         async with self._admit(request.scope, write=True):
             records = [r for r in request.records if r.tag.kind in OWNED_KINDS]
 
+            result = await self._store.apply_result(request.scope.pid, records)
             for record in records:
-                self._local.foreign(record)
-
-            result = await self._local.apply_result(request.scope.pid, records)
+                self._gc.submit(PartitionAddress(record.key.pid, record.key.address))
             self.applied += result["applied"]
 
             return result

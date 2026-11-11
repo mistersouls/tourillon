@@ -123,13 +123,13 @@ from tourillon.core.models.storageschema import (
     Key,
     Keyspace,
     ObligationKey,
-    PartitionAddress,
     Record,
 )
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer.pool import PeerPool
+from tourillon.core.ports.gc import CollectionScheduler
 from tourillon.core.ports.telemetry import Telemetry
-from tourillon.core.storage.store import Store
+from tourillon.core.storage.store import LocalStore
 from tourillon.core.telemetry import build_noop_telemetry
 from tourlib import Serializer
 from tourlib.constant import ENVELOPE_RESPONSE_TIMEOUT
@@ -336,7 +336,7 @@ class AntiEntropyService:
     def __init__(
         self,
         node_id: str,
-        store: Store,
+        store: LocalStore,
         partitioner: Partitioner,
         topologymgr: TopologyManager,
         peer_pool: PeerPool,
@@ -348,7 +348,7 @@ class AntiEntropyService:
         clock: Callable[[], float] = time.time,
         backoff: BackoffRetry | None = None,
         telemetry: Telemetry | None = None,
-        notify: Callable[[PartitionAddress], None],
+        gc: CollectionScheduler,
     ) -> None:
         self._node_id = node_id
         self._telemetry = telemetry or build_noop_telemetry()
@@ -359,6 +359,9 @@ class AntiEntropyService:
         self._config = config
         self._clock = clock
         self._store = store
+        if gc is None:
+            raise ValueError("GC scheduler is required")
+        self._gc = gc
         self.obligations = obligations or ObligationQueue(config.hotqueue_size)
 
         self.tracker = ViewTracker(
@@ -371,7 +374,7 @@ class AntiEntropyService:
         )
 
         self.responder = AntiEntropyResponder(
-            self._store, self.tracker, config.concurrency
+            self._store, self.tracker, config.concurrency, gc
         )
 
         self._backoff = PeerBackoff(backoff or BackoffRetry(), time.monotonic)
@@ -412,8 +415,8 @@ class AntiEntropyService:
         self.tracker.start()
         self.responder.start()
         self._tasks = [
-            asyncio.create_task(self._deliver_loop(), name="antientropy-delivery"),
-            asyncio.create_task(self._run(), name="antientropy-loop"),
+            asyncio.create_task(self._deliver_loop(), name="ae-delivery"),
+            asyncio.create_task(self._run(), name="ae-loop"),
         ]
 
         logger.info("ae.started node=%s", self._node_id)
@@ -846,7 +849,7 @@ class AntiEntropyService:
             await self._deliver_to(target, list(group), records, view)
 
         if obsolete:
-            await self.local.remove_obligations(obsolete)
+            await self._store.remove_obligations(obsolete)
             self._stats.obligations_dropped += len(obsolete)
             self._obligation_event("dropped", len(obsolete))
             logger.debug(
@@ -909,7 +912,7 @@ class AntiEntropyService:
         view: ReplicaView,
     ) -> bool:
         call = self._caller(target)
-        scope = Scope((pid,), view.view_hash((pid,)), self.local.retention_versions)
+        scope = Scope((pid,), view.view_hash((pid,)), self._store.retention_versions)
 
         for chunk in _chunks(obligations, records, self._batch_bytes):
             unique = {records[ob.key].key: records[ob.key] for ob in chunk}
@@ -926,7 +929,7 @@ class AntiEntropyService:
                 self._failed(target, exc)
                 return False
 
-            await self.local.remove_obligations(chunk)
+            await self._store.remove_obligations(chunk)
             self._stats.obligations_delivered += len(chunk)
             self._obligation_event("delivered", len(chunk))
 
@@ -961,6 +964,7 @@ class AntiEntropyService:
             cutoff_ms,
             goal,
             progress=self._sync_progress(peer, view),
+            gc=self._gc,
         )
 
     def _sync_progress(self, peer: str, view: ReplicaView) -> SyncProgress:

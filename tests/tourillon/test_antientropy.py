@@ -33,7 +33,7 @@ import pytest
 
 from tests.helpers.telemetry import RecordingTelemetry
 from tourillon.bootstrap.handlers import antientropy as handlers
-from tourillon.core.ae.local import LocalStore
+from tourillon.core.ae.responder import AntiEntropyResponder
 from tourillon.core.ae.sync import (
     BudgetSpentError,
     PeerSync,
@@ -59,6 +59,7 @@ from tourillon.core.models.storageschema import (
     Key,
     Keyspace,
     ObligationKey,
+    PartitionAddress,
     Pid,
     Record,
     Tag,
@@ -76,8 +77,9 @@ from tourillon.core.services.antientropy import (
 from tourillon.core.services.gc import GarbageCollector
 from tourillon.core.spaces.hashspace import HashSpace
 from tourillon.core.storage.retention import RetentionPolicy
-from tourillon.core.storage.session import DigestCell, GroupSessionManager
-from tourillon.infra.storage.lmdb_session import LmdbConfig, LmdbSessionProvider
+from tourillon.core.storage.session import DigestCell
+from tourillon.core.storage.store import LocalStore
+from tourillon.infra.storage.lmdb_storage import LmdbConfig, LmdbTransactional
 from tourlib.adapter import MsgPackSerializer
 from tourlib.envelope import Envelope, build_envelope
 from tourlib.exceptions import ProtocolError, ValidationError
@@ -85,30 +87,6 @@ from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
 
 pytestmark = pytest.mark.tourillon
-
-
-@pytest.mark.parametrize(
-    "versions, notify",
-    [
-        (None, lambda address: None),
-        (0, lambda address: None),
-        (2, None),
-    ],
-)
-def test_local_ae_rejects_missing_retention_or_gc_notification(
-    tmp_path: Path,
-    versions: int,
-    notify,
-) -> None:
-    with pytest.raises(
-        (ValueError, ValidationError), match="retention.versions|GC notification"
-    ):
-        LocalStore(
-            _Storage(tmp_path),
-            PARTITIONER,
-            notify,
-            RetentionPolicy(RetentionConfig(versions=versions)),
-        )
 
 
 SERIALIZER = MsgPackSerializer()
@@ -121,26 +99,55 @@ RECENT_MS = 19_990_000  # within the grace window: never compared
 TOKENS = {"node-a": ("10", "70"), "node-b": ("30", "b0"), "node-c": ("50", "e0")}
 
 
+@pytest.mark.parametrize("versions", [None, 0])
+def test_store_requires_valid_retention_config(versions: int | None) -> None:
+    with pytest.raises(ValidationError, match="retention.versions"):
+        RetentionConfig(versions=versions)
+
+
+def test_antientropy_requires_gc_scheduler(tmp_path: Path) -> None:
+    storage = _Storage(tmp_path)
+    with pytest.raises(ValueError, match="GC scheduler"):
+        AntiEntropyService(
+            node_id="node-a",
+            store=LocalStore(storage, PARTITIONER, RetentionPolicy(RetentionConfig())),
+            partitioner=PARTITIONER,
+            topologymgr=TopologyManager(),
+            peer_pool=None,  # type: ignore[arg-type]
+            serializer=SERIALIZER,
+            replication_factor=RF,
+            config=AntiEntropyConfig(),
+            gc=None,  # type: ignore[arg-type]
+        )
+
+
+class _CollectionRecorder:
+    def __init__(self) -> None:
+        self.addresses: list[PartitionAddress] = []
+
+    def submit(self, address: PartitionAddress) -> None:
+        self.addresses.append(address)
+
+
 class _Storage:
     def __init__(self, root: Path) -> None:
         self._root = root
-        self._providers: dict[int, LmdbSessionProvider] = {}
+        self._transactionals: dict[int, LmdbTransactional] = {}
 
-    async def session_provider_for(self, group: int) -> LmdbSessionProvider:
-        provider = self._providers.get(group)
+    async def transactional_for(self, group: int) -> LmdbTransactional:
+        transactional = self._transactionals.get(group)
 
-        if provider is None:
+        if transactional is None:
             self._root.mkdir(parents=True, exist_ok=True)
-            provider = self._providers[group] = LmdbSessionProvider(
+            transactional = self._transactionals[group] = LmdbTransactional(
                 config=LmdbConfig(path=self._root / f"g{group}", map_size=1 << 24),
-                group=group,
             )
 
-        return provider
+        return transactional
 
     async def close(self) -> None:
-        for provider in self._providers.values():
-            await provider.close()
+        for transactional in self._transactionals.values():
+            await transactional.close()
 
 
 class _Network:
@@ -246,13 +253,13 @@ def _records(count: int, wall_ms: int = OLD_MS) -> list[Record]:
 
 async def _write(service: AntiEntropyService, records: list[Record]) -> None:
     for record in records:
-        await service.local.apply(record.key.pid.value, [record])
+        await service._store.apply_result(record.key.pid.value, [record])
 
 
 async def _owned(service: AntiEntropyService, pid: int) -> set[bytes]:
     start = pid.to_bytes(4, "big")
     stop = (pid + 1).to_bytes(4, "big")
-    keys, cursor = await service.local.keys(start, stop, 1 << 14)
+    keys, cursor = await service._store.keys(start, stop, 1 << 14)
     assert cursor is None
 
     return {k.to_bytes(Keyspace.TAGS) for k in keys}
@@ -277,12 +284,11 @@ class _Cluster:
         storage = _Storage(self._tmp_path / node_id)
         self.storages.append(storage)
         policy = RetentionConfig(versions=retention_versions)
-        retention = RetentionPolicy(policy)
+        store = LocalStore(storage, PARTITIONER, RetentionPolicy(policy))
 
         service = AntiEntropyService(
             node_id=node_id,
-            storage=storage,
-            retention=retention,
+            store=store,
             partitioner=PARTITIONER,
             topologymgr=topology,
             peer_pool=self.network.pool(),  # type: ignore[arg-type]
@@ -292,8 +298,8 @@ class _Cluster:
             clock=lambda: NOW,
             backoff=BackoffRetry(initial_delay=0.0, max_delay=0.0, jitter=0.0),
             telemetry=None if telemetry is None else telemetry.as_port(),
-            notify=GarbageCollector(
-                storage,
+            gc=GarbageCollector(
+                store,
                 PARTITIONER,
                 policy,
                 node_id=node_id,
@@ -302,7 +308,7 @@ class _Cluster:
                     if telemetry is None
                     else telemetry.as_port()
                 ),
-            ).submit,
+            ),
         )
 
         self.network.nodes[node_id] = service
@@ -366,11 +372,9 @@ def _history(record: Record, count: int) -> list[Record]:
 async def _collect_history(
     service: AntiEntropyService, records: list[Record], versions: int
 ) -> None:
-    assert service.local.retention_versions == versions
-    group = PARTITIONER.group_for(records[0].key.pid.value)
-    provider = await service.local._storage.session_provider_for(group)
-    async with GroupSessionManager(provider).session(write=True) as session:
-        await service.local._retention.collect(session, [r.key for r in records])
+    assert service._store.retention_versions == versions
+    address = PartitionAddress(records[0].key.pid, records[0].key.address)
+    await service._store.collect_address(address, len(records))
 
 
 async def test_retained_sets_converge_under_tiny_budgets_without_old_bucket_starvation(
@@ -393,7 +397,7 @@ async def test_retained_sets_converge_under_tiny_budgets_without_old_bucket_star
     assert await _owned(a, pid) == expected
     assert await _owned(b, pid) == expected
     assert a.stats.budget_stops > 0
-    assert await a.local.roots([pid]) == await b.local.roots([pid])
+    assert await a._store.roots([pid]) == await b._store.roots([pid])
 
 
 async def test_retention_policy_mismatch_is_explicitly_rejected(
@@ -433,10 +437,8 @@ async def test_latest_version_covers_grouped_debts_after_gc_and_preserves_concur
     pid = records[0].key.pid.value
     assert await _owned(b, pid) == {records[2].key.to_bytes(Keyspace.TAGS)}
     assert cluster.network.requests.count(("node-b", "antientropy.push")) == 1
-    provider = await a.local._storage.session_provider_for(PARTITIONER.group_for(pid))
-    async with GroupSessionManager(provider).session() as session:
-        page, _ = await session.obligation_page(None, 10)
-        assert page == [ObligationKey("node-b", records[3].key)]
+    obligations = await a._store.list_obligations(None, 10)
+    assert obligations == [ObligationKey("node-b", records[3].key)]
 
 
 async def test_ignored_retention_covers_delivery_but_malformed_ack_does_not(
@@ -450,7 +452,7 @@ async def test_ignored_retention_covers_delivery_but_malformed_ack_does_not(
     await _write(b, records[2:])
     debt = await _oblige(a, records[0], "node-b")
     await a.deliver([debt], view)
-    assert not await a.local.has_obligations()
+    assert not await a._store.has_obligations()
     assert await _owned(b, records[0].key.pid.value) == {
         records[2].key.to_bytes(Keyspace.TAGS)
     }
@@ -470,7 +472,7 @@ async def test_ignored_retention_covers_delivery_but_malformed_ack_does_not(
 
     monkeypatch.setattr(cluster.network, "request", malformed)
     await a.deliver([debt], view)
-    assert await a.local.has_obligations()
+    assert await a._store.has_obligations()
     assert a.obligations.backlog
 
 
@@ -766,7 +768,7 @@ async def test_scan_budget_counts_listed_keys(cluster: _Cluster) -> None:
     await _write(b, records)
 
     sync = PeerSync(
-        a.local,
+        a._store,
         "node-b",
         a._caller("node-b"),
         view,
@@ -779,6 +781,7 @@ async def test_scan_budget_counts_listed_keys(cluster: _Cluster) -> None:
         ),
         int((NOW - 10) * 1000),
         progress=SyncProgress(),
+        gc=a._gc,
     )
 
     with pytest.raises(BudgetSpentError):
@@ -799,6 +802,7 @@ async def test_rpc_refuses_once_stale() -> None:
         SessionLimits(1, 1, 1, 1),
         0,
         progress=SyncProgress(),
+        gc=_CollectionRecorder(),
     )
 
     with pytest.raises(ViewChangedError):
@@ -1051,6 +1055,36 @@ async def test_unexpected_response_kind_is_a_protocol_error(cluster: _Cluster) -
 # --- responder admission ------------------------------------------------------
 
 
+async def test_responder_schedules_collection_after_successful_store_application(
+    cluster: _Cluster,
+) -> None:
+    a, _, _ = await _three(cluster)
+    view = _view(a)
+    record = _shared_records(view, "node-b")[0]
+    pid = record.key.pid.value
+    scope = Scope((pid,), view.view_hash((pid,)), 64)
+    scheduler = _CollectionRecorder()
+    responder = AntiEntropyResponder(a._store, a.tracker, 1, scheduler)
+    responder.start()
+    try:
+        assert await responder.push(PushRequest(scope, (record,))) == 1
+        assert await a._store.read_at(record.key) == record
+        assert scheduler.addresses == [
+            PartitionAddress(record.key.pid, record.key.address)
+        ]
+
+        invalid = dataclasses.replace(
+            record, key=dataclasses.replace(record.key, pid=Pid((pid + 1) % 16))
+        )
+        with pytest.raises(ValueError, match="requested partition"):
+            await responder.push(PushRequest(scope, (invalid,)))
+        assert scheduler.addresses == [
+            PartitionAddress(record.key.pid, record.key.address)
+        ]
+    finally:
+        await responder.stop()
+
+
 async def test_responder_refuses_beyond_capacity_and_drains_on_stop(
     cluster: _Cluster,
 ) -> None:
@@ -1123,25 +1157,30 @@ async def test_local_store_pages_roots_buckets_and_flags_foreign(
     await _write(a, records)
     pids = sorted({r.key.pid.value for r in records})
 
-    page, cursor = await a.local.root_page(None, 2)
-    assert [pid for pid, _ in page] == pids[:2] and cursor == pids[1]
+    page = await a._store.list_root(None, 2)
+    assert [pid for pid, _ in page] == pids[:2]
     collected: list[int] = [pid for pid, _ in page]
+    cursor = page[-1][0]
+    page_size = 2
 
-    while cursor is not None:
-        page, cursor = await a.local.root_page(cursor, 3)
+    while len(page) == page_size:
+        page_size = 3
+        page = await a._store.list_root(cursor, 3)
         collected.extend(pid for pid, _ in page)
+        if page:
+            cursor = page[-1][0]
 
     assert collected == pids
 
     pid = records[-1].key.pid.value
-    buckets = await a.local.buckets_until(pid, None, None, 1)
+    buckets = await a._store.buckets_until(pid, None, None, 1)
     assert 2 in buckets
 
-    assert await a.local.buckets_until(pid, None, 0, 1) == {
+    assert await a._store.buckets_until(pid, None, 0, 1) == {
         b: c for b, c in buckets.items() if b <= 0
     }
 
-    roots = await a.local.roots([pid])
+    roots = await a._store.roots([pid])
     total = DigestCell()
 
     for cell in buckets.values():
@@ -1150,7 +1189,7 @@ async def test_local_store_pages_roots_buckets_and_flags_foreign(
     assert roots[pid] == total
 
     record = records[0]
-    assert not a.local.foreign(record)
+    assert not a._store.foreign(record)
 
     moved = Record(
         key=Key(
@@ -1162,7 +1201,7 @@ async def test_local_store_pages_roots_buckets_and_flags_foreign(
         value=record.value,
     )
 
-    assert a.local.foreign(moved)
+    assert a._store.foreign(moved)
 
 
 async def test_local_read_bounds_batches_and_always_progresses(
@@ -1173,11 +1212,11 @@ async def test_local_read_bounds_batches_and_always_progresses(
     records = [r for r in _records(64) if r.key.pid.value == pid]
     await _write(a, records)
     keys = [r.key for r in records]
-    missing = _record(999).key
+    missing = dataclasses.replace(_record(999).key, pid=Pid(pid))
 
-    found, consumed = await a.local.read(pid, [missing] + keys, 1)
+    found, consumed = await a._store.read(pid, [missing] + keys, 1)
     assert consumed == 2 and found == [records[0]]
-    found, consumed = await a.local.read(pid, keys, 1 << 30)
+    found, consumed = await a._store.read(pid, keys, 1 << 30)
     assert consumed == len(keys) and found == records
 
 
@@ -1244,10 +1283,7 @@ async def _oblige(
     service: AntiEntropyService, record: Record, target: str
 ) -> ObligationKey:
     obligation = ObligationKey(target, record.key)
-    group = PARTITIONER.group_for(record.key.pid.value)
-    provider = await service.local._storage.session_provider_for(group)
-    async with GroupSessionManager(provider).session(write=True) as session:
-        await session.put_obligations([obligation])
+    await service._store.put(record, [obligation])
 
     return obligation
 
@@ -1265,12 +1301,12 @@ async def test_deliver_pushes_owed_versions_then_forgets_them(
     await a.deliver([obligation], view)
 
     assert record.key.to_bytes(Keyspace.TAGS) in await _owned(b, pid)
-    assert not await a.local.has_obligations()
+    assert not await a._store.has_obligations()
     assert a.stats.obligations_delivered == 1
     assert ("node-b", "antientropy.push") in cluster.network.requests
 
 
-async def test_deliver_drops_only_obsolete_targets_and_retains_uncovered_debts(
+async def test_deliver_drops_obsolete_targets_and_pushes_available_versions(
     cluster: _Cluster,
 ) -> None:
     a, _, _ = await _three(cluster)
@@ -1284,10 +1320,10 @@ async def test_deliver_drops_only_obsolete_targets_and_retains_uncovered_debts(
 
     await a.deliver([foreign, missing], view)
 
-    assert await a.local.has_obligations()
+    assert not await a._store.has_obligations()
     assert a.stats.obligations_dropped == 1
-    assert a.obligations.backlog
-    assert cluster.network.requests == []
+    assert a.stats.obligations_delivered == 1
+    assert ("node-b", "antientropy.push") in cluster.network.requests
 
 
 async def test_budget_checkpoints_cover_local_only_windows_and_multiple_partitions(
@@ -1324,7 +1360,7 @@ async def test_deliver_parks_obligations_of_unreachable_targets(
 
     await a.deliver([obligation], view)
 
-    assert await a.local.has_obligations()
+    assert await a._store.has_obligations()
     assert a.obligations.backlog
     assert a.stats.obligations_deferred == 1
     assert record.key.to_bytes(Keyspace.TAGS) not in await _owned(
@@ -1344,7 +1380,7 @@ async def test_deliver_keeps_obligations_when_the_push_fails(
 
     await a.deliver([obligation], view)
 
-    assert await a.local.has_obligations()
+    assert await a._store.has_obligations()
     assert a.stats.obligations_delivered == 0
     assert a.stats.errors == 1
 
@@ -1368,7 +1404,7 @@ async def test_delivery_reloads_persisted_obligations_on_start(
 
     await asyncio.wait_for(a.obligations.wait_idle(), 1)
     assert a.stats.obligations_delivered == 1
-    assert not await a.local.has_obligations()
+    assert not await a._store.has_obligations()
     assert record.key.to_bytes(Keyspace.TAGS) in await _owned(b, record.key.pid.value)
     assert a.to_dict()["hotqueue"]["backlog"] is False
 

@@ -1,3 +1,17 @@
+# Copyright 2026 Tourillon Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import builtins
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
@@ -5,9 +19,7 @@ from typing import Any, Protocol
 
 from tourillon.core.models.config import StorageConfig
 from tourillon.core.models.storageschema import KeyList, Keyspace, KVList, KVPair, KVRef
-from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.utils.defer import Result
-from tourlib.models.ts import HLCTimestamp
 from tourlib.models.types import SupportsBytes
 
 
@@ -88,9 +100,6 @@ class Transactional(Protocol):
 class Storage(Protocol):
     async def transactional_for(self, group: int) -> Transactional:
         """Return a transactional for the given group ID."""
-
-    async def latest_hlc(self, partitioner: Partitioner) -> HLCTimestamp:
-        """Return the latest hybrid logical clock timestamp."""
 
     async def close(self) -> None:
         """Close the storage and release any resources."""

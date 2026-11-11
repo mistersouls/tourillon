@@ -13,11 +13,12 @@
 # limitations under the License.
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from tourillon.core.config import StorageConfig
 from tourillon.core.models.config import RetentionConfig
 from tourillon.core.models.storageschema import (
     Key,
@@ -25,7 +26,6 @@ from tourillon.core.models.storageschema import (
     KeyTag,
     KVPair,
     KVRef,
-    MetaKind,
     ObligationKey,
     PartitionAddress,
     Pid,
@@ -34,18 +34,14 @@ from tourillon.core.models.storageschema import (
     TagKind,
     Value,
 )
-from tourillon.core.ports.storage import Session
 from tourillon.core.storage.retention import RetentionPolicy
 from tourillon.core.storage.session import (
-    BUCKET_PREFIX,
     DEFAULT_BUCKET_SHIFT,
-    ROOT_PREFIX,
     DigestCell,
-    GroupSessionManager,
-    bucket_key,
+    SessionProvider,
     root_key,
 )
-from tourillon.infra.storage.lmdb_session import LmdbConfig, LmdbSessionProvider
+from tourillon.infra.storage.lmdb_storage import LmdbStorage
 from tourlib.exceptions import ValidationError
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
@@ -54,47 +50,24 @@ pytestmark = pytest.mark.tourillon
 
 
 @pytest.fixture
-async def provider(tmp_path: Path) -> AsyncIterator[LmdbSessionProvider]:
-    provider = LmdbSessionProvider(
-        config=LmdbConfig(path=tmp_path / "group", map_size=8 * 1024 * 1024),
-        group=0,
-    )
+async def storage(tmp_path: Path) -> AsyncIterator[LmdbStorage]:
+    storage = LmdbStorage(StorageConfig(data_dir=str(tmp_path), group_size="16Mi"))
     try:
-        yield provider
+        yield storage
     finally:
-        await provider.close()
+        await storage.close()
 
 
-def _record(index: int) -> Record:
+def _record(index: int, *, pid: int = 1) -> Record:
     return Record(
         key=Key(
-            pid=Pid(1),
+            pid=Pid(pid),
             address=Address(namespace=b"ns", key=f"key-{index}".encode()),
             ts=HLCTimestamp(wall_ms=100 + index, counter=0, node_id="node"),
         ),
         tag=Tag(kind=TagKind.LIVE),
         value=Value(data=b"value", quorum_write=1),
     )
-
-
-async def test_manager_flushes_digest_with_records(
-    provider: LmdbSessionProvider,
-) -> None:
-    manager = GroupSessionManager(provider)
-    first, second = _record(1), _record(2)
-    async with manager.session(write=True) as session:
-        assert await session.put(first)
-    async with manager.session(write=True) as session:
-        assert await session.put(second)
-    async with provider.session() as raw:
-        kv = await raw.get(KVRef(bucket_key(1, 0), Keyspace.META))
-        assert kv is not None
-        assert DigestCell.from_bytes(kv.value) == (
-            DigestCell.of(first.key) + DigestCell.of(second.key)
-        )
-    async with manager.session() as session:
-        assert await session.read(first.key) == first
-        assert await session.read(second.key) == second
 
 
 def _history(count: int, *, tombstone: bool = False) -> list[Record]:
@@ -116,78 +89,95 @@ def _history(count: int, *, tombstone: bool = False) -> list[Record]:
     ]
 
 
+async def test_session_flushes_digest_with_records(storage: LmdbStorage) -> None:
+    sessions = SessionProvider(storage)
+    first, second = _record(1), _record(2)
+
+    async with sessions.session(group=0, write=True) as session:
+        assert await session.put_record(first)
+    async with sessions.session(group=0, write=True) as session:
+        assert await session.put_record(second)
+
+    async with sessions.session(group=0) as session:
+        assert await session.roots([1]) == [
+            (1, DigestCell.of(first.key) + DigestCell.of(second.key))
+        ]
+        assert await session.read_record(first.key) == first
+        assert await session.read_record(second.key) == second
+
+
 @pytest.mark.parametrize("versions", [1, 2, 4])
-async def test_collection_atomically_keeps_top_versions_and_current_tombstone(
-    provider: LmdbSessionProvider,
+async def test_collection_keeps_top_versions_and_current_tombstone(
+    storage: LmdbStorage,
     versions: int,
 ) -> None:
     records = _history(5, tombstone=True)
-    manager = GroupSessionManager(provider)
-    async with manager.session(write=True) as session:
-        await session.put_many(records)
-        await session.put(_record(42))
-        await session.put_obligations([ObligationKey("target", records[0].key)])
-    async with manager.session(write=True) as session:
+    sessions = SessionProvider(storage)
+
+    async with sessions.session(group=0, write=True) as session:
+        await session.put_record_many(records)
+        await session.put_record(_record(42))
+        await session.put_obligation_many([ObligationKey("target", records[0].key)])
+
+    async with sessions.session(group=0, write=True) as session:
         count, size = await RetentionPolicy(RetentionConfig(versions=versions)).collect(
-            session, [r.key for r in records]
+            session, [record.key for record in records]
         )
         assert count == 5 - versions
         assert size > 0
-    async with manager.session() as session:
-        assert [await session.read(r.key) for r in records] == (
-            [None] * (5 - versions) + records[-versions:]
-        )
-        assert await session.read(_record(42).key) == _record(42)
-        assert await session.has_obligations()
-    async with provider.session() as raw:
-        root = await raw.get(KVRef(root_key(1), Keyspace.META))
-        assert root is not None
-        expected = DigestCell.of(_record(42).key)
-        for record in records[-versions:]:
-            expected += DigestCell.of(record.key)
-        assert DigestCell.from_bytes(root.value) == expected
-        assert await raw.get(KVRef(bucket_key(1, 1), Keyspace.META)) is None
-        for record in records[:-versions]:
-            assert (
-                await raw.get(KVRef(record.key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
-                is None
-            )
+
+    async with sessions.session(group=0) as session:
+        assert [await session.read_record(record.key) for record in records] == [
+            None
+        ] * (5 - versions) + records[-versions:]
+        assert await session.read_record(_record(42).key) == _record(42)
+        assert await session.obligation_keys(limit=10) == [
+            ObligationKey("target", records[0].key)
+        ]
+        root = (await session.roots([1]))[0][1]
+        buckets = await session.list_buckets(1, limit=10)
+        assert sum((cell for _, cell in buckets), DigestCell()) == root
 
 
-async def test_collection_dry_run_and_rollback_preserve_records_and_digests(
-    provider: LmdbSessionProvider,
+async def test_dry_run_and_rollback_preserve_records_and_digests(
+    storage: LmdbStorage,
 ) -> None:
     records = _history(3)
-    manager = GroupSessionManager(provider)
-    async with manager.session(write=True) as session:
-        await session.put_many(records)
-    async with manager.session() as session:
+    sessions = SessionProvider(storage)
+
+    async with sessions.session(group=0, write=True) as session:
+        await session.put_record_many(records)
+
+    async with sessions.session(group=0) as session:
         result = await RetentionPolicy(RetentionConfig(versions=1)).collect(
-            session, [r.key for r in records], dry_run=True
+            session, [record.key for record in records], dry_run=True
         )
         assert result[0] == 2
+
     with pytest.raises(RuntimeError, match="rollback"):
-        async with manager.session(write=True) as session:
+        async with sessions.session(group=0, write=True) as session:
             await RetentionPolicy(RetentionConfig(versions=1)).collect(
-                session, [r.key for r in records]
+                session, [record.key for record in records]
             )
             await session.flush()
             raise RuntimeError("rollback")
-    async with manager.session() as session:
-        assert [await session.read(r.key) for r in records] == records
-    async with provider.session() as raw:
-        root = await raw.get(KVRef(root_key(1), Keyspace.META))
-        assert root is not None
-        assert DigestCell.from_bytes(root.value).count == 3
+
+    async with sessions.session(group=0) as session:
+        assert [await session.read_record(record.key) for record in records] == records
+        assert await session.roots([1]) == [
+            (1, sum((DigestCell.of(record.key) for record in records), DigestCell()))
+        ]
 
 
 async def test_retention_rejects_out_of_order_historical_arrivals(
-    provider: LmdbSessionProvider,
+    storage: LmdbStorage,
 ) -> None:
     records = _history(4)
-    manager = GroupSessionManager(provider)
-    async with manager.session(write=True) as session:
-        versions = RetentionPolicy(RetentionConfig(versions=2))
+    sessions = SessionProvider(storage)
+    address = PartitionAddress(records[0].key.pid, records[0].key.address)
+    versions = RetentionPolicy(RetentionConfig(versions=2))
+
+    async with sessions.session(group=0, write=True) as session:
         assert await versions.apply(session, records[-2:]) == ["applied", "applied"]
         lookup = await versions.lookup(session, records[0].key)
         assert lookup.outside_retention
@@ -197,347 +187,268 @@ async def test_retention_rejects_out_of_order_historical_arrivals(
         ]
         lookup = await versions.lookup(session, records[-1].key)
         assert not lookup.outside_retention
-        assert await session.latest_identities(
-            PartitionAddress(records[0].key.pid, records[0].key.address), 2
-        ) == [KeyTag(r.key, r.tag) for r in reversed(records[-2:])]
+        assert await session.latest_identities(address, 2) == [
+            KeyTag(record.key, record.tag) for record in reversed(records[-2:])
+        ]
 
 
 @pytest.mark.parametrize("versions", [0, -1, True, 65])
-async def test_collection_rejects_invalid_retention_without_removing_current_state(
-    provider: LmdbSessionProvider,
+async def test_collection_rejects_invalid_retention_without_removing_records(
+    storage: LmdbStorage,
     versions: int,
 ) -> None:
     record = _record(1)
-    manager = GroupSessionManager(provider)
-    async with manager.session(write=True) as session:
-        await session.put(record)
+    sessions = SessionProvider(storage)
+
+    async with sessions.session(group=0, write=True) as session:
+        await session.put_record(record)
+
     with pytest.raises(ValidationError, match="retention.versions"):
-        async with manager.session(write=True) as session:
+        async with sessions.session(group=0, write=True) as session:
             await RetentionPolicy(RetentionConfig(versions=versions)).collect(
                 session, [record.key]
             )
-    async with manager.session() as session:
-        assert await session.read(record.key) == record
+
+    async with sessions.session(group=0) as session:
+        assert await session.read_record(record.key) == record
 
 
 @pytest.mark.parametrize("versions", [None, 0, True, 65])
-def test_retention_policy_rejects_disabled_or_invalid_retention(
-    provider: LmdbSessionProvider,
-    versions: int,
+def test_retention_policy_rejects_disabled_or_invalid_versions(
+    versions: int | None,
 ) -> None:
     with pytest.raises(ValidationError, match="retention.versions"):
         RetentionConfig(versions=versions)
 
 
-async def test_repeated_flush_preserves_cumulative_deltas(
-    provider: LmdbSessionProvider,
-) -> None:
+async def test_repeated_flush_preserves_cumulative_deltas(storage: LmdbStorage) -> None:
+    sessions = SessionProvider(storage)
     first, second = _record(1), _record(2)
-    async with GroupSessionManager(provider).session(write=True) as session:
+
+    async with sessions.session(group=0, write=True) as session:
         await session.flush()
-        assert await session.put(first)
+        assert await session.put_record(first)
         await session.flush()
         await session.flush()
-        assert await session.put(second)
-        assert not await session.put(first)
+        assert await session.put_record(second)
+        assert not await session.put_record(first)
         await session.flush()
-    async with provider.session() as raw:
-        kv = await raw.get(KVRef(bucket_key(1, 0), Keyspace.META))
-        assert kv is not None
-        assert DigestCell.from_bytes(kv.value) == (
-            DigestCell.of(first.key) + DigestCell.of(second.key)
-        )
+
+    async with sessions.session(group=0) as session:
+        assert await session.roots([1]) == [
+            (1, DigestCell.of(first.key) + DigestCell.of(second.key))
+        ]
 
 
 async def test_body_failure_rolls_back_records_and_flushed_digest(
-    provider: LmdbSessionProvider,
+    storage: LmdbStorage,
 ) -> None:
     record = _record(1)
+    sessions = SessionProvider(storage)
+
     with pytest.raises(RuntimeError, match="abort"):
-        async with GroupSessionManager(provider).session(write=True) as session:
-            await session.put(record)
+        async with sessions.session(group=0, write=True) as session:
+            await session.put_record(record)
             await session.flush()
             raise RuntimeError("abort")
-    async with provider.session() as raw:
-        assert await raw.get(KVRef(bucket_key(1, 0), Keyspace.META)) is None
-        assert (
-            await raw.get(KVRef(record.key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
-            is None
-        )
-        assert (
-            await raw.get(KVRef(record.key.to_bytes(Keyspace.LOGS), Keyspace.LOGS))
-            is None
-        )
+
+    async with sessions.session(group=0) as session:
+        assert await session.roots([1]) == [(1, DigestCell())]
+        assert await session.read_record(record.key) is None
 
 
-async def test_flush_failure_rolls_back_records(
-    provider: LmdbSessionProvider,
-) -> None:
-    ref = KVRef(bucket_key(1, 0), Keyspace.META)
-    # A malformed persisted cell makes the automatic flush fail on encoding.
+async def test_flush_failure_rolls_back_records(storage: LmdbStorage) -> None:
     maximum = DigestCell(count=2**64 - 1)
-    async with provider.session(write=True) as raw:
-        await raw.put(KVPair(ref.key, maximum.to_bytes(), Keyspace.META))
     record = _record(1)
+
+    transactional = await storage.transactional_for(0)
+    async with transactional.transaction(write=True) as txn:
+        await txn.put(KVPair(root_key(1), maximum.to_bytes(), Keyspace.META)).get()
+
     with pytest.raises(OverflowError):
-        async with GroupSessionManager(provider).session(write=True) as session:
-            await session.put(record)
-    async with provider.session() as raw:
-        assert await raw.get(ref) == KVPair(ref.key, maximum.to_bytes(), Keyspace.META)
-        assert (
-            await raw.get(KVRef(record.key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
-            is None
+        async with SessionProvider(storage).session(group=0, write=True) as session:
+            await session.put_record(record)
+
+    async with transactional.transaction() as txn:
+        assert await txn.get(KVRef(root_key(1), Keyspace.META)).get() == KVPair(
+            root_key(1), maximum.to_bytes(), Keyspace.META
         )
         assert (
-            await raw.get(KVRef(record.key.to_bytes(Keyspace.LOGS), Keyspace.LOGS))
+            await txn.get(
+                KVRef(record.key.to_bytes(Keyspace.TAGS), Keyspace.TAGS)
+            ).get()
             is None
         )
 
 
-async def test_batch_reads_preserve_missing_entries_and_duplicates(
-    provider: LmdbSessionProvider,
+async def test_record_reads_preserve_missing_entries_and_duplicates(
+    storage: LmdbStorage,
 ) -> None:
+    sessions = SessionProvider(storage)
     record, missing = _record(1), _record(2)
-    manager = GroupSessionManager(provider)
-    async with manager.session(write=True) as session:
-        await session.put(record)
-    async with manager.session() as session:
-        keys = [missing.key, record.key, record.key]
-        assert await session.get_many(keys) == [None, record, record]
-        assert await session.read(missing.key) is None
+
+    async with sessions.session(group=0, write=True) as session:
+        await session.put_record(record)
+
+    async with sessions.session(group=0) as session:
+        assert await session.read_record_many(
+            [missing.key, record.key, record.key]
+        ) == [
+            None,
+            record,
+            record,
+        ]
+        assert await session.read_record(missing.key) is None
         assert (
-            await session.get(PartitionAddress(record.key.pid, record.key.address))
+            await session.get_last_record(
+                PartitionAddress(record.key.pid, record.key.address)
+            )
             == record
         )
-        assert await session.get_many([]) == []
+        assert await session.read_record_many([]) == []
 
 
 @pytest.mark.parametrize("missing_space", [Keyspace.TAGS, Keyspace.LOGS])
-async def test_batch_read_requires_both_entries(
-    provider: LmdbSessionProvider, missing_space: Keyspace
+async def test_record_read_requires_both_entries(
+    storage: LmdbStorage, missing_space: Keyspace
 ) -> None:
     record = _record(1)
-    async with provider.session(write=True) as raw:
-        for space, value in (
-            (Keyspace.TAGS, record.tag.to_bytes()),
-            (Keyspace.LOGS, record.value.to_bytes()),
-        ):
-            if space != missing_space:
-                await raw.put(KVPair(record.key.to_bytes(space), value, space))
-    async with GroupSessionManager(provider).session() as session:
-        assert await session.get_many([record.key]) == [None]
-
-
-@pytest.mark.parametrize("limit", [0, -1])
-async def test_paged_session_reads_reject_invalid_limits(
-    provider: LmdbSessionProvider, limit: int
-) -> None:
-    async with GroupSessionManager(provider).session() as session:
-        with pytest.raises(ValueError, match="limit must be >= 1"):
-            await session.obligation_page(None, limit)
-        with pytest.raises(ValueError, match="limit must be >= 1"):
-            await session.root_page(None, limit)
-
-
-def _versioned(pid: int, wall_ms: int) -> Record:
-    return Record(
-        key=Key(
-            pid=Pid(pid),
-            address=Address(namespace=b"ns", key=f"key-{pid}-{wall_ms}".encode()),
-            ts=HLCTimestamp(wall_ms=wall_ms, counter=0, node_id="node"),
+    other_space = Keyspace.LOGS if missing_space == Keyspace.TAGS else Keyspace.TAGS
+    raw = KVPair(
+        record.key.to_bytes(other_space),
+        (
+            record.value.to_bytes()
+            if other_space == Keyspace.LOGS
+            else record.tag.to_bytes()
         ),
-        tag=Tag(kind=TagKind.LIVE),
-        value=Value(data=b"value", quorum_write=1),
+        other_space,
     )
 
+    transactional = await storage.transactional_for(0)
+    async with transactional.transaction(write=True) as txn:
+        await txn.put(raw).get()
 
-@dataclass(frozen=True)
-class _Prefix:
-    raw: bytes
-
-    def to_bytes(self) -> bytes:
-        return self.raw
-
-
-async def _meta_cells(raw: Session, prefix: bytes) -> dict[bytes, DigestCell]:
-    async with raw.batch() as batch:
-        batch.list(Keyspace.META, prefix=_Prefix(prefix))
-
-    (page,) = await batch.result()
-
-    return {kv.key: DigestCell.from_bytes(kv.value) for kv in page}
+    async with SessionProvider(storage).session(group=0) as session:
+        assert await session.read_record(record.key) is None
 
 
-async def test_pid_root_combines_its_buckets_and_roots_are_contiguous(
-    provider: LmdbSessionProvider,
+async def test_root_and_bucket_pages_are_bounded_and_contiguous(
+    storage: LmdbStorage,
 ) -> None:
+    sessions = SessionProvider(storage)
     bucket = 1 << DEFAULT_BUCKET_SHIFT
-
     records = [
-        _versioned(2, 10),
-        _versioned(1, 10),
-        _versioned(1, bucket + 10),
-        _versioned(1, 3 * bucket),
+        _record(10, pid=2),
+        _record(11, pid=1),
+        _record(12, pid=1),
+        _record(13, pid=1),
+    ]
+    records = [
+        replace(
+            record,
+            key=replace(
+                record.key,
+                ts=HLCTimestamp(
+                    wall_ms=(
+                        10 if index < 2 else bucket + 10 if index == 2 else 3 * bucket
+                    ),
+                    counter=0,
+                    node_id="node",
+                ),
+            ),
+        )
+        for index, record in enumerate(records)
     ]
 
-    manager = GroupSessionManager(provider)
+    async with sessions.session(group=0, write=True) as session:
+        await session.put_record_many(records)
 
-    async with manager.session(write=True) as session:
-        assert await session.put_many(records[:2]) == [True, True]
+    async with sessions.session(group=0) as session:
+        roots = await session.list_roots(limit=1)
+        roots += await session.list_roots(after=roots[-1][0], limit=2)
+        buckets = await session.list_buckets(1, limit=1)
+        buckets += await session.list_buckets(1, after=buckets[-1][0], limit=3)
+        assert [pid for pid, _ in roots] == [1, 2]
+        assert [bucket_id for bucket_id, _ in buckets] == [0, 1, 3]
+        assert await session.roots([1, 2]) == roots
+        with pytest.raises(ValueError, match="limit must be >= 1"):
+            await session.list_roots(limit=0)
+        assert await session.list_buckets(1, limit=0) == []
 
-    async with manager.session(write=True) as session:
-        assert await session.put_many(records[2:]) == [True, True]
 
-    async with provider.session() as raw:
-        roots = await _meta_cells(raw, ROOT_PREFIX)
-        buckets = await _meta_cells(raw, BUCKET_PREFIX)
+async def test_put_record_is_idempotent_and_does_not_refold_existing_version(
+    storage: LmdbStorage,
+) -> None:
+    sessions = SessionProvider(storage)
+    record = _record(1)
 
-    assert list(roots) == [root_key(1), root_key(2)]
-    assert roots[root_key(2)] == DigestCell.of(records[0].key)
+    async with sessions.session(group=0, write=True) as session:
+        assert await session.put_record_many([record, record]) == [True, False]
+        assert await session.put_record_many([]) == []
 
-    assert roots[root_key(1)] == (
-        DigestCell.of(records[1].key)
-        + DigestCell.of(records[2].key)
-        + DigestCell.of(records[3].key)
+    async with sessions.session(group=0, write=True) as session:
+        assert not await session.put_record(record)
+
+    async with sessions.session(group=0) as session:
+        assert await session.roots([1]) == [(1, DigestCell.of(record.key))]
+
+
+async def test_obligations_are_paged_removed_and_excluded_from_digests(
+    storage: LmdbStorage,
+) -> None:
+    sessions = SessionProvider(storage)
+    record = _record(1)
+    first, second = (
+        ObligationKey("node-a", record.key),
+        ObligationKey("node-b", record.key),
     )
 
-    assert list(buckets) == [
-        bucket_key(1, 0),
-        bucket_key(1, 1),
-        bucket_key(1, 3),
-        bucket_key(2, 0),
-    ]
+    async with sessions.session(group=0, write=True) as session:
+        await session.put_record(record)
+        await session.put_obligation_many([second, first, first])
+        await session.put_obligation_many([])
 
-    pid_one = [cell for key, cell in buckets.items() if key != bucket_key(2, 0)]
-    assert sum(pid_one, DigestCell()) == roots[root_key(1)]
+    async with sessions.session(group=0) as session:
+        assert await session.obligation_keys(limit=1) == [first]
+        assert await session.obligation_keys(after=first.to_bytes(), limit=1) == [
+            second
+        ]
+        assert await session.obligation_keys(after=second.to_bytes(), limit=1) == []
 
+    async with sessions.session(group=0, write=True) as session:
+        assert await session.remove_obligation_many([first, second]) == 2
+        assert await session.remove_obligation_many([]) == 0
 
-async def test_pid_root_flush_failure_rolls_back_records_and_cells(
-    provider: LmdbSessionProvider,
-) -> None:
-    ref = KVRef(root_key(1), Keyspace.META)
-    maximum = DigestCell(count=2**64 - 1)
-
-    async with provider.session(write=True) as raw:
-        await raw.put(KVPair(ref.key, maximum.to_bytes(), Keyspace.META))
-
-    record = _record(1)
-
-    with pytest.raises(OverflowError):
-        async with GroupSessionManager(provider).session(write=True) as session:
-            await session.put(record)
-
-    async with provider.session() as raw:
-        assert await raw.get(ref) == KVPair(ref.key, maximum.to_bytes(), Keyspace.META)
-        assert await raw.get(KVRef(bucket_key(1, 0), Keyspace.META)) is None
-
-        assert (
-            await raw.get(KVRef(record.key.to_bytes(Keyspace.TAGS), Keyspace.TAGS))
-            is None
-        )
-
-
-async def test_put_many_never_rewrites_or_refolds_an_existing_version(
-    provider: LmdbSessionProvider,
-) -> None:
-    record = _record(1)
-    manager = GroupSessionManager(provider)
-
-    async with manager.session(write=True) as session:
-        assert await session.put_many([record, record]) == [True, False]
-        assert await session.put_many([]) == []
-
-    async with manager.session(write=True) as session:
-        assert not await session.put(record)
-
-    async with provider.session() as raw:
-        kv = await raw.get(KVRef(bucket_key(1, 0), Keyspace.META))
-        assert kv is not None
-        assert DigestCell.from_bytes(kv.value) == DigestCell.of(record.key)
-
-
-async def test_obligations_are_paged_removed_and_kept_out_of_digests(
-    provider: LmdbSessionProvider,
-) -> None:
-    record = _record(1)
-    first = ObligationKey("node-a", record.key)
-    second = ObligationKey("node-b", record.key)
-    manager = GroupSessionManager(provider)
-
-    async with manager.session(write=True) as session:
-        await session.put(record)
-        assert not await session.has_obligations()
-        await session.put_obligations([second, first, first])
-        await session.put_obligations([])
-
-    async with manager.session() as session:
-        assert await session.has_obligations()
-        page, cursor = await session.obligation_page(None, 1)
-        assert page == [first]
-        assert cursor == first.to_bytes()
-        assert await session.obligation_page(cursor, 1) == (
-            [second],
-            second.to_bytes(),
-        )
-        assert await session.obligation_page(second.to_bytes(), 1) == ([], None)
-
-    async with manager.session(write=True) as session:
-        await session.remove_obligations([first, second])
-        await session.remove_obligations([])
-
-    async with manager.session() as session:
-        assert not await session.has_obligations()
-        assert await session.read(record.key) == record
-    async with provider.session() as raw:
-        kv = await raw.get(KVRef(bucket_key(1, 0), Keyspace.META))
-        assert kv is not None
-        assert DigestCell.from_bytes(kv.value) == DigestCell.of(record.key)
+    async with sessions.session(group=0) as session:
+        assert await session.obligation_keys(limit=10) == []
+        assert await session.read_record(record.key) == record
+        assert await session.roots([1]) == [(1, DigestCell.of(record.key))]
 
 
 async def test_obligation_changes_roll_back_with_the_session(
-    provider: LmdbSessionProvider,
+    storage: LmdbStorage,
 ) -> None:
+    sessions = SessionProvider(storage)
     record = _record(1)
     obligation = ObligationKey("node-a", record.key)
-    manager = GroupSessionManager(provider)
 
     with pytest.raises(RuntimeError, match="abort"):
-        async with manager.session(write=True) as session:
-            await session.put(record)
-            await session.put_obligations([obligation])
+        async with sessions.session(group=0, write=True) as session:
+            await session.put_record(record)
+            await session.put_obligation_many([obligation])
             raise RuntimeError("abort")
 
-    async with manager.session() as session:
-        assert not await session.has_obligations()
-        assert await session.read(record.key) is None
+    async with sessions.session(group=0) as session:
+        assert await session.obligation_keys(limit=10) == []
+        assert await session.read_record(record.key) is None
 
-    async with manager.session(write=True) as session:
-        await session.put_obligations([obligation])
+    async with sessions.session(group=0, write=True) as session:
+        await session.put_obligation_many([obligation])
 
     with pytest.raises(RuntimeError, match="abort"):
-        async with manager.session(write=True) as session:
-            await session.remove_obligations([obligation])
+        async with sessions.session(group=0, write=True) as session:
+            await session.remove_obligation_many([obligation])
             raise RuntimeError("abort")
 
-    async with manager.session() as session:
-        assert await session.has_obligations()
-
-
-async def test_obligation_pages_skip_unreadable_entries(
-    provider: LmdbSessionProvider,
-) -> None:
-    record = _record(1)
-    obligation = ObligationKey("node-a", record.key)
-    corrupt = MetaKind.OBLIGATION.value + b"\x00"
-
-    async with provider.session(write=True) as raw:
-        await raw.put(KVPair(corrupt, b"", Keyspace.META))
-
-    async with GroupSessionManager(provider).session(write=True) as session:
-        await session.put_obligations([obligation])
-
-    async with GroupSessionManager(provider).session() as session:
-        page, cursor = await session.obligation_page(None, 1)
-        assert page == []
-        assert cursor == corrupt
-        assert await session.obligation_page(cursor, 2) == ([obligation], None)
+    async with sessions.session(group=0) as session:
+        assert await session.obligation_keys(limit=10) == [obligation]

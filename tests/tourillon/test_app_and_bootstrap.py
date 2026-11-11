@@ -26,7 +26,7 @@ from tourillon.core.manager import Manager
 from tourillon.core.ports import TelemetryProvider
 from tourillon.core.telemetry import build_noop_telemetry
 from tourillon.core.transports.dispatcher import Dispatcher
-from tourillon.infra.storage.lmdb_storage import LMDBStorageProvider
+from tourillon.infra.storage.lmdb_storage import LmdbStorageProvider
 from tourlib.adapter import CryptographyMtlsAdapter, MsgPackSerializer, TomlPersistence
 
 
@@ -101,7 +101,7 @@ def _build_application(
         serializer=MsgPackSerializer(),
         peer_dispatcher=Dispatcher(),
         client_dispatcher=Dispatcher(),
-        storage_provider=LMDBStorageProvider(),
+        storage_provider=LmdbStorageProvider(),
         telemetry_provider=telemetry_provider,
     )
 

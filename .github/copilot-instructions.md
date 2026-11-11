@@ -41,6 +41,10 @@ full `uv run pytest` once before declaring the change done.
 - `tourillon/infra/`, `tourlib/adapter/` — concrete implementations.
 - `tourillon/bootstrap/deps.py` — the only place that chooses implementations.
 
+All local data access goes through the shared `tourillon/core/storage/store.py`
+`Store` injected by `Manager`. Request services, anti-entropy and GC must not
+open their own sessions or raw transactions.
+
 ## Wire protocol essentials
 
 One frame type, `tourlib.envelope.Envelope`: 32-byte header + UTF-8 `kind` + opaque `context` (<= 32 bytes, trace context) + serialized payload. `kind` is lowercase `domain.action`; responses are `<kind>.accept` / `<kind>.reject`.

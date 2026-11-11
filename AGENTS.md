@@ -141,7 +141,7 @@ Every Python file begins with exactly this block, before any import or docstring
 
 Domain code depends on **protocols**, never on concrete backends.
 
-- Protocols live in `tourillon/core/ports/` (`Storage`, `SessionProvider`, `Session`, `Batch`, `StorageProvider`, `Telemetry`, `TelemetryProvider`) and in `tourlib/port/` (`Serializer`, `Persistence`, `MtlsCrypto`).
+- Protocols live in `tourillon/core/ports/` (`Storage`, `Transactional`, `Transaction`, `StorageProvider`, `Telemetry`, `TelemetryProvider`) and in `tourlib/port/` (`Serializer`, `Persistence`, `MtlsCrypto`).
 - Implementations live in `tourillon/infra/` and `tourlib/adapter/`.
 - Selection happens **only** in `tourillon/bootstrap/deps.py`.
 
@@ -189,8 +189,9 @@ Purely internal kinds (`gossip.*`, `replication.*`, `antientropy.*`) intentional
 
 ### Storage
 
-- Every operation is scoped to a **partition group**: get a `SessionProvider` with `storage.session_provider_for(group)`, then `async with provider.session(write=True) as session:`.
-- Use `session.batch()` when several operations belong together; a single `await batch.result()` resolves them.
+- Services access local data only through the shared `tourillon/core/storage/store.py` `Store`, injected by `Manager`; this includes request handling, anti-entropy, GC and clock restoration.
+- `Store` routes operations to **partition groups** and owns typed sessions and retention decisions. Only the internal `SessionProvider` opens raw transactions through `Storage.transactional_for(group)`.
+- Raw `Transaction` operations return deferred results: `await result.get()` or `await transaction.results()` resolves them. Records, obligations and digest changes must commit atomically.
 - Keyspaces and key/value schema types live in `tourillon/core/models/storageschema.py`. Do not invent ad-hoc key encodings.
 
 ### Configuration and node state

@@ -24,7 +24,6 @@ from tests.helpers.telemetry import RecordingTelemetry
 from tourillon.core.models.config import RetentionConfig
 from tourillon.core.models.storageschema import (
     Key,
-    Keyspace,
     PartitionAddress,
     Pid,
     Record,
@@ -35,8 +34,9 @@ from tourillon.core.models.storageschema import (
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.services.gc import GarbageCollector
 from tourillon.core.spaces.hashspace import HashSpace
-from tourillon.core.storage.session import GroupSessionManager
-from tourillon.infra.storage.lmdb_session import LmdbConfig, LmdbSessionProvider
+from tourillon.core.storage.retention import RetentionPolicy
+from tourillon.core.storage.store import LocalStore
+from tourillon.infra.storage.lmdb_storage import LmdbConfig, LmdbTransactional
 from tourlib.exceptions import ValidationError
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
@@ -45,12 +45,12 @@ pytestmark = pytest.mark.tourillon
 
 
 class _Storage:
-    def __init__(self, provider: LmdbSessionProvider) -> None:
-        self.provider = provider
+    def __init__(self, transactional: LmdbTransactional) -> None:
+        self.transactional = transactional
 
-    async def session_provider_for(self, group: int) -> LmdbSessionProvider:
+    async def transactional_for(self, group: int) -> LmdbTransactional:
         assert group == 0
-        return self.provider
+        return self.transactional
 
 
 @pytest.fixture
@@ -62,11 +62,15 @@ def telemetry() -> RecordingTelemetry:
 async def gc(
     tmp_path: Path, telemetry: RecordingTelemetry
 ) -> AsyncIterator[GarbageCollector]:
-    provider = LmdbSessionProvider(LmdbConfig(tmp_path / "group", map_size=1 << 24), 0)
+    transactional = LmdbTransactional(LmdbConfig(tmp_path / "group", map_size=1 << 24))
+    storage = _Storage(transactional)
+    partitioner = Partitioner(pshift=1, gshift=0, hashspace=HashSpace(bits=8))
+    retention = RetentionConfig(versions=1, interval=600, batch_size=1, hotqueue_size=1)
+    store = LocalStore(storage, partitioner, RetentionPolicy(retention))
     worker = GarbageCollector(
-        _Storage(provider),
-        Partitioner(pshift=1, gshift=0, hashspace=HashSpace(bits=8)),
-        RetentionConfig(versions=1, interval=600, batch_size=1, hotqueue_size=1),
+        store,
+        partitioner,
+        retention,
         node_id="node",
         telemetry=telemetry.as_port(),
     )
@@ -74,7 +78,7 @@ async def gc(
         yield worker
     finally:
         await worker.stop()
-        await provider.close()
+        await transactional.close()
 
 
 def _record(index: int) -> Record:
@@ -88,14 +92,14 @@ def _record(index: int) -> Record:
 
 
 def _record_bytes(record: Record) -> int:
-    return len(record.to_bytes(Keyspace.TAGS)) + len(record.key.to_bytes(Keyspace.LOGS))
+    return record.size()
 
 
-async def _seed(gc: GarbageCollector) -> GroupSessionManager:
-    manager = GroupSessionManager(await gc._storage.session_provider_for(0))
-    async with manager.session(write=True) as session:
-        await session.put_many([_record(i) for i in range(1, 5)])
-    return manager
+async def _seed(gc: GarbageCollector) -> LocalStore:
+    for index in range(1, 5):
+        await gc._store.put(_record(index))
+
+    return gc._store
 
 
 async def _completed(gc: GarbageCollector) -> None:
@@ -127,8 +131,7 @@ async def test_gc_request_dry_run_then_collection_and_restart(
     )
     assert telemetry.total("gc_versions_total", event="collected") == 0
     assert telemetry.total("gc_record_bytes_removed_total") == 0
-    async with manager.session() as session:
-        assert await session.read(_record(1).key) == _record(1)
+    assert await manager.read_at(_record(1).key) == _record(1)
     gc.request()
     await _completed(gc)
     assert gc.status.scanned == 4
@@ -149,9 +152,8 @@ async def test_gc_request_dry_run_then_collection_and_restart(
         for duration, _ in telemetry.calls["gc_transaction_duration_seconds"]
     )
     assert telemetry.spans == []
-    async with manager.session() as session:
-        assert await session.read(_record(1).key) is None
-        assert await session.read(_record(4).key) == _record(4)
+    assert await manager.read_at(_record(1).key) is None
+    assert await manager.read_at(_record(4).key) == _record(4)
     await gc.stop()
     await gc.start()
     gc.request()
@@ -182,12 +184,10 @@ async def test_generic_hot_queue_deduplicates_and_bounds_memory(
     await gc.start()
     async with asyncio.timeout(3):
         while True:
-            async with manager.session() as session:
-                if await session.read(_record(3).key) is None:
-                    break
+            if await manager.read_at(_record(3).key) is None:
+                break
             await asyncio.sleep(0.001)
-    async with manager.session() as session:
-        assert await session.read(_record(4).key) == _record(4)
+    assert await manager.read_at(_record(4).key) == _record(4)
     assert telemetry.total("gc_versions_total", source="hot", event="collected") == 3
     assert telemetry.total(
         "gc_record_bytes_removed_total", source="hot"
@@ -219,12 +219,13 @@ async def test_gc_failure_is_visible_and_can_be_retried(
     telemetry: RecordingTelemetry,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    original = gc._storage.session_provider_for
+    storage = gc._store._storage
+    original = storage.transactional_for
 
-    async def fail(group: int):
+    async def fail(group: int) -> LmdbTransactional:
         raise OSError("unavailable")
 
-    monkeypatch.setattr(gc._storage, "session_provider_for", fail)
+    monkeypatch.setattr(storage, "transactional_for", fail)
     await gc.start()
     gc.request()
     await _completed(gc)
@@ -234,7 +235,7 @@ async def test_gc_failure_is_visible_and_can_be_retried(
     assert telemetry.total("gc_passes_total", outcome="failed") == 1
     assert telemetry.total("gc_versions_total", event="collected") == 0
     assert "gc.transaction failed node=node group=0 source=scan" in caplog.text
-    monkeypatch.setattr(gc._storage, "session_provider_for", original)
+    monkeypatch.setattr(storage, "transactional_for", original)
     gc.request()
     await _completed(gc)
     assert gc.status.state == "completed"
@@ -244,8 +245,8 @@ async def test_failed_gc_commit_does_not_report_removals(
     gc: GarbageCollector, telemetry: RecordingTelemetry, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = await _seed(gc)
-    provider = await gc._storage.session_provider_for(0)
-    original = provider.session
+    transactional = await gc._store._storage.transactional_for(0)
+    original = transactional.transaction
 
     @asynccontextmanager
     async def fail_commit(write: bool = False):
@@ -253,34 +254,34 @@ async def test_failed_gc_commit_does_not_report_removals(
             yield session
             raise OSError("commit failed")
 
-    monkeypatch.setattr(provider, "session", fail_commit)
+    monkeypatch.setattr(transactional, "transaction", fail_commit)
     await gc.start()
     gc.request()
     await _completed(gc)
     assert gc.status.state == "failed"
     assert telemetry.total("gc_versions_total", event="collected") == 0
     assert telemetry.total("gc_record_bytes_removed_total") == 0
-    monkeypatch.setattr(provider, "session", original)
-    async with manager.session() as session:
-        assert await session.read(_record(1).key) == _record(1)
+    monkeypatch.setattr(transactional, "transaction", original)
+    assert await manager.read_at(_record(1).key) == _record(1)
 
 
 async def test_hot_gc_failure_is_measured_and_periodic_pass_can_retry(
     gc: GarbageCollector, telemetry: RecordingTelemetry, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await _seed(gc)
-    original = gc._storage.session_provider_for
+    storage = gc._store._storage
+    original = storage.transactional_for
 
-    async def fail(group: int):
+    async def fail(group: int) -> LmdbTransactional:
         raise OSError("unavailable")
 
-    monkeypatch.setattr(gc._storage, "session_provider_for", fail)
+    monkeypatch.setattr(storage, "transactional_for", fail)
     gc.submit(PartitionAddress(Pid(0), _record(1).key.address))
     await gc._hot_step()
     assert telemetry.total("gc_errors_total", source="hot") == 1
     assert telemetry.total("gc_record_bytes_removed_total") == 0
     assert telemetry.calls["gc_hot_queue_size"][-1][0] == 0
-    monkeypatch.setattr(gc._storage, "session_provider_for", original)
+    monkeypatch.setattr(storage, "transactional_for", original)
     await gc.start()
     gc.request()
     await _completed(gc)
@@ -292,11 +293,11 @@ async def test_cancelled_gc_pass_records_duration_without_errors_or_removals(
 ) -> None:
     entered = asyncio.Event()
 
-    async def blocked(group: int):
+    async def blocked(group: int) -> LmdbTransactional:
         entered.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(gc._storage, "session_provider_for", blocked)
+    monkeypatch.setattr(gc._store._storage, "transactional_for", blocked)
     await gc.start()
     gc.request()
     async with asyncio.timeout(3):

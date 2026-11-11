@@ -37,13 +37,10 @@ from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.partition.placement import PlacementStrategy
 from tourillon.core.peer.pool import PeerPool
 from tourillon.core.ports import Telemetry
-from tourillon.core.ports.storage import Storage
 from tourillon.core.services.antientropy import AntiEntropyService
 from tourillon.core.services.gc import GarbageCollector
 from tourillon.core.services.store import StorageService
-from tourillon.core.storage.retention import RetentionPolicy
-from tourillon.core.storage.session import DEFAULT_BUCKET_SHIFT
-from tourillon.core.storage.store import Store
+from tourillon.core.storage.store import LocalStore
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourillon.core.transports.server import EnvelopeServer
 from tourlib import Serializer, ValidationError
@@ -79,7 +76,7 @@ class NodeLifecycle:
         peer_pool: PeerPool,
         topologymgr: TopologyManager,
         partitioner: Partitioner,
-        storage: Storage,
+        local_store: LocalStore,
         gossip_stats: GossipStats,
         telemetry: Telemetry,
         store: StorageService,
@@ -122,11 +119,9 @@ class NodeLifecycle:
 
         # The only mechanism that copies versions between nodes: it delivers
         # obligations, fills a joining node and empties a draining one.
-        retention = RetentionPolicy(config.placement.retention)
-        store = Store(storage, partitioner, retention, DEFAULT_BUCKET_SHIFT)
         self._antientropy = AntiEntropyService(
             node_id=config.node.id,
-            store=store,
+            store=local_store,
             partitioner=partitioner,
             topologymgr=topologymgr,
             peer_pool=peer_pool,
@@ -135,7 +130,7 @@ class NodeLifecycle:
             config=config.placement.anti_entropy,
             obligations=obligations,
             telemetry=telemetry,
-            notify=gc.submit,
+            gc=gc,
         )
 
         self._state_file = Path(self._config.storage.data_dir) / NODE_STATE_FILENAME

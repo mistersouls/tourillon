@@ -28,9 +28,9 @@ from tourillon.core.log import logger
 from tourillon.core.models.config import RetentionConfig
 from tourillon.core.models.storageschema import Keyspace, PartitionAddress
 from tourillon.core.partition.partitioner import Partitioner
-from tourillon.core.ports.storage import Storage
+from tourillon.core.ports.gc import CollectionScheduler
 from tourillon.core.ports.telemetry import Telemetry
-from tourillon.core.storage.retention import RetentionPolicy
+from tourillon.core.storage.store import LocalStore
 
 
 @dataclass(frozen=True)
@@ -51,20 +51,19 @@ class CollectionStatus:
         return asdict(self)
 
 
-class GarbageCollector:
+class GarbageCollector(CollectionScheduler):
     def __init__(
         self,
-        storage: Storage,
+        store: LocalStore,
         partitioner: Partitioner,
         config: RetentionConfig,
         *,
         node_id: str,
         telemetry: Telemetry,
     ) -> None:
-        self._storage = storage
+        self._store = store
         self._node_id = node_id
         self._telemetry = telemetry
-        self._retention = RetentionPolicy(config)
         self._partitioner = partitioner
         self.config = config
         self._hot: OrderedDict[PartitionAddress, None] = OrderedDict()
@@ -110,7 +109,7 @@ class GarbageCollector:
             logger.info(
                 "gc.started node=%s versions=%d interval=%.2fs batch_size=%d",
                 self._node_id,
-                self._retention.versions,
+                self._store.retention_versions,
                 self.config.interval,
                 self.config.batch_size,
             )
@@ -203,12 +202,12 @@ class GarbageCollector:
             after: bytes | None = None
 
             while True:
-                async with self._session(
-                    group, "scan", self._status.dry_run
-                ) as session:
-                    keys = await session.log_page(after, self.config.batch_size)
-                    count, size = await self._retention.collect(
-                        session, keys, dry_run=self._status.dry_run
+                async with self._transaction(group, "scan", self._status.dry_run):
+                    keys, count, size = await self._store.collect_page(
+                        group,
+                        after,
+                        self.config.batch_size,
+                        dry_run=self._status.dry_run,
                     )
 
                 self._record_collection(
@@ -250,11 +249,12 @@ class GarbageCollector:
 
     async def _collect_address(self, address: PartitionAddress) -> None:
         group = self._partitioner.group_for(address.pid.value)
-        async with self._session(group, "hot", False) as session:
-            records = await session.oldest_keys(address, self.config.batch_size)
-            count, size = await self._retention.collect(session, records)
+        async with self._transaction(group, "hot", False):
+            scanned, count, size = await self._store.collect_address(
+                address, self.config.batch_size
+            )
 
-        self._record_collection("hot", False, len(records), count, size)
+        self._record_collection("hot", False, scanned, count, size)
 
         if count == self.config.batch_size:
             self.submit(address)
@@ -280,17 +280,13 @@ class GarbageCollector:
             )
 
     @asynccontextmanager
-    async def _session(
+    async def _transaction(
         self, group: int, source: str, dry_run: bool
-    ) -> AsyncIterator[GroupSession]:
+    ) -> AsyncIterator[None]:
         started = monotonic()
         outcome = "completed"
         try:
-            provider = await self._storage.session_provider_for(group)
-            async with GroupSessionManager(provider).session(
-                write=not dry_run
-            ) as session:
-                yield session
+            yield
         except asyncio.CancelledError:
             outcome = "cancelled"
             raise

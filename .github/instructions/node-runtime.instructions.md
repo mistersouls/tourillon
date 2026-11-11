@@ -25,17 +25,12 @@ Services receive their collaborators by constructor injection. Do not reach for 
 
 ## Storage access
 
-```python
-provider = await storage.session_provider_for(group)
-async with provider.session(write=True) as session:
-    async with session.batch() as batch:
-        batch.put(kv)
-        batch.get(ref)
-        results = await batch.get()
-```
+Services receive the same `core/storage/store.py` `Store` from `Manager`.
+Use its data operations; never open a session or transaction in a service.
 
-- Every operation is scoped to a **partition group**. Never bypass `session_provider_for`.
-- Use `batch()` when multiple operations belong to the same logical unit; a single `await batch.result()` resolves them.
+- `Store` owns partition-group routing, exact reads and writes, AE application, obligations, digests, retention and clock restoration.
+- Its internal `SessionProvider` opens a typed `Session` through `Storage.transactional_for(group)` and `Transactional.transaction(write=...)`.
+- Raw operations return deferred results, resolved by `await result.get()` or `await transaction.results()`. Keep related record, obligation and digest mutations in one transaction.
 - Key and value encodings come from `tourillon/core/models/storageschema.py` (`Keyspace`, `KVPair`, `KVRef`). Never invent an ad-hoc byte layout.
 - Write sessions must be short-lived; do not hold one across a network call.
 

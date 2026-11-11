@@ -17,6 +17,7 @@ import asyncio
 import pytest
 
 from tourillon.core.config import StorageConfig
+from tourillon.core.models.config import RetentionConfig
 from tourillon.core.models.storageschema import (
     Key,
     Keyspace,
@@ -29,44 +30,52 @@ from tourillon.core.models.storageschema import (
     TagKind,
     Value,
 )
-from tourillon.core.storage.session import GroupSessionManager
-from tourillon.infra.storage.lmdb_session import (
+from tourillon.core.partition.partitioner import Partitioner
+from tourillon.core.spaces.hashspace import HashSpace
+from tourillon.core.storage.retention import RetentionPolicy
+from tourillon.core.storage.session import SessionProvider
+from tourillon.core.storage.store import LocalStore
+from tourillon.infra.storage.lmdb_storage import (
     LmdbConfig,
-    LmdbSession,
-    LmdbSessionProvider,
+    LmdbStorage,
+    LmdbStorageProvider,
+    LmdbTransactional,
 )
-from tourillon.infra.storage.lmdb_storage import LMDBStorage, LMDBStorageProvider
-from tourillon.infra.storage.lmdb_transaction import LmdbTransaction
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
 
 
-def _record(pid: int, idx: int, kind: TagKind = TagKind.LIVE):
+def _record(pid: int, idx: int, kind: TagKind = TagKind.LIVE) -> Record:
     key = Key(
         pid=Pid(pid),
         address=Address(namespace=b"ns", key=f"k-{pid}-{idx}".encode()),
         ts=HLCTimestamp(wall_ms=100 + idx, counter=idx, node_id="n"),
     )
-    value = Value(data=f"value-{pid}-{idx}".encode(), quorum_write=idx + 1)
-    tag = Tag(kind=kind)
-    return key, value, tag
-
-
-def _tag_kv(key: Key, tag: Tag) -> KVPair:
-    return KVPair(
-        key=key.to_bytes(Keyspace.TAGS), value=tag.to_bytes(), keyspace=Keyspace.TAGS
+    return Record(
+        key=key,
+        value=Value(data=f"value-{pid}-{idx}".encode(), quorum_write=idx + 1),
+        tag=Tag(kind=kind),
     )
 
 
-def _log_kv(key: Key, value: Value) -> KVPair:
+def _tag_kv(record: Record) -> KVPair:
     return KVPair(
-        key=key.to_bytes(Keyspace.LOGS), value=value.to_bytes(), keyspace=Keyspace.LOGS
+        record.key.to_bytes(Keyspace.TAGS),
+        record.tag.to_bytes(),
+        Keyspace.TAGS,
     )
 
 
-def _provider(tmp_path, group: int = 0) -> LmdbSessionProvider:
-    config = LmdbConfig(path=tmp_path / str(group), map_size=8 * 1024 * 1024)
-    return LmdbSessionProvider(config=config, group=group)
+def _log_kv(record: Record) -> KVPair:
+    return KVPair(
+        record.key.to_bytes(Keyspace.LOGS),
+        record.value.to_bytes(),
+        Keyspace.LOGS,
+    )
+
+
+def _config(tmp_path) -> StorageConfig:
+    return StorageConfig(data_dir=str(tmp_path), group_size="8Mi")
 
 
 @pytest.mark.tourillon
@@ -79,369 +88,266 @@ async def test_key_only_pages_match_pair_pages_without_changing_values(
     limit: int,
     prefix: Pid | None,
 ) -> None:
-    provider = _provider(tmp_path)
+    transactional = LmdbTransactional(
+        LmdbConfig(path=tmp_path / "group", map_size=8 * 1024 * 1024)
+    )
     pairs = [
         KVPair(Pid(pid).to_bytes() + suffix, b"payload" * 1024, Keyspace.LOGS)
         for pid, suffix in [(0, b"a"), (1, b"a"), (1, b"b"), (2, b"a")]
     ]
+
     try:
-        async with provider.session(write=True) as session:
+        async with transactional.transaction(write=True) as txn:
             for pair in pairs:
-                await session.put(pair)
+                await txn.put(pair).get()
 
-        async with provider.session() as session:
-            async with session.batch() as batch:
-                batch.list(Keyspace.LOGS, prefix=prefix, limit=limit, reverse=reverse)
-                batch.keys(Keyspace.LOGS, prefix=prefix, limit=limit, reverse=reverse)
-
-            listed, batched_keys = await batch.result()
-            direct_keys = await session.keys(
+        async with transactional.transaction() as txn:
+            listed = await txn.list(
                 Keyspace.LOGS, prefix=prefix, limit=limit, reverse=reverse
-            )
-            assert (
-                direct_keys
-                == batched_keys
-                == [KVRef(pair.key, pair.keyspace) for pair in listed]
-            )
-            for pair in listed:
-                assert pair.value == b"payload" * 1024
+            ).get()
+            keys = await txn.keys(
+                Keyspace.LOGS, prefix=prefix, limit=limit, reverse=reverse
+            ).get()
+            assert keys == [KVRef(pair.key, pair.keyspace) for pair in listed]
+            assert all(pair.value == b"payload" * 1024 for pair in listed)
     finally:
-        await provider.close()
+        await transactional.close()
 
 
 @pytest.mark.tourillon
 @pytest.mark.parametrize("reverse", [False, True])
-async def test_key_only_pages_preserve_start_bounds_and_deleted_cursor(
+async def test_bounded_pages_preserve_start_bounds_and_deleted_cursor(
     tmp_path,
     reverse: bool,
 ) -> None:
-    provider = _provider(tmp_path)
+    transactional = LmdbTransactional(
+        LmdbConfig(path=tmp_path / "group", map_size=8 * 1024 * 1024)
+    )
     prefix = Pid(1)
     keys = [prefix.to_bytes() + suffix for suffix in (b"a", b"b", b"c")]
+
     try:
-        async with provider.session(write=True) as session:
+        async with transactional.transaction(write=True) as txn:
             for key in keys:
-                await session.put(KVPair(key, b"value", Keyspace.LOGS))
-            await session.put(KVPair(Pid(2).to_bytes() + b"a", b"other", Keyspace.LOGS))
+                await txn.put(KVPair(key, b"value", Keyspace.LOGS)).get()
+            await txn.put(
+                KVPair(Pid(2).to_bytes() + b"a", b"other", Keyspace.LOGS)
+            ).get()
 
             for start in (keys[1], prefix.to_bytes() + b"bb", b"\xff" * 8):
-                async with session.batch() as batch:
-                    batch.list(
-                        Keyspace.LOGS, prefix=prefix, start=start, reverse=reverse
-                    )
-                (listed,) = await batch.result()
-                assert await session.keys(
+                listed = await txn.list(
                     Keyspace.LOGS, prefix=prefix, start=start, reverse=reverse
-                ) == [KVRef(pair.key, pair.keyspace) for pair in listed]
+                ).get()
+                listed_keys = await txn.keys(
+                    Keyspace.LOGS, prefix=prefix, start=start, reverse=reverse
+                ).get()
+                assert listed_keys == [
+                    KVRef(pair.key, pair.keyspace) for pair in listed
+                ]
 
-            await session.delete(KVRef(keys[1], Keyspace.LOGS))
-            resumed = await session.keys(
+            await txn.delete(KVRef(keys[1], Keyspace.LOGS)).get()
+            resumed = await txn.keys(
                 Keyspace.LOGS, prefix=prefix, start=keys[1], reverse=reverse
-            )
+            ).get()
             assert resumed == [KVRef(keys[0] if reverse else keys[2], Keyspace.LOGS)]
     finally:
-        await provider.close()
+        await transactional.close()
 
 
 @pytest.mark.tourillon
-@pytest.mark.asyncio
 async def test_lmdb_transaction_round_trips_and_filters_records(tmp_path) -> None:
-    provider = _provider(tmp_path)
+    transactional = LmdbTransactional(
+        LmdbConfig(path=tmp_path / "group", map_size=8 * 1024 * 1024)
+    )
+
     try:
-        key1, value1, tag1 = _record(1, 1, TagKind.LIVE)
-        key2, value2, tag2 = _record(1, 2, TagKind.TOMBSTONE)
-        key3, value3, tag3 = _record(2, 1, TagKind.LIVE)
+        live, tombstone, other = (
+            _record(1, 1),
+            _record(1, 2, TagKind.TOMBSTONE),
+            _record(2, 1),
+        )
 
-        with provider._env.begin(write=True) as txn:  # noqa: SLF001
-            store = LmdbTransaction(
-                txn=txn,
-                dbi_logs=provider._dbi_logs,  # noqa: SLF001
-                dbi_tags=provider._dbi_tags,  # noqa: SLF001
-                dbi_meta=provider._dbi_meta,  # noqa: SLF001
-            )
-            store.put(_tag_kv(key1, tag1))
-            store.put(_tag_kv(key2, tag2))
-            store.put(_tag_kv(key3, tag3))
-            store.put(_log_kv(key1, value1))
-            assert store.exists(KVRef(key1.to_bytes(Keyspace.LOGS), Keyspace.LOGS))
-            assert not store.exists(KVRef(key2.to_bytes(Keyspace.LOGS), Keyspace.LOGS))
+        async with transactional.transaction(write=True) as txn:
+            for record in (live, tombstone, other):
+                await txn.put(_tag_kv(record)).get()
+            await txn.put(_log_kv(live)).get()
 
-            assert store.get(
-                KVRef(key=key1.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)
-            ) == _log_kv(key1, value1)
-            assert store.list(Keyspace.TAGS, prefix=Pid(1), limit=0) == []
+            live_ref = KVRef(live.key.to_bytes(Keyspace.LOGS), Keyspace.LOGS)
+            missing_ref = KVRef(tombstone.key.to_bytes(Keyspace.LOGS), Keyspace.LOGS)
+            assert await txn.exists(live_ref).get()
+            assert not await txn.exists(missing_ref).get()
+            assert await txn.get(live_ref).get() == _log_kv(live)
+            assert await txn.list(Keyspace.TAGS, prefix=Pid(1), limit=0).get() == []
 
-            listed = store.list(Keyspace.TAGS, prefix=Pid(1), limit=10)
+            listed = await txn.list(Keyspace.TAGS, prefix=Pid(1), limit=10).get()
             assert [item.key for item in listed] == [
-                key1.to_bytes(Keyspace.TAGS),
-                key2.to_bytes(Keyspace.TAGS),
+                live.key.to_bytes(Keyspace.TAGS),
+                tombstone.key.to_bytes(Keyspace.TAGS),
             ]
 
-            after_first = store.list(
+            after_first = await txn.list(
                 Keyspace.TAGS,
                 prefix=Pid(1),
-                start=key1.to_bytes(Keyspace.TAGS),
+                start=live.key.to_bytes(Keyspace.TAGS),
                 limit=10,
-            )
-            assert [item.key for item in after_first] == [key2.to_bytes(Keyspace.TAGS)]
+            ).get()
+            assert [item.key for item in after_first] == [
+                tombstone.key.to_bytes(Keyspace.TAGS)
+            ]
 
-            reverse = store.list(Keyspace.TAGS, prefix=Pid(1), reverse=True, limit=1)
-            assert reverse == [_tag_kv(key2, tag2)]
+            reverse = await txn.list(
+                Keyspace.TAGS, prefix=Pid(1), reverse=True, limit=1
+            ).get()
+            assert reverse == [_tag_kv(tombstone)]
 
-            last_live = store.last(
+            last_live = await txn.last(
                 Keyspace.TAGS,
                 prefix=Pid(1),
                 predicate=lambda kv: Tag.from_bytes(kv.value).kind == TagKind.LIVE,
-            )
-            assert last_live == _tag_kv(key1, tag1)
+            ).get()
+            assert last_live == _tag_kv(live)
 
-            store.delete(
-                KVRef(key=key1.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)
-            )
-            assert not store.exists(KVRef(key1.to_bytes(Keyspace.LOGS), Keyspace.LOGS))
-            assert (
-                store.get(
-                    KVRef(key=key1.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)
-                )
-                is None
-            )
+            assert await txn.delete(live_ref).get() == _log_kv(live)
+            assert not await txn.exists(live_ref).get()
+            assert await txn.get(live_ref).get() is None
     finally:
-        await provider.close()
+        await transactional.close()
 
 
 @pytest.mark.tourillon
-@pytest.mark.asyncio
-async def test_lmdb_session_iter_last_and_abort_paths(tmp_path) -> None:
-    provider = _provider(tmp_path)
-    key1, value1, tag1 = _record(1, 1, TagKind.LIVE)
-    key2, value2, tag2 = _record(1, 2, TagKind.TOMBSTONE)
-    key3, value3, tag3 = _record(1, 3, TagKind.STALE)
+async def test_session_reads_bounded_pages_and_aborts_failed_writes(tmp_path) -> None:
+    storage = LmdbStorage(_config(tmp_path))
+    sessions = SessionProvider(storage)
+    records = [_record(1, index) for index in range(1, 4)]
 
     try:
-        async with provider.session(write=True) as session:
-            await session.put(_tag_kv(key1, tag1))
-            await session.put(_tag_kv(key2, tag2))
-            await session.put(_tag_kv(key3, tag3))
-            await session.put(_log_kv(key1, value1))
-            await session.put(_log_kv(key2, value2))
-            await session.put(_log_kv(key3, value3))
+        async with sessions.session(group=0, write=True) as session:
+            assert await session.put_record_many(records) == [True, True, True]
 
-        async with provider.session(write=False) as session:
-            assert await session.get(
-                KVRef(key=key1.to_bytes(Keyspace.LOGS), keyspace=Keyspace.LOGS)
-            ) == _log_kv(key1, value1)
-
-            forward = [
-                kv
-                async for kv in session.iter(
-                    Keyspace.TAGS,
-                    prefix=Pid(1),
-                    batch_size=1,
-                    limit=2,
-                )
-            ]
-            assert [item.key for item in forward] == [
-                key1.to_bytes(Keyspace.TAGS),
-                key2.to_bytes(Keyspace.TAGS),
-            ]
-
-            reverse = [
-                kv
-                async for kv in session.iter(
-                    Keyspace.TAGS,
-                    prefix=Pid(1),
-                    reverse=True,
-                    batch_size=1,
-                )
-            ]
-            assert [item.key for item in reverse] == [
-                key3.to_bytes(Keyspace.TAGS),
-                key2.to_bytes(Keyspace.TAGS),
-                key1.to_bytes(Keyspace.TAGS),
-            ]
-
-            last_owned = await session.last(
-                Keyspace.TAGS,
+        async with sessions.session(group=0) as session:
+            first = await session.keys(prefix=Pid(1), limit=2)
+            second = await session.keys(
                 prefix=Pid(1),
-                predicate=lambda kv: Tag.from_bytes(kv.value).kind != TagKind.STALE,
+                after=first[-1].to_bytes(Keyspace.TAGS),
+                limit=2,
             )
-            assert last_owned == _tag_kv(key2, tag2)
+            assert first == [record.key for record in records[:2]]
+            assert second == [records[2].key]
+            assert await session.read_record(records[0].key) == records[0]
 
+        aborted = _record(2, 4)
         with pytest.raises(RuntimeError, match="boom"):
-            async with provider.session(write=True) as session:
-                key4, value4, tag4 = _record(2, 4, TagKind.LIVE)
-                await session.put(_tag_kv(key4, tag4))
-                await session.put(_log_kv(key4, value4))
+            async with sessions.session(group=0, write=True) as session:
+                await session.put_record(aborted)
                 raise RuntimeError("boom")
 
-        async with provider.session(write=False) as session:
-            aborted = await session.get(
-                KVRef(
-                    key=Key(
-                        pid=Pid(2),
-                        address=Address(namespace=b"ns", key=b"k-2-4"),
-                        ts=HLCTimestamp(wall_ms=104, counter=4, node_id="n"),
-                    ).to_bytes(Keyspace.TAGS),
-                    keyspace=Keyspace.TAGS,
-                )
-            )
-            assert aborted is None
-
-        assert LmdbSession._next_page_key(b"\x00\xff", reverse=False) == b"\x01"
-        assert LmdbSession._next_page_key(b"\x01\x00", reverse=True) == b"\x00\xff"
-        assert LmdbSession._setup_limit(None, 4) == (4, None)
-        assert LmdbSession._setup_limit(-1, 4) == (4, None)
-        assert LmdbSession._setup_limit(2, 4) == (2, 2)
+        async with sessions.session(group=0) as session:
+            assert await session.read_record(aborted.key) is None
     finally:
-        await provider.close()
+        await storage.close()
 
 
 @pytest.mark.tourillon
-@pytest.mark.asyncio
-async def test_lmdb_session_provider_rejects_new_sessions_after_close(tmp_path) -> None:
-    provider = _provider(tmp_path)
-    await provider.close()
-
-    with pytest.raises(RuntimeError, match="closed"):
-        async with provider.session():
-            raise AssertionError("unreachable")
-
-
-@pytest.mark.tourillon
-@pytest.mark.asyncio
-async def test_lmdb_storage_caches_providers_reports_latest_hlc_and_closes(
+async def test_lmdb_storage_caches_transactionals_restores_hlc_and_closes(
     tmp_path,
 ) -> None:
-    config = StorageConfig(data_dir=str(tmp_path), group_size="8Mi")
-    storage = LMDBStorage(config)
+    storage = LmdbStorage(_config(tmp_path))
+    partitioner = Partitioner(pshift=16, gshift=1, hashspace=HashSpace())
+    store = LocalStore(storage, partitioner, RetentionPolicy(RetentionConfig(versions=2)))
+    key_b = _record(50000, 3).key
 
-    provider0 = await storage.session_provider_for(0)
-    provider1 = await storage.session_provider_for(1)
-    assert provider0 is await storage.session_provider_for(0)
-
-    key_a, _, tag_a = _record(1, 1, TagKind.LIVE)
-    key_b, _, tag_b = _record(50000, 3, TagKind.LIVE)
-
-    async with provider0.session(write=True) as session:
-        await session.put(_tag_kv(key_a, tag_a))
-    async with provider1.session(write=True) as session:
-        await session.put(_tag_kv(key_b, tag_b))
-
-    latest = await storage.latest_hlc(total_groups=2)
-    assert latest == key_b.ts
-
-    await storage.close()
-    await storage.close()
-
-    with pytest.raises(RuntimeError, match="closed"):
-        await storage.session_provider_for(0)
-
-
-@pytest.mark.tourillon
-async def test_latest_hlc_restores_the_clock_of_versions_held_for_obligations(
-    tmp_path,
-) -> None:
-    config = StorageConfig(data_dir=str(tmp_path), group_size="8Mi")
-    storage = LMDBStorage(config)
-    records = [
-        Record(key=k, value=v, tag=t) for k, v, t in (_record(1, 1), _record(1, 4))
-    ]
     try:
-        manager = GroupSessionManager(await storage.session_provider_for(0))
-        async with manager.session(write=True) as session:
-            await session.put_many(records)
-            await session.put_obligations(
+        transactional0 = await storage.transactional_for(0)
+        transactional1 = await storage.transactional_for(1)
+        assert transactional0 is await storage.transactional_for(0)
+        assert transactional0 is not transactional1
+
+        async with SessionProvider(storage).session(group=0, write=True) as session:
+            await session.put_record(_record(1, 1))
+        async with SessionProvider(storage).session(group=1, write=True) as session:
+            await session.put_record(_record(50000, 3))
+
+        assert await store.latest_hlc() == key_b.ts
+    finally:
+        await storage.close()
+        await storage.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        await storage.transactional_for(0)
+
+
+@pytest.mark.tourillon
+async def test_latest_hlc_restores_versions_held_for_obligations(tmp_path) -> None:
+    config = _config(tmp_path)
+    storage = LmdbStorage(config)
+    partitioner = Partitioner(pshift=16, gshift=0, hashspace=HashSpace())
+    records = [_record(1, 1), _record(1, 4)]
+
+    try:
+        async with SessionProvider(storage).session(group=0, write=True) as session:
+            await session.put_record_many(records)
+            await session.put_obligation_many(
                 [ObligationKey("peer", record.key) for record in records]
             )
     finally:
         await storage.close()
-    reopened = LMDBStorage(config)
+
+    reopened = LmdbStorage(config)
     try:
-        assert await reopened.latest_hlc(1) == records[-1].key.ts
+        assert (
+            await LocalStore(
+                reopened,
+                partitioner,
+                RetentionPolicy(RetentionConfig(versions=2)),
+            ).latest_hlc()
+            == records[-1].key.ts
+        )
     finally:
         await reopened.close()
 
 
 @pytest.mark.tourillon
-@pytest.mark.asyncio
-async def test_lmdb_storage_wraps_provider_initialization_failures(
+async def test_lmdb_storage_wraps_transactional_initialization_failures(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = StorageConfig(data_dir=str(tmp_path), group_size="8Mi")
-    storage = LMDBStorage(config)
+    storage = LmdbStorage(_config(tmp_path))
 
-    def boom(*args, **kwargs):
+    def broken(*args, **kwargs):
         raise OSError("broken")
 
     monkeypatch.setattr(
-        "tourillon.infra.storage.lmdb_storage.LmdbSessionProvider", boom
+        "tourillon.infra.storage.lmdb_storage.LmdbTransactional", broken
     )
 
-    with pytest.raises(
-        RuntimeError, match="Failed to initialize LMDB session provider"
-    ):
-        await storage.session_provider_for(0)
+    with pytest.raises(RuntimeError, match="Failed to initialize LMDB transactional"):
+        await storage.transactional_for(0)
 
 
 @pytest.mark.tourillon
 def test_lmdb_storage_provider_creates_directory_and_storage(tmp_path) -> None:
     config = StorageConfig(data_dir=str(tmp_path / "data"), group_size="8Mi")
-    provider = LMDBStorageProvider()
 
-    storage = provider.create(config)
+    storage = LmdbStorageProvider().create(config)
 
     assert (tmp_path / "data").exists()
-    assert isinstance(storage, LMDBStorage)
+    assert isinstance(storage, LmdbStorage)
 
 
 @pytest.mark.tourillon
-def test_lmdb_session_abort_on_cancelled_error() -> None:
-    """Test that LMDB session properly aborts on CancelledError.
+async def test_cancelled_transaction_aborts_pending_writes(tmp_path) -> None:
+    transactional = LmdbTransactional(
+        LmdbConfig(path=tmp_path / "group", map_size=8 * 1024 * 1024)
+    )
+    record = _record(1, 1)
+    ref = KVRef(record.key.to_bytes(Keyspace.TAGS), Keyspace.TAGS)
 
-    Root cause: CancelledError inherits from BaseException, NOT Exception.
-    Exception handlers using `except Exception` will NOT catch it.
-    This test verifies that the fix using `except BaseException` works correctly.
-    """
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            async with transactional.transaction(write=True) as txn:
+                await txn.put(_tag_kv(record)).get()
+                raise asyncio.CancelledError()
 
-    # BUGGY CODE: abort is NOT called
-    abort_called_buggy = False
-
-    def buggy_exception_handler():
-        nonlocal abort_called_buggy
-        try:
-            raise asyncio.CancelledError()
-        except Exception:  # BUG: does NOT catch CancelledError
-            abort_called_buggy = True
-            raise
-
-    # Verify CancelledError escapes
-    with pytest.raises(asyncio.CancelledError):
-        buggy_exception_handler()
-
-    # Verify abort was NOT called (this is the bug)
-    assert not abort_called_buggy, "Buggy code: abort should NOT have been called"
-
-    # FIXED CODE: abort IS called
-    abort_called_fixed = False
-
-    def fixed_exception_handler():
-        nonlocal abort_called_fixed
-        try:
-            raise asyncio.CancelledError()
-        except BaseException:  # FIX: catches CancelledError
-            abort_called_fixed = True
-            raise
-
-    # CancelledError still escapes (that's correct)
-    with pytest.raises(asyncio.CancelledError):
-        fixed_exception_handler()
-
-    # Verify abort WAS called (this is the fix)
-    assert (
-        abort_called_fixed
-    ), "Fixed code: abort SHOULD be called with except BaseException"
-
-    # Final verification
-    assert (
-        not abort_called_buggy and abort_called_fixed
-    ), "Test verifies: buggy code doesn't call abort, fixed code does"
+        async with transactional.transaction() as txn:
+            assert await txn.get(ref).get() is None
+    finally:
+        await transactional.close()
