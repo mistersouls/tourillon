@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from typing import Callable, Awaitable, Mapping, Any, Iterable
 
-from tourillon.core.ae.sync import SyncProgress, PeerSync, SessionTally, SessionLimits
+from tourillon.core.ae.sync import SyncProgress, PeerSync, SessionTally, SessionLimits, Goal
 from tourillon.core.ae.tracker import ViewTracker
 from tourillon.core.ae.view import ReplicaView
 from tourillon.core.exceptions import AntiEntropyRejectError, ViewChangedError, BudgetSpentError
@@ -44,6 +44,10 @@ _SESSION_PHASES = frozenset(
     {MemberPhase.JOINING, MemberPhase.READY, MemberPhase.DRAINING}
 )
 
+_SOURCE_PHASES = frozenset({MemberPhase.READY, MemberPhase.DRAINING})
+
+_YIELD_EVERY = 4096
+
 
 @dataclass
 class AeStats:
@@ -60,6 +64,8 @@ class AeStats:
     bytes_pushed: int = 0
     view_changes: int = 0
     budget_stops: int = 0
+    sync_in_passes: int = 0
+    sync_out_passes: int = 0
     errors: int = 0
     rejects: dict[str, int] = field(default_factory=dict)
     last_failure: str | None = None
@@ -163,43 +169,63 @@ class AeReconciler:
         self,
         node_id: str,
         config: AeConfig,
+        replication_factor: int,
         local_store: LocalStore,
         partitioner: Partitioner,
         topologymgr: TopologyManager,
         peer_pool: PeerPool,
         serializer: Serializer,
-        tracker: ViewTracker,
         telemetry: Telemetry,
         backoff: BackoffRetry | None = None
     ) -> None:
         self._node_id = node_id
+        self._gate = asyncio.Event()
         self._config = config
         self._local_store = local_store
         self._partitioner = partitioner
         self._topologymgr = topologymgr
         self._pool = peer_pool
         self._serializer = serializer
-        self._tracker = tracker
         self._telemetry = telemetry
 
         self._progress: dict[tuple[str, str], SyncProgress] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._stats = AeStats()
         self._backoff = PeerBackoff(backoff or BackoffRetry())
+        self._retry_delay = max(1.0, self._config.min_interval)
 
         # pid -> (view hash, local root) at the last complete handoff: an
         # orphan partition is only pushed again once it or its replicas change.
         self._handed: dict[int, tuple[bytes, bytes]] = {}
+
+        self._tracker = ViewTracker(
+            node_id=self._node_id,
+            partitioner=self._partitioner,
+            topologymgr=self._topologymgr,
+            replication_factor=replication_factor,
+            settle_delay=5.0,
+            settle_quiet=0.5
+        )
 
     @property
     def running(self) -> bool:
         """Check if the service is running."""
         return any(not task.done() for task in self._tasks)
 
+    @property
+    def gate(self) -> asyncio.Event:
+        return self._gate
+
+    @property
+    def tracker(self) -> ViewTracker:
+        return self._tracker
+
     async def start(self) -> None:
         if self.running:
             return
 
+        await self._tracker.start()
+        self._gate.set()
         self._tasks = [
             # asyncio.create_task(self._deliver_loop(), name="ae-delivery"),
             asyncio.create_task(self._run(), name="ae-loop"),
@@ -216,6 +242,9 @@ class AeReconciler:
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+        self._gate.clear()
+        await self._tracker.stop()
 
     def plan(self, view: ReplicaView) -> list[Unit]:
         units: list[Unit] = []
@@ -279,6 +308,40 @@ class AeReconciler:
         self._sweep_done("completed", len(units), before, started)
         return True
 
+    async def sync_in(self) -> None:
+        started = time.monotonic()
+        passes = 0
+        copied = (self._stats.pulled, self._stats.bytes_pulled)
+        logger.info("ae.sync_in started node=%s", self._node_id)
+
+        while True:
+            view = await self._tracker.wait_ready()
+            stale = self._tracker.stale_signal()
+
+            if not view.owns:
+                logger.debug("ae.sync_in waiting for a view that places node=%s", self._node_id)
+                await stale.wait()
+                continue
+
+            failed = await self._sync_in_pass(view, stale)
+            self._stats.sync_in_passes += 1
+            passes += 1
+
+            if not failed and not stale.is_set():
+                logger.info(
+                    "ae.sync_in done node=%s passes=%d pulled=%d (%s) in %.2fs",
+                    self._node_id, passes, self._stats.pulled - copied[0],
+                    human_bytes(self._stats.bytes_pulled - copied[1]),
+                    time.monotonic() - started
+                )
+                return
+
+            _log_incomplete("sync_in", passes, stale, self._retry_delay)
+            await self._pause(self._retry_delay, stale)
+
+    async def sync_out(self) -> None:
+        ...
+
     def _cutoff_ms(self) -> int:
         return int((time.time() - self._config.grace) * 1000)
 
@@ -290,7 +353,7 @@ class AeReconciler:
         cutoff_ms: int,
         phases: frozenset[MemberPhase],
         *,
-        goal: str | None = None
+        goal: Goal = "sweep"
     ) -> Exchange:
         """Run one session per peer over its pids"""
         result = Exchange()
@@ -309,7 +372,7 @@ class AeReconciler:
             sync = self._session(peer, view, stale, cutoff_ms, goal=goal)
             started = time.monotonic()
             outcome = await self._guard(Work(peer, sync.sync_roots, (pids,)))
-            ok = self._settle(goal or "handoff", sync.tally, outcome)
+            ok = self._settle(goal, sync.tally, outcome)
 
             if goal is not None:
                 state = "done" if ok else "stopped"
@@ -334,6 +397,25 @@ class AeReconciler:
 
         return await self._reachable(peer, _SESSION_PHASES)
 
+    def _failed(self, peer: str, exc: Exception) -> str:
+        self._stats.failed(exc)
+
+        if isinstance(exc, AntiEntropyRejectError):
+            self._stats.rejects[exc.code] = self._stats.rejects.get(exc.code, 0) + 1
+            if exc.retry_after > 0:
+                self._backoff.defer(peer, exc.retry_after)
+                logger.debug(
+                    "ae.session deferred peer=%s code=%s retry_after=%.2fs",
+                    peer, exc.code, exc.retry_after
+                )
+                return "deferred"
+        else:
+            self._stats.errors += 1
+
+        self._backoff.failed(peer)
+        logger.warning("ae.session failed peer=%s: %s", peer, describe(exc))
+        return "failed"
+
     async def _guard(self, work: Work) -> str:
         """
         Run one session; turn its failure into backoff and counters.
@@ -354,25 +436,6 @@ class AeReconciler:
         except _SESSION_ERRORS as exc:
             return self._failed(work.peer, exc)
 
-    def _failed(self, peer: str, exc: Exception) -> str:
-        self._stats.failed(exc)
-
-        if isinstance(exc, AntiEntropyRejectError):
-            self._stats.rejects[exc.code] = self._stats.rejects.get(exc.code, 0) + 1
-            if exc.retry_after > 0:
-                self._backoff.defer(peer, exc.retry_after)
-                logger.debug(
-                    "ae.session deferred peer=%s code=%s retry_after=%.2fs",
-                    peer, exc.code, exc.retry_after
-                )
-                return "deferred"
-        else:
-            self._stats.errors += 1
-
-        self._backoff.failed(peer)
-        logger.warning("ae.session failed peer=%s: %s", peer, describe(exc))
-        return "failed"
-
     async def _handoff(self, unit: Unit, view: ReplicaView, stale: asyncio.Event) -> None:
         """
         Push versions of partitions this node does not replicate.
@@ -391,6 +454,10 @@ class AeReconciler:
     def _jittered(self, delay: float) -> float:
         jitter = self._config.jitter
         return max(0, delay * (1 + random.uniform(-jitter, jitter)))
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.time() * 1000)
 
     async def _orphans(
         self,
@@ -451,7 +518,7 @@ class AeReconciler:
         view: ReplicaView,
         stale: asyncio.Event,
         cutoff_ms: int,
-        goal: str | None = None
+        goal: Goal = "sweep",
     ) -> PeerSync:
         self._stats.sessions += 1
 
@@ -475,7 +542,7 @@ class AeReconciler:
             goal=goal
         )
 
-    def _settle(self, goal: str, tally: SessionTally, outcome: str) -> bool:
+    def _settle(self, goal: Goal, tally: SessionTally, outcome: str) -> bool:
         self._stats.merge(tally, handoff=(goal != "sweep"))
         self._telemetry.ae_sessions_total.add(1, attributes={"outcome": outcome, "goal": goal})
 
@@ -489,6 +556,46 @@ class AeReconciler:
                 self._telemetry.ae_bytes_total.add(size, attributes=attributes)
 
         return outcome == "ok"
+
+    async def _sync_in_pass(self, view: ReplicaView, stale: asyncio.Event) -> bool:
+        primaries = await self._sources(view)
+        cutoff_ms = self._now_ms()
+        goal = "sync_in"
+        result = await self._exchange(
+            primaries, view, stale, cutoff_ms, _SOURCE_PHASES, goal=goal
+        )
+        failed = bool(result.failed)
+
+        fallback = _fallback_sources(view, primaries, result.skipped)
+        logger.debug(
+            "ae.%s pass sources=%d pids=%d failed=%d fallback=%d",
+            goal, len(primaries), sum(len(p) for p in primaries.values()),
+            len(result.failed), len(fallback)
+        )
+        if fallback:
+            again = await self._exchange(
+                fallback, view, stale, cutoff_ms, _SOURCE_PHASES, goal=goal
+            )
+            failed = failed or bool(again.failed)
+
+        return failed
+
+    @staticmethod
+    async def _sources(view: ReplicaView) -> dict[str, list[int]]:
+        sources: dict[str, list[int]] = {}
+
+        for pid in range(len(view.replicas)):
+            if pid % _YIELD_EVERY == 0:
+                await asyncio.sleep(0)
+
+            if not view.is_replica(pid):
+                continue
+
+            primary = view.primary_source(pid)
+            if primary is not None:
+                sources.setdefault(primary, []).append(pid)
+
+        return sources
 
     def _sync_progress(self, peer: str, view: ReplicaView) -> SyncProgress:
         key = (peer, view.serial)
@@ -513,10 +620,9 @@ class AeReconciler:
         busy = delta["pulled"] or delta["pushed"] or delta["errors"]
         logger.log(
             logging.INFO if busy else logging.DEBUG,
-            "ae.sweep %s units=%d sessions=%d diverged=%d pulled=%d pushed=%d (%s) errors=%d in %.2fs",
-            outcome, units, delta["sessions"], delta["diverged"], delta["diverged"], delta["pulled"],
-            human_bytes(delta["bytes_pulled"]), delta["pushed"], human_bytes(delta["bytes_pushed"]),
-            delta["errors"], time.monotonic() - started
+            "ae.sweep %s units=%d sessions=%d diverged=%d pulled=%d (%s) pushed=%d (%s) errors=%d in %.2fs",
+            outcome, units, delta["sessions"], delta["diverged"], delta["pulled"], human_bytes(delta["bytes_pulled"]),
+            delta["pushed"], human_bytes(delta["bytes_pushed"]), delta["errors"], time.monotonic() - started
         )
 
 
@@ -547,6 +653,31 @@ def _count_reached(reached: dict[int, int], pids: list[int], recent: set[int]) -
     for pid in pids:
         if pid not in recent:
             reached[pid] = reached.get(pid, 0) + 1
+
+
+def _fallback_sources(
+    view: ReplicaView,
+    primaries: dict[str, list[int]],
+    down: set[str]
+) -> dict[str, list[int]]:
+    fallback: dict[str, list[int]] = {}
+
+    for primary in down:
+        for pid in primaries.get(primary, []):
+            for peer in view.sources_of(pid):
+                if peer not in (primary, view.node_id):
+                    fallback.setdefault(peer, []).append(pid)
+
+    return fallback
+
+
+def _log_incomplete(goal: str, passes: int, stale: asyncio.Event, retry: float) -> None:
+    if stale.is_set():
+        logger.debug("ae.%s pass=%d interrupted by a view change", goal, passes)
+        return
+
+    logger.debug("ae.%s pass=%d incomplete, retrying in %.2fs", goal, passes, retry)
+
 
 def _targets(view: ReplicaView, pids: Iterable[int]) -> dict[str, list[int]]:
     """Group pids by target replicas"""

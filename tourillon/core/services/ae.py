@@ -15,17 +15,18 @@ class AeService:
         self,
         local_store: LocalStore,
         tracker: ViewTracker,
+        gate: asyncio.Event,
         concurrency: int
     ) -> None:
         self._local_store = local_store
         self._tracker = tracker
+        self._gate = gate
         self._concurrency = concurrency
         self._active: int = 0
         self._rejected: int = 0
         self._applied: int = 0
         self._idle = asyncio.Event()
         self._idle.set()
-        self._running = False
 
     async def roots(self, request: RootsRequest) -> RootsResponse:
         async with self._admit(request.scope):
@@ -60,7 +61,7 @@ class AeService:
     def _check(self, scope: Scope, write: bool) -> None:
         view = self._tracker.view
 
-        if not self._running or view is None:
+        if not self._gate.is_set() or view is None:
             self._rejected += 1
             raise AntiEntropyRejectError(
                 AntiEntropyRejectError.NOT_READY,

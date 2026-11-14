@@ -144,7 +144,8 @@ class Manager:
         )
         self._ae = AeService(
             local_store=self._local_store,
-            tracker=self._lifecycle.ae_tracker,
+            tracker=self._lifecycle.ae_reconciler.tracker,
+            gate=self._lifecycle.ae_reconciler.gate,
             concurrency=4
         )
 

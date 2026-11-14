@@ -98,7 +98,7 @@ def build_view(
     tokens = [vnode.token for vnode in ring]
     phases = _phases(topology)
     targets = {n for n, phase in phases.items() if phase is not MemberPhase.DRAINING}
-    serving = {n for n, phase in phases.items() if phase is MemberPhase.JOINING}
+    serving = {n for n, phase in phases.items() if phase is not MemberPhase.JOINING}
     memo: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] = {}
     replicas: list[tuple[str, ...]] = []
     sources: list[tuple[str, ...]] = []

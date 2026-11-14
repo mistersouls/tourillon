@@ -18,7 +18,6 @@ import ssl
 from pathlib import Path
 
 from tourillon.core.ae.reconciler import AeReconciler
-from tourillon.core.ae.tracker import ViewTracker
 from tourillon.core.config import TourillonConfig
 from tourillon.core.exceptions import BootstrapError, JoinError, StartupError
 from tourillon.core.gossip.bootstrapper import GossipBootstrapper
@@ -106,23 +105,15 @@ class NodeLifecycle:
             serializer=serializer,
             storage=deprecated_storage,
         )
-        self._ae_tracker = ViewTracker(
-            node_id=self._config.node.id,
-            partitioner=self._partitioner,
-            topologymgr=self._topologymgr,
-            replication_factor=self._config.placement.replication_factor,
-            settle_delay=5.0,
-            settle_quiet=0.5
-        )
         self._ae_reconciler = AeReconciler(
             node_id=config.node.id,
             config=config.placement.antientropy,
+            replication_factor=config.placement.replication_factor,
             local_store=self._local_store,
             partitioner=self._partitioner,
             topologymgr=topologymgr,
             peer_pool=self._peer_pool,
             serializer=self._serializer,
-            tracker=self._ae_tracker,
             telemetry=self._telemetry,
         )
 
@@ -133,8 +124,8 @@ class NodeLifecycle:
         self._client_started = False
 
     @property
-    def ae_tracker(self) -> ViewTracker:
-        return self._ae_tracker
+    def ae_reconciler(self) -> AeReconciler:
+        return self._ae_reconciler
 
     async def start(self, seeds: list[str] | None = None) -> None:
         logger.info("Starting node lifecycle for '%s'", self._config.node.id)
@@ -171,7 +162,7 @@ class NodeLifecycle:
 
         await self._gossiper.stop()
         await self._stop_peer()
-        await self._stop_ae()
+        await self._ae_reconciler.stop()
         logger.info("Node lifecycle stopped for '%s'", self._config.node.id)
 
     def is_joining(self) -> bool:
@@ -248,39 +239,40 @@ class NodeLifecycle:
 
         await self._peer_pool.start()
         await self._gossiper.start()
-        member = await self._publish_state(state)
-        synced = await self._sync_full(state)
-        ready = False
+        await self._publish_state(state)
 
-        if synced:
-            logger.info("Re-synced cluster membership successfully")
-            success, failed = await self._run_transfers(member)
-
-            if failed:
-                logger.error(
-                    "Data transfer failed for %d partitions; node will transition to FAILED",
-                    len(failed),
-                )
-                final = await self._transition_to(state, MemberPhase.FAILED)
-            else:
-                logger.info(
-                    "Data transfer completed successfully for %d partitions",
-                    len(success),
-                )
-                final = await self._transition_to(state, MemberPhase.READY)
-                await self._start_client()
-                ready = True
-        else:
-            final = await self._transition_to(state, MemberPhase.FAILED)
-
-        await self._publish_state(final)
-        if not ready:
-            logger.error("Join operation failed; node transitioned to FAILED phase")
+        if not await self._sync_full(state):
+            failed = await self._transition_to(state, MemberPhase.FAILED)
+            await self._publish_state(failed)
+            logger.error(
+                "gossip.bootstrap failed node=%s transitioned to phase=%s",
+                failed.node_id, failed.phase.value
+            )
+            await self._ae_reconciler.stop()
             await self._gossiper.stop()
             return
 
-        await self._hint_replayer.start()
-        await self._start_ae()
+        await self._publish_state(state)
+        await self._ae_reconciler.start()
+
+        try:
+            await self._ae_reconciler.sync_in()
+            synced = True
+        except Exception as exc:
+            logger.exception("ae.sync_in failed: %s", exc)
+            synced = False
+
+        if not synced:
+            failed = await self._transition_to(state, MemberPhase.FAILED)
+            await self._publish_state(failed)
+            await self._ae_reconciler.stop()
+            await self._gossiper.stop()
+            return
+
+        logger.info("ae.sync_in reached for node=%s", state.node_id)
+        ready = await self._transition_to(state, MemberPhase.READY)
+        await self._start_client()
+        await self._publish_state(ready)
 
     async def _run_transfers(self, member: Member) -> tuple[list[str], list[str]]:
         """Run the join transfers, re-planning them on every ring change until they settle.
@@ -339,14 +331,6 @@ class NodeLifecycle:
         await self._gossiper.announce(member)
         return member
 
-    async def _start_ae(self) -> None:
-        await self._ae_tracker.start()
-        await self._ae_reconciler.start()
-
-    async def _stop_ae(self) -> None:
-        await self._ae_reconciler.stop()
-        await self._ae_tracker.stop()
-
     async def _start_ready(self, ready_state: NodeState) -> None:
         assert ready_state.phase == MemberPhase.READY
 
@@ -357,7 +341,7 @@ class NodeLifecycle:
         await self._publish_state(ready_state)
         await self._start_client()
         await self._hint_replayer.start()
-        await self._start_ae()
+        await self._ae_reconciler.start()
 
     async def _startup_idle(
         self, state: NodeState, seeds: list[str] | None = None

@@ -47,10 +47,13 @@ class Session:
         return Record(key=key, tag=tag, value=value)
 
     async def put_record(self, record: Record) -> bool:
-        (written,) = await self._insert_record_many([record])
+        (written,) = await self.put_record_many([record])
         return written
 
     async def put_record_many(self, records: Iterable[Record]) -> list[bool]:
+        if not isinstance(records, list):
+            records = list(records)
+
         if not records:
             return []
 
@@ -111,33 +114,39 @@ class Session:
             else:
                 updates.append((key, cell.to_bytes()))
 
-        self._txn.delete_many([KeyList(Keyspace.META, deletes)])
-        self._txn.put_many([KVList(Keyspace.META, updates)])
+        if deletes:
+            self._txn.delete_many([KeyList(Keyspace.META, deletes)])
+        if updates:
+            self._txn.put_many([KVList(Keyspace.META, updates)])
+
         await self._txn.results()
         self._deltas.clear()
         self._stored.clear()
 
-    async def _insert_record_many(self, records: Iterable[Record]) -> list[bool]:
+    async def _insert_record_many(self, records: list[Record]) -> list[bool]:
         """Insert multiple records into the storage."""
-        refs = self._unknown_cells((record.key for record in records))
+        if not records:
+            return []
 
-        kvlist = (
-            KVList(keyspace, [rec.kv(keyspace).item() for rec in records])
-            for keyspace in (Keyspace.LOGS, Keyspace.TAGS)
-        )
-        deferred = self._txn.put_many(kvlist, overwrite=False)
-
+        refs = self._unknown_cells(record.key for record in records)
         pairs = self._txn.get_many([KeyList(Keyspace.META, refs)])
         self._stored.update(dict.fromkeys(refs, DigestCell()))
         for pair in await pairs.get():
             self._stored[pair.key] = DigestCell.from_bytes(pair.value)
 
-        result = await deferred.get()
-        half = len(result) // 2
-        return [
-            log and tag
-            for log, tag in zip(result[:half], result[half:], strict=True)
+        writes = [
+            (
+                self._txn.put(record.kv(Keyspace.LOGS), overwrite=False),
+                self._txn.put(record.kv(Keyspace.TAGS), overwrite=False),
+            )
+            for record in records
         ]
+
+        written: list[bool] = []
+        for log_write, tag_write in writes:
+            written.append(await log_write.get() and await tag_write.get())
+
+        return written
 
     def _unknown_cells(self, keys: Iterable[Key]) -> list[bytes]:
         refs = {ref for key in keys for ref in cell_keys(key, self._bucket_shift)}

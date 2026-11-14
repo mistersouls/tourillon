@@ -25,7 +25,12 @@ from tourillon.core.models.member import Member, MemberPhase
 from tourillon.core.spaces.ring import Ring
 
 # Phases whose vnodes are part of the active ring: members that own data.
-RING_PHASES = frozenset({MemberPhase.READY, MemberPhase.PAUSED, MemberPhase.DRAINING})
+RING_PHASES = frozenset({
+    MemberPhase.JOINING,
+    MemberPhase.READY,
+    MemberPhase.PAUSED,
+    MemberPhase.DRAINING
+})
 
 
 @dataclass(frozen=True)
