@@ -17,6 +17,8 @@ import contextlib
 import ssl
 from pathlib import Path
 
+from tourillon.core.ae.reconciler import AeReconciler
+from tourillon.core.ae.tracker import ViewTracker
 from tourillon.core.config import TourillonConfig
 from tourillon.core.exceptions import BootstrapError, JoinError, StartupError
 from tourillon.core.gossip.bootstrapper import GossipBootstrapper
@@ -31,6 +33,7 @@ from tourillon.core.ports import Telemetry
 from tourillon.core.ports.deprecated_storage import DeprecatedStorage
 from tourillon.core.replay.hint import HintReplayer
 from tourillon.core.spaces.ring import Ring
+from tourillon.core.storage.local import LocalStore
 from tourillon.core.transfer.runner import TransferRunner
 from tourillon.core.transports.dispatcher import Dispatcher
 from tourillon.core.transports.server import EnvelopeServer
@@ -54,11 +57,13 @@ class NodeLifecycle:
         topologymgr: TopologyManager,
         partitioner: Partitioner,
         deprecated_storage: DeprecatedStorage,
+        local_store: LocalStore,
         gossip_stats: GossipStats,
         telemetry: Telemetry,
     ) -> None:
         self._config = config
         self._persistence = persistence
+        self._local_store = local_store
         self._topologymgr = topologymgr
         self._partitioner = partitioner
         self._serializer = serializer
@@ -101,12 +106,35 @@ class NodeLifecycle:
             serializer=serializer,
             storage=deprecated_storage,
         )
+        self._ae_tracker = ViewTracker(
+            node_id=self._config.node.id,
+            partitioner=self._partitioner,
+            topologymgr=self._topologymgr,
+            replication_factor=self._config.placement.replication_factor,
+            settle_delay=5.0,
+            settle_quiet=0.5
+        )
+        self._ae_reconciler = AeReconciler(
+            node_id=config.node.id,
+            config=config.placement.antientropy,
+            local_store=self._local_store,
+            partitioner=self._partitioner,
+            topologymgr=topologymgr,
+            peer_pool=self._peer_pool,
+            serializer=self._serializer,
+            tracker=self._ae_tracker,
+            telemetry=self._telemetry,
+        )
 
         self._state_file = Path(self._config.storage.data_dir) / NODE_STATE_FILENAME
         self._join_task: asyncio.Task[None] | None = None
         self._join_lock = asyncio.Lock()
         self._peer_started = False
         self._client_started = False
+
+    @property
+    def ae_tracker(self) -> ViewTracker:
+        return self._ae_tracker
 
     async def start(self, seeds: list[str] | None = None) -> None:
         logger.info("Starting node lifecycle for '%s'", self._config.node.id)
@@ -143,6 +171,7 @@ class NodeLifecycle:
 
         await self._gossiper.stop()
         await self._stop_peer()
+        await self._stop_ae()
         logger.info("Node lifecycle stopped for '%s'", self._config.node.id)
 
     def is_joining(self) -> bool:
@@ -251,6 +280,7 @@ class NodeLifecycle:
             return
 
         await self._hint_replayer.start()
+        await self._start_ae()
 
     async def _run_transfers(self, member: Member) -> tuple[list[str], list[str]]:
         """Run the join transfers, re-planning them on every ring change until they settle.
@@ -309,6 +339,14 @@ class NodeLifecycle:
         await self._gossiper.announce(member)
         return member
 
+    async def _start_ae(self) -> None:
+        await self._ae_tracker.start()
+        await self._ae_reconciler.start()
+
+    async def _stop_ae(self) -> None:
+        await self._ae_reconciler.stop()
+        await self._ae_tracker.stop()
+
     async def _start_ready(self, ready_state: NodeState) -> None:
         assert ready_state.phase == MemberPhase.READY
 
@@ -319,6 +357,7 @@ class NodeLifecycle:
         await self._publish_state(ready_state)
         await self._start_client()
         await self._hint_replayer.start()
+        await self._start_ae()
 
     async def _startup_idle(
         self, state: NodeState, seeds: list[str] | None = None

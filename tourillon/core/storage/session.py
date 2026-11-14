@@ -1,6 +1,6 @@
 import time
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Iterable
+from typing import AsyncIterator, Iterable, Mapping
 
 from tourillon.core.models.storageschema import (
     PartitionAddress, Record, Keyspace, Key, KVRef, Tag, Value,
@@ -8,7 +8,7 @@ from tourillon.core.models.storageschema import (
 )
 from tourillon.core.ports.storage import Storage, Transaction
 from tourillon.core.log import logger as _logger
-from tourillon.core.storage.cell import cell_keys, DigestCell
+from tourillon.core.storage.cell import cell_keys, DigestCell, Root
 from tourlib.models.types import SupportsBytes
 
 logger = _logger.storage()
@@ -74,6 +74,31 @@ class Session:
             for kv in await self._txn.results()
             if kv is not None
         ]
+
+    async def roots(self, pids: Iterable[int]) -> list[tuple[int, DigestCell]]:
+        pids = tuple(pids)
+        if not pids:
+            return []
+
+        items = KeyList(Keyspace.META, (Root(pid).to_bytes() for pid in pids))
+        pairs = await self._txn.get_many([items]).get()
+        cells = dict(DigestCell.from_kv(pair) for pair in pairs)
+        return [(pid, cells.get(pid, DigestCell())) for pid in pids]
+
+    async def list_roots(self, after: int | None = None, limit: int = 64) -> list[tuple[int, DigestCell]]:
+        """List root digest cells for partitions in ascending order."""
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+
+        start = None if after is None else Root(after).to_bytes()
+        result = self._txn.list(
+            Keyspace.META,
+            prefix=Root.prefix(),
+            start=start,
+            limit=limit
+        )
+        page = await result.get()
+        return [DigestCell.from_kv(pair) for pair in page]
 
     async def flush(self) -> None:
         """Flush the session, committing any pending operations."""

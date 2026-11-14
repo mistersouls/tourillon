@@ -315,6 +315,34 @@ class OpenTelemetryTelemetry(Telemetry):
             description="Total FAILED announcements emitted through gossip hot path.",
         )
 
+    @property
+    def ae_sessions_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="ae_sessions_total",
+            description="Total anti-entropy sessions initiated.",
+        )
+
+    @property
+    def ae_versions_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="ae_versions_total",
+            description="Versions copied by anti-entropy sessions, by direction.",
+        )
+
+    @property
+    def ae_bytes_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="ae_bytes_total",
+            description="Value bytes copied by anti-entropy sessions, by direction.",
+        )
+
+    @property
+    def ae_sweeps_total(self) -> CounterMetric:
+        return self._counter_metric(
+            name="ae_sweeps_total",
+            description="Anti-entropy sweeps, by outcome.",
+        )
+
     def start_span(
         self,
         name: str,

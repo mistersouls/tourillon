@@ -73,6 +73,14 @@ class TopologyManager:
         # Fingerprint cache; None means the cache is dirty.
         self._fingerprint: str | None = None
 
+        # Bumped on every ring or ownership change; lets waiters detect a
+        # change that happened between their snapshot and their wait.
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
     async def snapshot(self) -> Topology:
         """Return an immutable Topology snapshot acquired under the lock."""
         async with self._lock:
@@ -91,8 +99,7 @@ class TopologyManager:
             changed = self._apply(member)
 
         if changed:
-            async with self._ring_changed:
-                self._ring_changed.notify_all()
+            await self._notify()
 
         return changed
 
@@ -112,8 +119,7 @@ class TopologyManager:
                     accepted += 1
 
         if accepted:
-            async with self._ring_changed:
-                self._ring_changed.notify_all()
+            await self._notify()
 
         return accepted
 
@@ -142,6 +148,14 @@ class TopologyManager:
             await self._ring_changed.wait()
         return self._ring
 
+    async def wait_for_change(self, generation: int) -> int:
+        """Wait until the ring  or ring member's phase changes after generation."""
+        async with self._ring_changed:
+            while self._generation == generation:
+                await self._ring_changed.wait()
+
+        return self._generation
+
     def _apply(self, member: Member) -> bool:
         """Apply member under the already-held lock; return True if modified."""
         old = self._registry.get(member.node_id)
@@ -156,6 +170,11 @@ class TopologyManager:
             return False
         self._fingerprint = None  # invalidate cache on any accepted mutation
         return self._update_ring(old, member)
+
+    async def _notify(self) -> None:
+        self._generation += 1
+        async with self._ring_changed:
+            self._ring_changed.notify_all()
 
     def _update_ring(self, old: Member | None, new: Member) -> bool:
         """Derive the ring from the latest member state, not from transitions.

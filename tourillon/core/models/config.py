@@ -568,18 +568,99 @@ class RepairConfig:
 
 
 @dataclass(frozen=True)
+class AeConfig:
+    sweep_period: float = 600.0
+    min_interval: float = 1.0
+    pids_per_cycle: int = 4096
+    concurrency: int = 4
+    jitter: float = 0.2
+    grace: float = 120.0
+    keys_per_request: int = 1024
+    max_batch_bytes: int = 4 * 1024 * 1024
+    max_repairs_per_cycle: int = 10_000
+    max_keys_per_cycle: int = 1_000_000
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "sweep_period": self.sweep_period,
+            "min_interval": self.min_interval,
+            "pids_per_cycle": self.pids_per_cycle,
+            "concurrency": self.concurrency,
+            "jitter": self.jitter,
+            "grace": self.grace,
+            "keys_per_request": self.keys_per_request,
+            "max_batch_bytes": self.max_batch_bytes,
+            "max_repairs_per_cycle": self.max_repairs_per_cycle,
+            "max_keys_per_cycle": self.max_keys_per_cycle,
+        }
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> "AeConfig":
+        return cls(
+            sweep_period=cls._ae_number(document, "sweep_period", 600.0, minimum=1.0),
+            min_interval=cls._ae_number(document, "min_interval", 1.0, minimum=0.01),
+            pids_per_cycle=cls._ae_int(document, "pids_per_cycle", 4096, minimum=1),
+            concurrency=cls._ae_int(document, "concurrency", 4, minimum=1),
+            jitter=cls._ae_number(document, "jitter", 0.2, minimum=0.0, maximum=1.0),
+            grace=cls._ae_number(document, "grace", 120.0, minimum=0.0),
+            keys_per_request=cls._ae_int(document, "keys_per_request", 1024, minimum=1),
+            max_batch_bytes=cls._ae_int(document, "max_batch_bytes", 4 * 1024 * 1024, minimum=1),
+            max_repairs_per_cycle=cls._ae_int(document, "max_repairs_per_cycle", 10_000, minimum=1),
+            max_keys_per_cycle=cls._ae_int(document, "max_keys_per_cycle", 1_000_000, minimum=2),
+        )
+
+    @staticmethod
+    def _ae_number(
+        document: Mapping[str, Any],
+        name: str,
+        default: float,
+        *,
+        minimum: float,
+        maximum: float | None = None,
+        prefix: str = "placement.antientropy.",
+    ) -> float:
+        value = document.get(name, default)
+
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValidationError(f"{prefix}{name} must be a number")
+
+        if value < minimum or (maximum is not None and value > maximum):
+            bound = f">= {minimum}" if maximum is None else f"in [{minimum}, {maximum}]"
+            raise ValidationError(f"{prefix}{name} must be {bound}")
+
+        return float(value)
+
+    @staticmethod
+    def _ae_int(
+        document: Mapping[str, Any],
+        name: str,
+        default: int,
+        minimum: int,
+        prefix: str = "placement.antientropy.",
+    ) -> int:
+        value = document.get(name, default)
+
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValidationError(f"{prefix}{name} must be an integer >= {minimum}")
+
+        return value
+
+
+@dataclass(frozen=True)
 class PlacementConfig:
     """Placement runtime options."""
 
     replication_factor: int = 3
     read_repair: ReadRepairConfig = field(default_factory=ReadRepairConfig)
     repair: RepairConfig = field(default_factory=RepairConfig)
+    antientropy: AeConfig = field(default_factory=AeConfig)
 
     def to_document(self) -> dict[str, Any]:
         return {
             "replication_factor": self.replication_factor,
             "read_repair": self.read_repair.to_document(),
             "repair": self.repair.to_document(),
+            "antientropy": self.antientropy.to_document(),
         }
 
     @classmethod
@@ -589,16 +670,24 @@ class PlacementConfig:
             raise ValidationError(
                 "placement.replication_factor must be an integer >= 1"
             )
+
         read_repair_doc = document.get("read_repair", {})
         if not isinstance(read_repair_doc, Mapping):
             raise ValidationError("placement.read_repair must be a table")
+
         repair_doc = document.get("repair", {})
         if not isinstance(repair_doc, Mapping):
             raise ValidationError("placement.repair must be a table")
+
+        ae_doc = document.get("antientropy", {})
+        if not isinstance(ae_doc, Mapping):
+            raise ValidationError("placement.antientropy must be a table")
+
         return cls(
             replication_factor=replication_factor,
             read_repair=ReadRepairConfig.from_document(read_repair_doc),
             repair=RepairConfig.from_document(repair_doc),
+            antientropy=AeConfig.from_document(ae_doc),
         )
 
 

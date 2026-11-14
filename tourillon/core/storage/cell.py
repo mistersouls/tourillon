@@ -1,16 +1,14 @@
 import hashlib
 from dataclasses import dataclass
+from tourillon.core.models.ae import BUCKET_SIZE, DIGEST_SIZE
 
-from tourillon.core.models.storageschema import Pid, Key, Keyspace, KVPair, MetaKind
+from tourillon.core.models.storageschema import Pid, Key, Keyspace, MetaKind, KVPair, RawPrefix
 
 _ROOT = b"\x00"
 _BUCKET = b"\x01"
 _COUNT_SIZE: int = 8
 ROOT_PREFIX: bytes = MetaKind.DIGEST.value + _ROOT  # type: ignore
 BUCKET_PREFIX: bytes = MetaKind.DIGEST.value + _BUCKET  # type: ignore
-BUCKET_SIZE: int  = 8
-DIGEST_SIZE: int = 16
-
 
 
 @dataclass(frozen=True, slots=True, eq=True, order=True)
@@ -28,6 +26,10 @@ class Root:
             raise ValueError("Invalid root prefix")
         pid = Pid.from_bytes(data[len(ROOT_PREFIX):])
         return cls(pid=pid.value)
+
+    @staticmethod
+    def prefix() -> RawPrefix:
+        return RawPrefix(ROOT_PREFIX)
 
 
 @dataclass(frozen=True, slots=True, eq=True, order=True)
@@ -97,6 +99,12 @@ class DigestCell:
             count=int.from_bytes(b[:_COUNT_SIZE], "big"),
             digest=int.from_bytes(b[_COUNT_SIZE:], "big"),
         )
+
+    @classmethod
+    def from_kv(cls, kv: KVPair) -> tuple[int, "DigestCell"]:
+        root = Root.from_bytes(kv.key)
+        digest = cls.from_bytes(kv.value)
+        return root.pid, digest
 
 
 def cell_keys(key: Key, bucket_shift: int) -> tuple[bytes, bytes]:

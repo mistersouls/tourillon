@@ -15,7 +15,7 @@
 import hashlib
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
-from typing import Any, Iterable
+from typing import Any, Iterable, Self
 
 from tourlib.models.ts import HLCTimestamp
 from tourlib.models.version import Address
@@ -64,6 +64,18 @@ class KVList:
 class KeyList:
     keyspace: Keyspace
     items: Iterable[bytes]
+
+
+@dataclass(frozen=True, slots=True, eq=True, order=True)
+class RawPrefix:
+    raw: bytes
+
+    def to_bytes(self) -> bytes:
+        return self.raw
+
+    @classmethod
+    def from_bytes(cls, b: bytes) -> Self:
+        return cls(b)
 
 
 @dataclass(frozen=True, slots=True, eq=True, order=True)

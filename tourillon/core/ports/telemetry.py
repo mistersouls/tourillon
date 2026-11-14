@@ -121,6 +121,22 @@ class Telemetry(Protocol):
     @property
     def gossip_failed_announcements_total(self) -> CounterMetric: ...
 
+    @property
+    def ae_sweeps_total(self) -> CounterMetric:
+        """Sweeps labeled ``outcome`` (completed, interrupted)."""
+
+    @property
+    def ae_sessions_total(self) -> CounterMetric:
+        """Anti-entropy sessions, labeled ``goal`` and ``outcome``."""
+
+    @property
+    def ae_versions_total(self) -> CounterMetric:
+        """Versions copied by anti-entropy sessions, labeled ``direction``."""
+
+    @property
+    def ae_bytes_total(self) -> CounterMetric:
+        """Value bytes copied by anti-entropy sessions, labeled ``direction``."""
+
     def start_span(
         self,
         name: str,

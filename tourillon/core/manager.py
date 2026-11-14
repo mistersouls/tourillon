@@ -17,6 +17,7 @@ import contextlib
 import signal
 import ssl
 from collections.abc import AsyncIterator
+from tourillon.core.ae.tracker import ViewTracker
 
 from tourillon.core.config import TourillonConfig
 from tourillon.core.gossip.gossiper import GossipStats
@@ -30,6 +31,7 @@ from tourillon.core.ports import Telemetry, TelemetryProvider
 from tourillon.core.ports.deprecated_storage import DeprecatedStorageProvider
 from tourillon.core.ports.storage import StorageProvider
 from tourillon.core.probe.detector import FailureDetectorProvider
+from tourillon.core.services.ae import AeService
 from tourillon.core.services.gossip import GossipService
 from tourillon.core.services.inspector import NodeInspector
 from tourillon.core.services.lifecycle import NodeLifecycle
@@ -106,21 +108,6 @@ class Manager:
             read_repair=config.placement.read_repair,
             repair=config.placement.repair,
         )
-        self._lifecycle = NodeLifecycle(
-            config=config,
-            peer_dispatcher=peer_dispatcher,
-            client_dispatcher=client_dispatcher,
-            tls_server=tls_server,
-            tls_client=tls_client,
-            persistence=persistence,
-            serializer=serializer,
-            peer_pool=self._peer_pool,
-            gossip_stats=self._gossip_stats,
-            partitioner=self._partitioner,
-            topologymgr=self._topologymgr,
-            deprecated_storage=self._deprecated_storage,
-            telemetry=self._telemetry,
-        )
         self._inspector = NodeInspector(
             node_id=self._config.node.id,
             stats=self._gossip_stats,
@@ -139,6 +126,27 @@ class Manager:
             partitioner=self._partitioner,
         )
         self._serializer = serializer
+        self._lifecycle = NodeLifecycle(
+            config=config,
+            peer_dispatcher=peer_dispatcher,
+            client_dispatcher=client_dispatcher,
+            tls_server=tls_server,
+            tls_client=tls_client,
+            persistence=persistence,
+            serializer=serializer,
+            peer_pool=self._peer_pool,
+            gossip_stats=self._gossip_stats,
+            partitioner=self._partitioner,
+            topologymgr=self._topologymgr,
+            deprecated_storage=self._deprecated_storage,
+            local_store=self._local_store,
+            telemetry=self._telemetry,
+        )
+        self._ae = AeService(
+            local_store=self._local_store,
+            tracker=self._lifecycle.ae_tracker,
+            concurrency=4
+        )
 
     @property
     def node_id(self) -> str:
@@ -171,9 +179,14 @@ class Manager:
         return self._telemetry
 
     @property
-    def store(self) -> StoreService:
-        """Get the store service."""
+    def store(self) -> StorageService:
+        """Get the storage service."""
         return self._store
+
+    @property
+    def ae(self) -> AeService:
+        """Get the AE service."""
+        return self._ae
 
     async def start(self, seeds: list[str] | None = None) -> None:
         """Start the Tourillon daemon.
