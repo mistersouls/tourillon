@@ -3,7 +3,7 @@ from typing import AsyncIterator, Iterable, Sequence
 
 from tourillon.core.models.storageschema import (
     PartitionAddress, Record, Keyspace, Key, KVRef, Tag, Value,
-    KVList, KeyList, TagKind, KeyTag
+    KVList, KeyList, TagKind, KeyTag, Obligation, ObligationPrefix, KVPair
 )
 from tourillon.core.ports.storage import Storage, Transaction
 from tourillon.core.log import logger as _logger
@@ -166,6 +166,47 @@ class Session:
         )
         page = await result.get()
         return [Bucket.from_kv(pair) for pair in page]
+
+    async def obligation_keys(
+        self,
+        after: bytes | None = None,
+        limit: int = 64
+    ) -> list[Obligation]:
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+
+        obligations: list[Obligation] = []
+        cursor = after
+        while len(obligations) < limit:
+            remaining = limit - len(obligations)
+            result = self._txn.keys(
+                Keyspace.META,
+                prefix=ObligationPrefix(),
+                start=cursor,
+                limit=remaining
+            )
+            page = await result.get()
+
+            for ref in page:
+                try:
+                    obligations.append(Obligation.from_bytes(ref.key))
+                except ValueError:
+                    logger.exception("storage.obligation unreadable key=%s", ref.key.hex())
+
+            if len(page) < remaining:
+                break
+
+            cursor = page[-1].key
+
+        return obligations
+
+    async def remove_obligation_many(self, obligations: Sequence[Obligation]) -> int:
+        if not obligations:
+            return 0
+
+        keylist = KeyList(Keyspace.META, (key.to_bytes() for key in obligations))
+        deleted: list[KVPair | None] = await self._txn.delete_many([keylist]).get()
+        return len([pair for pair in deleted if pair is not None])
 
     async def flush(self) -> None:
         """Flush the session, committing any pending operations."""

@@ -6,16 +6,21 @@ import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
-from typing import Callable, Awaitable, Mapping, Any, Iterable
+from itertools import groupby
+from typing import Callable, Awaitable, Mapping, Any, Iterable, Sequence
 
+from tourillon.core.ae.caller import Caller
+from tourillon.core.ae.obligations import ObligationQueue
 from tourillon.core.ae.sync import SyncProgress, PeerSync, SessionTally, SessionLimits, Goal
 from tourillon.core.ae.tracker import ViewTracker
 from tourillon.core.ae.view import ReplicaView
 from tourillon.core.exceptions import AntiEntropyRejectError, ViewChangedError, BudgetSpentError
 from tourillon.core.gossip.topology import TopologyManager
+from tourillon.core.models.ae import MAX_PAGE_LIMIT, Scope, MAX_BATCH_BYTES, PushRequest, PushResponse
 from tourillon.core.models.config import AeConfig
 from tourillon.core.models.member import MemberPhase
 from tourillon.core.models.retry import BackoffRetry
+from tourillon.core.models.storageschema import Obligation, Record, Key
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.peer import PeerPool
 from tourillon.core.ports import Telemetry
@@ -66,6 +71,9 @@ class AeStats:
     budget_stops: int = 0
     sync_in_passes: int = 0
     sync_out_passes: int = 0
+    obligations_dropped: int = 0
+    obligations_deferred: int = 0
+    obligations_delivered: int = 0
     errors: int = 0
     rejects: dict[str, int] = field(default_factory=dict)
     last_failure: str | None = None
@@ -206,6 +214,9 @@ class AeReconciler:
             settle_delay=5.0,
             settle_quiet=0.5
         )
+        self._obligations = ObligationQueue()
+        self._batch = min(self._config.keys_per_request, MAX_PAGE_LIMIT)
+        self._batch_bytes = min(config.max_batch_bytes, MAX_BATCH_BYTES)
 
     @property
     def running(self) -> bool:
@@ -227,7 +238,7 @@ class AeReconciler:
         await self._tracker.start()
         self._gate.set()
         self._tasks = [
-            # asyncio.create_task(self._deliver_loop(), name="ae-delivery"),
+            asyncio.create_task(self._delivery_loop(), name="ae-delivery"),
             asyncio.create_task(self._run(), name="ae-loop"),
         ]
 
@@ -294,7 +305,7 @@ class AeReconciler:
             await self._pause(delay, stale)
 
             # obligations go first: the sweep only finds what they missed.
-            # todo(souls): handle obligations and deprecate hint replay
+            await self._obligations.wait_idle()
 
             if stale.is_set():
                 self._stats.view_changes += 1
@@ -340,10 +351,126 @@ class AeReconciler:
             await self._pause(self._retry_delay, stale)
 
     async def sync_out(self) -> None:
-        ...
+        started = time.monotonic()
+        passes = 0
+        copied = (self._stats.handed_off, self._stats.bytes_pushed)
+        logger.info("ae.sync_out started node=%s", self._node_id)
+
+        while True:
+            view = await self._tracker.wait_ready()
+            stale = self._tracker.stale_signal()
+
+            if view.owns:
+                logger.debug("ae.sync_out waiting for a view without node=%s", self._node_id)
+                await stale.wait()
+                continue
+
+            done = await self._sync_out_pass(view, stale)
+            self._stats.sync_out_passes += 1
+            passes += 1
+
+            if done:
+                logger.info(
+                    "ae.sync_out hand off node=%s passes=%d pushed=%d (%s) in %.2fs",
+                    self._node_id, passes, self._stats.handed_off - copied[0],
+                    human_bytes(self._stats.bytes_pushed - copied[1]),
+                    time.monotonic() - started
+                )
+                return
+
+            _log_incomplete("sync_out", passes, stale, self._retry_delay)
+            await self._pause(self._retry_delay, stale)
+
+    async def deliver(self, batch: Sequence[Obligation], view: ReplicaView) -> None:
+        """
+        Push the versions of ``batch`` to their targets, then forget them.
+
+        A captured debt is covered by the latest local version. Missing
+        covering data is reported and retained; only a target no longer in
+        the preference list makes a debt obsolete without delivery.
+        """
+        owed = {ob for ob in batch if self._owed(ob, view)}
+        records = await self._local_store.record_from_obligations(list(owed))
+        obsolete = [ob for ob in batch if ob not in owed]
+        unavailable = [ob for ob in owed if ob.key not in records]
+        if unavailable:
+            self._obligations.backlog = True
+            logger.error(
+                "ae.obligations no covering local version count=%d", len(unavailable)
+            )
+        ready = sorted(
+            (ob for ob in owed if ob.key in records),
+            key=lambda o: (o.target, o.key.to_tag_bytes())
+        )
+
+        for target, group in groupby(ready, key=lambda ob: ob.target):
+            await self._deliver_to(target, list(group), records, view)
+
+        if obsolete:
+            await self._local_store.remove_obligations(obsolete)
+            self._stats.obligations_dropped += len(obsolete)
+            self._obligation_event("dropped", len(obsolete))
+            logger.debug(
+                "ae.obligations dropped count=%d (version gone or target no longer a replica)",
+                len(obsolete)
+            )
 
     def _cutoff_ms(self) -> int:
         return int((time.time() - self._config.grace) * 1000)
+
+    async def _delivery_loop(self) -> None:
+        while True:
+            view = await self._tracker.wait_ready()
+
+            try:
+                await self._delivery_step(view)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._stats.errors += 1
+                self._stats.failed(exc)
+                self._obligations.backlog = True
+                logger.exception("ae.delivery failed")
+                await asyncio.sleep(self._retry_delay)
+
+    async def _delivery_step(self, view: ReplicaView) -> None:
+        queue = self._obligations
+
+        if len(queue):
+            batch = queue.take(self._batch)
+
+            try:
+                await self.deliver(batch, view)
+            finally:
+                queue.settle(len(batch))
+
+            return
+
+        if queue.backlog:
+            await self._reload()
+
+        if not len(queue):
+            await queue.wait(self._retry_delay if queue.backlog else None)
+
+    async def _deliver_to(
+        self,
+        target: str,
+        obligations: list[Obligation],
+        records: dict[Key, Record],
+        view: ReplicaView
+    ) -> None:
+        if not await self._eligible(target):
+            self._park(target, len(obligations))
+            return
+
+        for pid, group in groupby(obligations, key=lambda o: o.key.pid.value):
+            if not await self._push_obligations(target, pid, list(group), records, view):
+                self._obligations.backlog = True
+                return
+
+        self._backoff.succeeded(target)
+        logger.debug("ae.obligations delivered target=%s count=%d", target, len(obligations))
+
 
     async def _exchange(
         self,
@@ -353,7 +480,7 @@ class AeReconciler:
         cutoff_ms: int,
         phases: frozenset[MemberPhase],
         *,
-        goal: Goal = "sweep"
+        goal: Goal = "sweep",
     ) -> Exchange:
         """Run one session per peer over its pids"""
         result = Exchange()
@@ -369,25 +496,32 @@ class AeReconciler:
                 self._stats.skipped += 1
                 continue
 
-            sync = self._session(peer, view, stale, cutoff_ms, goal=goal)
+            sync = self._session(peer, view, stale, cutoff_ms, goal)
             started = time.monotonic()
             outcome = await self._guard(Work(peer, sync.sync_roots, (pids,)))
             ok = self._settle(goal, sync.tally, outcome)
-
-            if goal is not None:
-                state = "done" if ok else "stopped"
-                tally = sync.tally
-                logger.info(
-                    "ae.%s session %s peer=%s pids=%d diverged=%d pulled=%d (%s) pushed=%d (%s) in %.2fs",
-                    goal, state, peer, len(pids), tally.pids_diverged, tally.pulled, human_bytes(tally.pulled_bytes),
-                    tally.pushed, human_bytes(tally.pushed_bytes), time.monotonic() - started
-                )
+            state = "done" if ok else "stopped"
+            tally = sync.tally
+            logger.info(
+                "ae.%s session %s peer=%s pids=%d diverged=%d "
+                "pulled=%d (%s) pushed=%d (%s) in %.2fs",
+                goal,
+                state,
+                peer,
+                len(pids),
+                tally.pids_diverged,
+                tally.pulled,
+                human_bytes(tally.pulled_bytes),
+                tally.pushed,
+                human_bytes(tally.pushed_bytes),
+                time.monotonic() - started,
+            )
 
             if not ok:
                 result.failed.add(peer)
                 continue
 
-            _count_reached(result.reached, pids, sync.recent if goal is None else set())
+            _count_reached(result.reached, pids, sync.recent if goal == "handoff" else set())
 
         return result
 
@@ -445,7 +579,14 @@ class AeReconciler:
         left for the GC.
         """
         marks = await self._orphans(unit.span, view)
-        result = await self._exchange(_targets(view, marks), view, stale, self._cutoff_ms(), _SESSION_PHASES)
+        result = await self._exchange(
+            _targets(view, marks),
+            view,
+            stale,
+            self._cutoff_ms(),
+            _SESSION_PHASES,
+            goal="handoff",
+        )
 
         for pid, mark in marks.items():
             if result.reached.get(pid, 0) == len(view.replicas[pid]):
@@ -458,6 +599,9 @@ class AeReconciler:
     @staticmethod
     def _now_ms() -> int:
         return int(time.time() * 1000)
+
+    def _obligation_event(self, action: str, count: int) -> None:
+        self._telemetry.ae_obligations_total.add(count, attributes={"action": action})
 
     async def _orphans(
         self,
@@ -479,6 +623,27 @@ class AeReconciler:
 
         return marks
 
+    def _owed(self, obligation: Obligation, view: ReplicaView) -> bool:
+        pid = obligation.key.pid.value
+        return (
+            obligation.target != self._node_id and
+            view.covers((pid,)) and
+            view.is_replica(pid, obligation.target)
+        )
+
+    def _park(self, target: str, count: int) -> None:
+        """Leave obligations of an unreachable target in META for later."""
+        if not self._backoff.deferred(target):
+            self._backoff.defer(target, self._retry_delay)
+
+        self._obligations.backlog = True
+        self._stats.obligations_deferred += count
+        self._obligation_event("deferred", count)
+        logger.debug(
+            "ae.obligations deferred target=%s count=%d (peer unreachable)",
+            target, count
+        )
+
     @staticmethod
     async def _pause(delay: float, stale: asyncio.Event) -> None:
         if delay <= 0:
@@ -486,6 +651,36 @@ class AeReconciler:
 
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(stale.wait(), timeout=delay)
+
+    async def _push_obligations(
+        self,
+        target: str,
+        pid: int,
+        obligations: list[Obligation],
+        records: dict[Key, Record],
+        view: ReplicaView
+    ) -> bool:
+        caller = Caller(self._pool, self._serializer)
+        scope = Scope((pid,), view.hash((pid,)))
+
+        for chunk in _chunks(obligations, records, self._batch_bytes):
+            unique = {records[ob.key].key: records[ob.key] for ob in chunk}
+            request = PushRequest(scope, tuple(unique.values()))
+
+            try:
+                result = PushResponse.from_dict(await caller.rpc(target, "ae.push", request))
+                acknowledged = result.delivery_count()
+                if acknowledged != len(unique):
+                    raise ProtocolError("obligation push did not acknowledge every record")
+            except _SESSION_ERRORS as exc:
+                self._failed(target, exc)
+                return False
+
+            await self._local_store.remove_obligations(chunk)
+            self._stats.obligations_delivered += len(chunk)
+            self._obligation_event("delivered", len(chunk))
+
+        return True
 
     async def _reachable(self, peer: str, phases: frozenset[MemberPhase]) -> bool:
         topology = await self._topologymgr.snapshot()
@@ -496,6 +691,24 @@ class AeReconciler:
 
         fd = self._pool.failure_detector(peer)
         return fd is None or fd.is_alive()
+
+    async def _reload(self) -> None:
+        queue = self._obligations
+        queue.backlog = False
+        after: bytes | None = None
+        pending = False
+
+        while True:
+            page = await self._local_store.list_obligations(after, self._batch)
+            after = page[-1].to_bytes() if len(page) == self._batch else None
+            ready = [ob for ob in page if not self._backoff.deferred(ob.target)]
+            pending = pending or len(ready) < len(page)
+            self._obligations.submit(ready)
+
+            if after is None or queue.backlog:
+                break
+
+        queue.backlog = queue.backlog or pending
 
     async def _run(self) -> None:
         while True:
@@ -532,19 +745,26 @@ class AeReconciler:
         return PeerSync(
             peer=peer,
             store=self._local_store,
-            serializer=self._serializer,
-            peer_pool=self._pool,
+            caller=Caller(self._pool, self._serializer),
             view=view,
             limits=limits,
             stale=stale,
             cutoff_ms=cutoff_ms,
             progress=self._sync_progress(peer, view),
-            goal=goal
+            goal=goal,
         )
 
-    def _settle(self, goal: Goal, tally: SessionTally, outcome: str) -> bool:
-        self._stats.merge(tally, handoff=(goal != "sweep"))
-        self._telemetry.ae_sessions_total.add(1, attributes={"outcome": outcome, "goal": goal})
+    def _settle(
+        self,
+        goal: Goal,
+        tally: SessionTally,
+        outcome: str,
+    ) -> bool:
+        self._stats.merge(tally, handoff=goal == "handoff")
+        self._telemetry.ae_sessions_total.add(
+            1,
+            attributes={"outcome": outcome, "goal": goal},
+        )
 
         for direction, versions, size in (
             ("pull", tally.pulled, tally.pulled_bytes),
@@ -564,21 +784,35 @@ class AeReconciler:
         result = await self._exchange(
             primaries, view, stale, cutoff_ms, _SOURCE_PHASES, goal=goal
         )
-        failed = bool(result.failed)
+        required = sum(len(pids) for pids in primaries.values())
+        reached = len(result.reached)
 
-        fallback = _fallback_sources(view, primaries, result.skipped)
         logger.debug(
-            "ae.%s pass sources=%d pids=%d failed=%d fallback=%d",
-            goal, len(primaries), sum(len(p) for p in primaries.values()),
-            len(result.failed), len(fallback)
+            "ae.%s pass sources=%d pids=%d failed=%d",
+            goal,
+            len(primaries),
+            required,
+            len(result.failed),
         )
-        if fallback:
-            again = await self._exchange(
-                fallback, view, stale, cutoff_ms, _SOURCE_PHASES, goal=goal
-            )
-            failed = failed or bool(again.failed)
 
-        return failed
+        return reached < required
+
+    async def _sync_out_pass(self, view: ReplicaView, stale: asyncio.Event) -> bool:
+        cutoff_ms = self._now_ms()
+        complete = True
+        after: int | None = None
+
+        while True:
+            roots = await self._local_store.list_roots(after, self._config.pids_per_cycle)
+            after = roots[-1][0] if roots else None
+            pids = [pid for pid, _ in roots]
+            result = await self._exchange(
+                _targets(view, pids), view, stale, cutoff_ms, _SESSION_PHASES, goal="sync_out"
+            )
+            complete = complete and _handed_all(view, pids, result)
+
+            if after is None or stale.is_set():
+                return complete and not stale.is_set()
 
     @staticmethod
     async def _sources(view: ReplicaView) -> dict[str, list[int]]:
@@ -642,6 +876,35 @@ def initiates(node_id: str, peer: str) -> bool:
     return (node_id == lo) == (digest & 1 == 0)
 
 
+def _chunks(
+    obligations: list[Obligation],
+    records: Mapping[Key, Record],
+    max_bytes: int
+) -> list[list[Obligation]]:
+    chunks: list[list[Obligation]] = []
+    current: list[Obligation] = []
+    size = 0
+
+    grouped: dict[Key, list[Obligation]] = {}
+    for obligation in obligations:
+        grouped.setdefault(records[obligation.key].key, []).append(obligation)
+
+    for debts in grouped.values():
+        cost = records[debts[0].key].size()
+
+        if current and size + cost > max_bytes:
+            chunks.append(current)
+            current, size = [], 0
+
+        current.extend(debts)
+        size += cost
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
 def _count_reached(reached: dict[int, int], pids: list[int], recent: set[int]) -> None:
     """
     Count a replica as reached for every pid fully handed off to it.
@@ -655,20 +918,14 @@ def _count_reached(reached: dict[int, int], pids: list[int], recent: set[int]) -
             reached[pid] = reached.get(pid, 0) + 1
 
 
-def _fallback_sources(
-    view: ReplicaView,
-    primaries: dict[str, list[int]],
-    down: set[str]
-) -> dict[str, list[int]]:
-    fallback: dict[str, list[int]] = {}
+def _handed_all(view: ReplicaView, pids: Iterable[int], result: Exchange) -> bool:
+    """Every pid reached each live target replica, and at least one."""
+    for pid in pids:
+        needed = [p for p in view.replicas[pid] if p not in result.skipped]
+        if not needed or result.reached.get(pid, 0) < len(needed):
+            return False
 
-    for primary in down:
-        for pid in primaries.get(primary, []):
-            for peer in view.sources_of(pid):
-                if peer not in (primary, view.node_id):
-                    fallback.setdefault(peer, []).append(pid)
-
-    return fallback
+    return True
 
 
 def _log_incomplete(goal: str, passes: int, stale: asyncio.Event, retry: float) -> None:

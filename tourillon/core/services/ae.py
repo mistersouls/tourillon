@@ -27,7 +27,7 @@ from tourillon.core.models.ae import (
     RootsResponse,
     Scope,
     RangeRequest,
-    RangeResponse, FetchRequest, FetchResponse,
+    RangeResponse, FetchRequest, FetchResponse, PushRequest, PushResponse,
 )
 from tourillon.core.storage.local import LocalStore
 
@@ -88,11 +88,19 @@ class AeService:
 
     async def fetch(self, request: FetchRequest) -> FetchResponse:
         async with self._admit(request.scope):
-            records, consumed = await self._local_store.list_records(request.keys, request.max_bytes)
+            records, consumed = await self._local_store.read_records(request.keys, request.max_bytes)
             return FetchResponse(
                 records=tuple(records),
                 consumed=max(1, consumed),
             )
+
+    async def push(self, request: PushRequest) -> PushResponse:
+        async with self._admit(request.scope, write=True):
+            results = await self._local_store.apply(request.records)
+            applied = sum(results)
+            already_present = len(results) - applied
+            self._applied += applied
+            return PushResponse(applied=applied, already_present=already_present)
 
     @asynccontextmanager
     async def _admit(self, scope: Scope, *, write: bool = False) -> AsyncIterator[None]:

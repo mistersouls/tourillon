@@ -20,6 +20,7 @@ from typing import Any, Iterable, Self
 from tourlib.models.ts import HLCTimestamp, WALL_MS_SIZE
 from tourlib.models.version import Address
 from tourlib.utils.buffer import BytesWalker
+from tourlib.validation import validate_node_id_size
 
 PID_SIZE = 4
 MAX_QUORUM_WRITE = 255
@@ -623,3 +624,80 @@ class MetaValue:
             source: MetaStaging.from_dict(meta) for source, meta in staging_data.items()
         }
         return cls(staging=staging)
+
+
+@dataclass(frozen=True, slots=True, eq=True)
+class ObligationPrefix:
+    target: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.target is not None:
+            self._validate_target(self.target)
+
+    def to_bytes(self) -> bytes:
+        if self.target is None:
+            return MetaKind.OBLIGATION.value
+        return MetaKind.OBLIGATION.value + self._length_prefixed(self.target.encode("utf-8"))
+
+    @classmethod
+    def from_bytes(cls, b: bytes) -> "ObligationPrefix":
+        walker = BytesWalker(b)
+
+        if walker.read_int(1, "metadata kind") != MetaKind.OBLIGATION.value:
+            raise ValueError("metadata key is not a replication obligation")
+
+        if walker.end():
+            target = walker.read_field("obligation target").decode("utf-8")
+            return cls(target=target)
+
+        return cls()
+
+
+    @staticmethod
+    def _length_prefixed(value: bytes) -> bytes:
+        if len(value) > 0xFFFF:
+            raise ValueError("metadata field exceeds 65535 bytes")
+        return len(value).to_bytes(2, "big") + value
+
+    @staticmethod
+    def _validate_target(target: str) -> None:
+        if not isinstance(target, str) or not target:
+            raise ValueError("obligation target must be a non-empty string")
+        validate_node_id_size(target)
+
+
+@dataclass(frozen=True, slots=True, eq=True)
+class Obligation:
+    target: str
+    key: Key
+
+
+    @property
+    def ts(self) -> HLCTimestamp:
+        return self.key.ts
+
+    @property
+    def address(self) -> PartitionAddress:
+        return PartitionAddress(self.key.pid, self.key.address)
+
+    def to_bytes(self) -> bytes:
+        prefix = ObligationPrefix(self.target).to_bytes()
+        return prefix + self.key.to_tag_bytes()
+
+    @classmethod
+    def from_bytes(cls, b: bytes) -> "Obligation":
+        walker = BytesWalker(b)
+
+        if walker.read(1, "metadata kind") != MetaKind.OBLIGATION.value:
+            raise ValueError("metadata key is not a replication obligation")
+
+        try:
+            target = walker.read_field("obligation target").decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("obligation target is not valid UTF-8") from exc
+
+        key = Key.walk(walker, Keyspace.TAGS)
+        if walker.read_remaining():
+            raise ValueError("obligation key contains trailing bytes")
+
+        return cls(target=target, key=key)

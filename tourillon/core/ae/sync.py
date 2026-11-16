@@ -20,9 +20,9 @@ from dataclasses import dataclass, field
 from itertools import groupby
 from typing import Any, Literal
 
+from tourillon.core.ae.caller import Caller
 from tourillon.core.ae.view import ReplicaView
 from tourillon.core.exceptions import (
-    AntiEntropyRejectError,
     BudgetSpentError,
     ViewChangedError,
 )
@@ -37,15 +37,11 @@ from tourillon.core.models.ae import (
     KeysResponse,
     RootsRequest,
     RootsResponse,
-    Scope, RangeRequest, RangeResponse, FetchResponse, FetchRequest,
+    Scope, RangeRequest, RangeResponse, FetchResponse, FetchRequest, PushRequest, PushResponse,
 )
 from tourillon.core.models.storageschema import Key, Keyspace, PartitionTime, Pid, Record
-from tourillon.core.peer import PeerPool
 from tourillon.core.storage.cell import Bucket, DigestCell
 from tourillon.core.storage.local import LocalStore
-from tourlib import Serializer
-from tourlib.envelope import build_envelope
-from tourlib.exceptions import ProtocolError
 from tourlib.handle import DictPayload
 from tourlib.utils.format import human_bytes
 
@@ -96,7 +92,7 @@ class SyncProgress:
         return start_key, stop_key
 
 
-Goal = Literal["sweep", "sync_in", "sync_out"]
+Goal = Literal["sweep", "sync_in", "sync_out", "handoff"]
 Direction = Literal["push", "pull", "skip"]
 
 
@@ -105,8 +101,7 @@ class PeerSync:
         self,
         peer: str,
         store: LocalStore,
-        serializer: Serializer,
-        peer_pool: PeerPool,
+        caller: Caller,
         view: ReplicaView,
         limits: SessionLimits,
         progress: SyncProgress,
@@ -116,9 +111,8 @@ class PeerSync:
         goal: Goal = "sweep",
     ) -> None:
         self._peer = peer
+        self._caller = caller
         self._store = store
-        self._serializer = serializer
-        self._pool = peer_pool
         self._view = view
         self._limits = limits
         self._progress = progress
@@ -266,36 +260,33 @@ class PeerSync:
             for record in records:
                 self._store.foreign(record)
 
-            self._tally.pulled += await self._store.apply(records)
+            self._tally.pulled += sum(await self._store.apply(records))
             self._tally.pulled_bytes += sum(r.size() for r in records)
 
     async def _push(self, scope: Scope, keys: list[Key]) -> None:
-        ...
+        while keys:
+            self._spend_repairs()
+            records, consumed = await self._store.read_records(keys, self._batch_size)
+            keys = keys[consumed:]
+
+            if not records:
+                continue
+
+            response = PushResponse.from_dict(
+                await self._rpc("ae.push", PushRequest(scope, tuple(records)))
+            )
+
+            if response.delivery_count() != len(records):
+                raise ValueError("push did not account for every submitted record")
+
+            self._tally.pushed += response.applied
+            self._tally.pushed_bytes += sum(r.size() for r in records)
 
     async def _rpc(self, kind: str, payload: DictPayload) -> dict[str, Any]:
         if self._stale.is_set():
             raise ViewChangedError(kind)
 
-        request = build_envelope(
-            kind=kind,
-            payload=self._serializer.encode(payload.to_dict()),
-            schema_id=self._serializer.schema_id,
-        )
-        async with self._pool.lease(self._peer) as client:
-            resp = await client.request(request)
-
-        if resp.kind == f"{kind}.accept":
-            data = self._serializer.decode(resp.payload)
-            return data if isinstance(data, dict) else {}
-
-        if resp.kind == f"{kind}.reject":
-            raise AntiEntropyRejectError.from_dict(
-                self._serializer.decode(resp.payload)
-            )
-
-        raise ProtocolError(
-            f"unexpected response kind '{resp.kind}' for {kind!r} request"
-        )
+        return await self._caller.rpc(self._peer, kind, payload)
 
     def _report_page(
         self,
@@ -310,12 +301,22 @@ class PeerSync:
             now - then for now, then in zip(self._tally.copied(), before, strict=True)
         )
         logger.log(
-            logging.DEBUG if self._goal == "sweep" else logging.DEBUG,
+            logging.INFO if self._goal != "sweep" else logging.DEBUG,
             "ae.%s page %d/%d peer=%s pids=%d..%d (%d) diverged=%d "
             "pulled=%d (%s) pushed=%d (%s) in %.2fs",
-            self._goal, index, pages, self._peer, pids[0], pids[-1],
-            len(pids), diverged, pulled, human_bytes(pulled_bytes),
-            pushed, human_bytes(pushed_bytes), time.monotonic() - started
+            self._goal,
+            index,
+            pages,
+            self._peer,
+            pids[0],
+            pids[-1],
+            len(pids),
+            diverged,
+            pulled,
+            human_bytes(pulled_bytes),
+            pushed,
+            human_bytes(pushed_bytes),
+            time.monotonic() - started,
         )
 
     def _spend_repairs(self) -> None:

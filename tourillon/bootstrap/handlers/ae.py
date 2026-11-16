@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator
 
 from tourillon.bootstrap.deps import get_manager, peer_dispatcher
 from tourillon.core.exceptions import AntiEntropyRejectError
-from tourillon.core.models.ae import BucketsRequest, KeysRequest, RootsRequest, RangeRequest, FetchRequest
+from tourillon.core.models.ae import BucketsRequest, KeysRequest, RootsRequest, RangeRequest, FetchRequest, PushRequest
 from tourlib.envelope import Envelope
 from tourlib.handle import DictReplier, MalformedError
 
@@ -91,3 +91,17 @@ async def fetch(request: Envelope) -> AsyncIterator[Envelope]:
         ...
     except AntiEntropyRejectError as exc:
         yield replier.reply("ae.fetch.reject", exc)
+
+
+@dispatcher.on("ae.push")
+async def push(request: Envelope) -> AsyncIterator[Envelope]:
+    manager = get_manager()
+    replier = DictReplier(manager.serializer, request)
+
+    try:
+        response = await manager.ae.push(replier.decode(PushRequest))
+        yield replier.reply("ae.push.accept", response)
+    except MalformedError:
+        ...
+    except AntiEntropyRejectError as exc:
+        yield replier.reply("ae.push.reject", exc)

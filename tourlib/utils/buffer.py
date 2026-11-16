@@ -63,3 +63,7 @@ class BytesWalker:
         chunk = self._data[self._pos :]
         self._pos = len(self._data)
         return chunk
+
+    def end(self) -> bool:
+        """Return whether the cursor is at the end of the buffer."""
+        return self._pos >= len(self._data)

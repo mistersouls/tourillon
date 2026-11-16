@@ -2,10 +2,13 @@ import asyncio
 from contextlib import asynccontextmanager
 from itertools import groupby
 from typing import AsyncIterator, Mapping, Iterable, Sequence
-from tourillon.core.models.ae import MAX_BATCH_BYTES, MAX_PAGE_LIMIT
 
-from tourillon.core.models.storageschema import PartitionAddress, Record, Pid, Key, PartitionTime, KeyTag, TagKind, \
-    RawPrefix, Keyspace
+from tourillon.core.models.ae import MAX_PAGE_LIMIT
+
+from tourillon.core.models.storageschema import (
+    PartitionAddress, Record, Pid, Key,
+    TagKind, Keyspace, Obligation
+)
 from tourillon.core.partition.partitioner import Partitioner
 from tourillon.core.ports import Telemetry
 from tourillon.core.ports.storage import Storage
@@ -61,8 +64,8 @@ class LocalStore:
                 with self._telemetry.start_span("storage.put_record"):
                     return await session.put_record(record)
 
-    async def apply(self, records: list[Record]) -> int:
-        applied = 0
+    async def apply(self, records: Sequence[Record]) -> list[bool]:
+        results: list[bool] = []
 
         for group, members in groupby(
             records,
@@ -73,11 +76,11 @@ class LocalStore:
                 async with self._session(group, write=True) as session:
                     attrs = {"group": group, "count": len(batch)}
                     with self._telemetry.start_span("storage.apply_records", attributes=attrs):
-                        applied += sum(await session.put_record_many(batch))
+                        results.extend(await session.put_record_many(batch))
 
-        return applied
+        return results
 
-    async def list_records(self, keys: Sequence[Key], max_bytes: int) -> tuple[list[Record], int]:
+    async def read_records(self, keys: Sequence[Key], max_bytes: int) -> tuple[list[Record], int]:
         records: list[Record] = []
         size: int = 0
         consumed: int = 0
@@ -107,6 +110,41 @@ class LocalStore:
                 consumed += 1
 
         return records, consumed
+
+    async def list_obligations(self, after: bytes | None = None, limit: int = 64) -> list[Obligation]:
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+
+        obligations: list[Obligation] = []
+        for group in range(self._partitioner.total_groups):
+            async with self._session(group) as session:
+                obligations.extend(await session.obligation_keys(after, limit))
+
+        return sorted(obligations, key=lambda o: o.to_bytes())[:limit]
+
+    async def record_from_obligations(self, obligations: Sequence[Obligation]) -> dict[Key, Record]:
+        found: dict[Key, Record] = {}
+        by_address: dict[PartitionAddress, Record | None] = {}
+
+        for obligation in obligations:
+            address = obligation.address
+            if address not in by_address:
+                async with self._pid_session(address.pid.value) as session:
+                    by_address[address] = await session.get_last_record(address)
+
+            record = by_address[address]
+            if record is not None and record.key.ts >= obligation.ts:
+                found[obligation.key] = record
+
+        return found
+
+    async def remove_obligations(self, obligations: Sequence[Obligation]) -> None:
+        ordered = sorted(obligations, key=lambda o: self._partitioner.group_for(o.key.pid.value))
+        for group, members in groupby(
+            ordered, key=lambda o: self._partitioner.group_for(o.key.pid.value)
+        ):
+            async with self._session(group, write=True) as session:
+                await session.remove_obligation_many(list(members))
 
     def foreign(self, record: Record) -> bool:
         """Whether a record is filed under a pid its address does not hash to."""

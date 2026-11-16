@@ -262,6 +262,54 @@ class FetchResponse:
         return cls(records=records, consumed=_int(data, "consumed", 1))
 
 
+@dataclass(frozen=True, slots=True)
+class PushRequest:
+    scope: Scope
+    records: tuple[Record, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scope": self.scope.to_dict(),
+            "records": [rec.to_dict() for rec in self.records],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PushRequest":
+        scope = Scope.from_dict(data["scope"])
+        raw_records = _list(data, "records", MAX_KEYS_PER_REQUEST)
+        records = tuple(Record.from_dict(r) for r in raw_records)
+        pid = scope.pid
+
+        if not records or any(r.key.pid.value != pid for r in records):
+            raise ValueError("records must be a non-empty list within the partition")
+
+
+        return cls(scope=scope, records=records)
+
+
+@dataclass(frozen=True, slots=True)
+class PushResponse:
+    applied: int
+    already_present: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "applied": self.applied,
+            "already_present": self.already_present,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PushResponse":
+        return cls(
+            applied=_int(data, "applied", 0),
+            already_present=_int(data, "already_present", 0),
+        )
+
+    def delivery_count(self) -> int:
+        """Return the total number of records delivered to the store."""
+        return self.applied + self.already_present
+
+
 def _list(data: dict[str, Any], name: str, limit: int) -> list[Any]:
     value = data[name]
 

@@ -137,6 +137,13 @@ class Telemetry(Protocol):
     def ae_bytes_total(self) -> CounterMetric:
         """Value bytes copied by anti-entropy sessions, labeled ``direction``."""
 
+    @property
+    def ae_obligations_total(self) -> CounterMetric:
+        """
+        Replication obligations, labeled ``event``.
+        Events: ``recorded``, ``delivered``, ``dropped``, ``deferred``.
+        """
+
     def start_span(
         self,
         name: str,
