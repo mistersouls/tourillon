@@ -1,6 +1,5 @@
-import time
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Iterable, Mapping
+from typing import AsyncIterator, Iterable, Sequence
 
 from tourillon.core.models.storageschema import (
     PartitionAddress, Record, Keyspace, Key, KVRef, Tag, Value,
@@ -8,7 +7,7 @@ from tourillon.core.models.storageschema import (
 )
 from tourillon.core.ports.storage import Storage, Transaction
 from tourillon.core.log import logger as _logger
-from tourillon.core.storage.cell import cell_keys, DigestCell, Root
+from tourillon.core.storage.cell import cell_keys, DigestCell, Root, Bucket
 from tourlib.models.types import SupportsBytes
 
 logger = _logger.storage()
@@ -46,6 +45,31 @@ class Session:
         value = Value.from_bytes(kv_log.value)
         return Record(key=key, tag=tag, value=value)
 
+    async def get_record_many(self, keys: Sequence[Key]) -> list[Record]:
+        records = []
+
+        kt_list = KeyList(Keyspace.TAGS, (key.to_bytes(Keyspace.TAGS) for key in keys))
+        kv_tags = await self._txn.get_many([kt_list]).get()
+
+        # avoid thread/event loop context switching by fetching logs in a single batch
+        kv_logs = []
+        for tagged in kv_tags:
+            key = Key.from_bytes(tagged.key, Keyspace.TAGS)
+            kv_logs.append(self._txn.get(KVRef(key.to_bytes(Keyspace.LOGS), Keyspace.LOGS)))
+
+        for idx, tagged in enumerate(kv_tags):
+            key = Key.from_bytes(tagged.key, Keyspace.TAGS)
+            kv_log = await kv_logs[idx].get()
+            if kv_log is None:
+                logger.warning("No log found for key: %s", key)
+                continue
+
+            tag = Tag.from_bytes(tagged.value)
+            value = Value.from_bytes(kv_log.value)
+            records.append(Record(key=key, tag=tag, value=value))
+
+        return records
+
     async def put_record(self, record: Record) -> bool:
         (written,) = await self.put_record_many([record])
         return written
@@ -78,6 +102,27 @@ class Session:
             if kv is not None
         ]
 
+    async def list_tags(
+        self,
+        prefix: SupportsBytes | None = None,
+        start: bytes | None = None,
+        limit: int = 64
+    ) -> list[KeyTag]:
+        result = self._txn.list(
+            Keyspace.TAGS,
+            prefix=prefix,
+            start=start,
+            limit=limit
+        )
+        page = await result.get()
+        return [
+            KeyTag(
+                key=Key.from_bytes(kv.key, Keyspace.TAGS),
+                tag=Tag.from_bytes(kv.value)
+            )
+            for kv in page
+        ]
+
     async def roots(self, pids: Iterable[int]) -> list[tuple[int, DigestCell]]:
         pids = tuple(pids)
         if not pids:
@@ -85,7 +130,7 @@ class Session:
 
         items = KeyList(Keyspace.META, (Root(pid).to_bytes() for pid in pids))
         pairs = await self._txn.get_many([items]).get()
-        cells = dict(DigestCell.from_kv(pair) for pair in pairs)
+        cells = dict(Root.from_kv(pair) for pair in pairs)
         return [(pid, cells.get(pid, DigestCell())) for pid in pids]
 
     async def list_roots(self, after: int | None = None, limit: int = 64) -> list[tuple[int, DigestCell]]:
@@ -101,7 +146,26 @@ class Session:
             limit=limit
         )
         page = await result.get()
-        return [DigestCell.from_kv(pair) for pair in page]
+        return [Root.from_kv(pair) for pair in page]
+
+    async def list_buckets(
+        self,
+        pid: int,
+        after: int | None = None,
+        limit: int = 64
+    ) -> list[tuple[int, DigestCell]]:
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+
+        start = None if after is None else Bucket(pid=pid, id=after).to_bytes()
+        result = self._txn.list(
+            Keyspace.META,
+            prefix=Bucket.prefix(pid),
+            start=start,
+            limit=limit
+        )
+        page = await result.get()
+        return [Bucket.from_kv(pair) for pair in page]
 
     async def flush(self) -> None:
         """Flush the session, committing any pending operations."""
@@ -161,8 +225,9 @@ class Session:
 
 
 class SessionProvider:
-    def __init__(self, storage: Storage) -> None:
+    def __init__(self, storage: Storage, bucket_shift: int) -> None:
         self._storage = storage
+        self._bucket_shift = bucket_shift
 
     @asynccontextmanager
     async def session(
@@ -170,7 +235,7 @@ class SessionProvider:
     ) -> AsyncIterator[Session]:
         transactional = await self._storage.transactional_for(group)
         async with transactional.transaction(write=write) as txn:
-            session = Session(txn)
+            session = Session(txn, self._bucket_shift)
             yield session
             if write:
                 await session.flush()

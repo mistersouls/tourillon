@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import Any, Iterable, Self
 
-from tourlib.models.ts import HLCTimestamp
+from tourlib.models.ts import HLCTimestamp, WALL_MS_SIZE
 from tourlib.models.version import Address
 from tourlib.utils.buffer import BytesWalker
 
@@ -128,6 +128,32 @@ class PartitionAddress:
 
 
 @dataclass(frozen=True, slots=True, eq=True)
+class PartitionTime:
+    pid: Pid
+    wall_ms: int
+
+    def to_bytes(self) -> bytes:
+        """Return a bytes representation of the PartitionTime."""
+        return self.pid.to_bytes() + self.wall_ms.to_bytes(WALL_MS_SIZE, "big")
+
+    @classmethod
+    def from_bytes(cls, b: bytes) -> "PartitionTime":
+        """Create a PartitionTime instance from a bytes representation."""
+        if len(b) != PID_SIZE + WALL_MS_SIZE:
+            raise ValueError(f"Expected {PID_SIZE + WALL_MS_SIZE} bytes, got {len(b)} bytes")
+
+        walker = BytesWalker(b)
+        pid = Pid.walk(walker)
+        wall_ms = walker.read_int(WALL_MS_SIZE, "wall_ms")
+        return cls(pid=pid, wall_ms=wall_ms)
+
+    def key(self) -> Key:
+        address = Address(key=b"", namespace=b"")
+        ts = HLCTimestamp(wall_ms=self.wall_ms, counter=0, node_id="")
+        return Key(pid=self.pid, address=address, ts=ts)
+
+
+@dataclass(frozen=True, slots=True, eq=True)
 class MetaKey:
     pid: Pid
     address: Address
@@ -162,7 +188,7 @@ class MetaKind(Enum):
     DIGEST = b"\x02"
 
 
-@dataclass(frozen=True, slots=True, eq=True)
+@dataclass(frozen=True, slots=True, eq=True, order=True)
 class Key:
     pid: Pid
     address: Address
@@ -198,10 +224,24 @@ class Key:
             return self.pid.to_bytes() + self.address.to_bytes() + self.ts.to_bytes()
         return MetaKey(pid=self.pid, address=self.address).to_bytes()
 
+    def to_log_bytes(self) -> bytes:
+        return self.to_bytes(Keyspace.LOGS)
+
+    def to_tag_bytes(self) -> bytes:
+        return self.to_bytes(Keyspace.TAGS)
+
     @classmethod
     def from_bytes(cls, b: bytes, ks: Keyspace) -> "Key":
         walker = BytesWalker(b)
         return cls.walk(walker, ks)
+
+    @classmethod
+    def from_log_bytes(cls, b: bytes) -> "Key":
+        return cls.from_bytes(b, Keyspace.LOGS)
+
+    @classmethod
+    def from_tag_bytes(cls, b: bytes) -> "Key":
+        return cls.from_bytes(b, Keyspace.TAGS)
 
     @classmethod
     def walk(cls, walker: BytesWalker, ks: Keyspace) -> "Key":
@@ -511,6 +551,7 @@ class Record(KeyTag):
     @classmethod
     def from_bytes(cls, b: bytes, ks: Keyspace) -> "Record":
         """Create a Record instance from a bytes representation."""
+        # todo(souls): to fix, value consumes the rest of the bytes
         walker = BytesWalker(b)
         key = Key.walk(walker, ks)
         value = Value.walk(walker)
@@ -544,6 +585,9 @@ class Record(KeyTag):
             value=value,
             keyspace=ks
         )
+
+    def size(self) -> int:
+        return len(self.to_bytes(Keyspace.LOGS)) + len(self.key.to_bytes(Keyspace.TAGS))
 
 
 @dataclass

@@ -1,12 +1,14 @@
 import hashlib
 from dataclasses import dataclass
-from tourillon.core.models.ae import BUCKET_SIZE, DIGEST_SIZE
 
 from tourillon.core.models.storageschema import Pid, Key, Keyspace, MetaKind, KVPair, RawPrefix
+from tourlib.utils import BytesWalker
 
 _ROOT = b"\x00"
 _BUCKET = b"\x01"
 _COUNT_SIZE: int = 8
+BUCKET_SIZE: int = 8
+DIGEST_SIZE: int = 16
 ROOT_PREFIX: bytes = MetaKind.DIGEST.value + _ROOT  # type: ignore
 BUCKET_PREFIX: bytes = MetaKind.DIGEST.value + _BUCKET  # type: ignore
 
@@ -31,6 +33,12 @@ class Root:
     def prefix() -> RawPrefix:
         return RawPrefix(ROOT_PREFIX)
 
+    @classmethod
+    def from_kv(cls, kv: KVPair) -> tuple[int, "DigestCell"]:
+        root = cls.from_bytes(kv.key)
+        digest = DigestCell.from_bytes(kv.value)
+        return root.pid, digest
+
 
 @dataclass(frozen=True, slots=True, eq=True, order=True)
 class Bucket:
@@ -39,29 +47,33 @@ class Bucket:
 
     def to_bytes(self) -> bytes:
         """Convert the Bucket instance to bytes."""
-        return BUCKET_PREFIX + Pid(self.pid).to_bytes() + self.id.to_bytes(BUCKET_SIZE, "big")
+        return self.prefix(self.pid).to_bytes() + self.id.to_bytes(BUCKET_SIZE, "big")
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "Bucket":
         """Create a Bucket instance from bytes."""
         if not data.startswith(BUCKET_PREFIX):
             raise ValueError("Invalid bucket prefix")
-        pid = Pid.from_bytes(data[len(BUCKET_PREFIX):len(BUCKET_PREFIX) + 8])
-        bucket_id = int.from_bytes(data[len(BUCKET_PREFIX) + 8:], "big")
+
+        walker = BytesWalker(data[len(BUCKET_PREFIX):])
+        pid = Pid.walk(walker)
+        bucket_id = walker.read_int(BUCKET_SIZE, "bucket_id")
         return cls(id=bucket_id, pid=pid.value)
 
-    def bounds(self, shift: int) -> tuple[bytes, bytes]:
-        """Return the TAGS ``(start, stop)`` bounds, both exclusive, of a bucket.
-
-            TAGS keys are ``pid | wall_ms | ...``, so a bucket is a contiguous range.
-            No real key equals the 12-byte ``pid | lo`` start, so the exclusive cursor
-            skips nothing.
-            """
-        pid_bytes = Pid(self.pid).to_bytes()
+    def bounds(self, shift: int) -> tuple[int, int]:
         lo = self.id << shift
         hi = (self.id + 1) << shift
+        return lo, hi
 
-        return pid_bytes + lo.to_bytes(BUCKET_SIZE, "big"), pid_bytes + hi.to_bytes(BUCKET_SIZE, "big")
+    @staticmethod
+    def prefix(pid: int) -> RawPrefix:
+        return RawPrefix(BUCKET_PREFIX + Pid(pid).to_bytes())
+
+    @classmethod
+    def from_kv(cls, kv: KVPair) -> tuple[int, "DigestCell"]:
+        bucket = Bucket.from_bytes(kv.key)
+        digest = DigestCell.from_bytes(kv.value)
+        return bucket.id, digest
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -99,12 +111,6 @@ class DigestCell:
             count=int.from_bytes(b[:_COUNT_SIZE], "big"),
             digest=int.from_bytes(b[_COUNT_SIZE:], "big"),
         )
-
-    @classmethod
-    def from_kv(cls, kv: KVPair) -> tuple[int, "DigestCell"]:
-        root = Root.from_bytes(kv.key)
-        digest = cls.from_bytes(kv.value)
-        return root.pid, digest
 
 
 def cell_keys(key: Key, bucket_shift: int) -> tuple[bytes, bytes]:

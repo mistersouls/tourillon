@@ -74,7 +74,7 @@ class AeStats:
     def failed(self, exc: Exception) -> None:
         self.last_failure = describe(exc)
         self.last_failure_at = datetime.now(UTC).isoformat()
-        logger.error("ae.error %s", exc)
+        logger.error("ae.error %s", exc, exc_info=exc)
 
     def progress(self) -> dict[str, int]:
         """Snapshot of the counters a sweep summary reports as deltas."""

@@ -19,6 +19,10 @@ from tourlib.utils import BytesWalker
 from tourlib.validation import validate_node_id_size
 
 
+WALL_MS_SIZE = 8
+COUNTER_SIZE = 2
+
+
 @dataclass(frozen=True, order=True, eq=True, slots=True)
 class HLCTimestamp:
     """Immutable hybrid logical clock timestamp.
@@ -62,8 +66,8 @@ class HLCTimestamp:
         node_id = self.node_id.encode("utf-8")
         node_id_len = len(node_id)
         return (
-            self.wall_ms.to_bytes(8, "big")
-            + self.counter.to_bytes(2, "big")
+            self.wall_ms.to_bytes(WALL_MS_SIZE, "big")
+            + self.counter.to_bytes(COUNTER_SIZE, "big")
             + node_id_len.to_bytes(2, "big")
             + node_id
         )
@@ -75,7 +79,7 @@ class HLCTimestamp:
 
     @classmethod
     def walk(cls, walker: BytesWalker) -> "HLCTimestamp":
-        wall_ms = walker.read_int(8, "hlc wall_ms")
-        counter = walker.read_int(2, "hlc counter")
+        wall_ms = walker.read_int(WALL_MS_SIZE, "hlc wall_ms")
+        counter = walker.read_int(COUNTER_SIZE, "hlc counter")
         node_id = walker.read_field("hlc node_id").decode("utf-8")
         return cls(wall_ms=wall_ms, counter=counter, node_id=node_id)
