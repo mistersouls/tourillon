@@ -57,6 +57,14 @@ class JoinError(Exception):
         self.error = error
 
 
+class DrainError(Exception):
+    """Raised when a node cannot begin or complete a drain."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__(error)
+        self.error = error
+
+
 class StoreOperationError(Exception):
     """Raised when a distributed store operation fails across one or more peers."""
 

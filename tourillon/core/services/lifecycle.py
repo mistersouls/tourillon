@@ -14,12 +14,14 @@
 
 import asyncio
 import contextlib
+import contextvars
 import ssl
 from pathlib import Path
+from typing import Coroutine, Any
 
 from tourillon.core.ae.reconciler import AeReconciler
 from tourillon.core.config import TourillonConfig
-from tourillon.core.exceptions import BootstrapError, JoinError, StartupError
+from tourillon.core.exceptions import BootstrapError, JoinError, StartupError, DrainError
 from tourillon.core.gossip.bootstrapper import GossipBootstrapper
 from tourillon.core.gossip.gossiper import Gossiper, GossipStats
 from tourillon.core.gossip.topology import TopologyManager
@@ -119,7 +121,8 @@ class NodeLifecycle:
 
         self._state_file = Path(self._config.storage.data_dir) / NODE_STATE_FILENAME
         self._join_task: asyncio.Task[None] | None = None
-        self._join_lock = asyncio.Lock()
+        self._drain_task: asyncio.Task[None] | None = None
+        self._membership_lock = asyncio.Lock()
         self._peer_started = False
         self._client_started = False
 
@@ -154,6 +157,12 @@ class NodeLifecycle:
         await self._stop_client()
         await self._hint_replayer.stop()
 
+        if self.is_draining():
+            assert self._drain_task is not None
+            self._drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._drain_task
+
         if self.is_joining():
             assert self._join_task is not None
             self._join_task.cancel()
@@ -168,8 +177,11 @@ class NodeLifecycle:
     def is_joining(self) -> bool:
         return self._join_task is not None and not self._join_task.done()
 
+    def is_draining(self) -> bool:
+        return self._drain_task is not None and not self._drain_task.done()
+
     async def join(self, seeds: list[str] | None = None) -> None:
-        async with self._join_lock:
+        async with self._membership_lock:
             if self.is_joining():
                 logger.warning("Join operation already in progress")
                 raise JoinError("Join operation already in progress.")
@@ -197,7 +209,39 @@ class NodeLifecycle:
                 self._perform_join(joining_state), name="node-join"
             )
 
-    async def leave(self) -> None:
+    async def drain(self) -> None:
+        """Acknowledge an explicit drain request; completion is announced as IDLE."""
+        async with self._membership_lock:
+            if self.is_joining():
+                raise DrainError("Cannot drain while a join operation is in progress.")
+
+            if self.is_draining():
+                raise DrainError("Drain operation already in progress.")
+
+            state = await self._load_state()
+            if state.phase != MemberPhase.READY:
+                raise DrainError(
+                    f"Cannot drain node in phase '{state.phase.value}'; must be 'ready'."
+                )
+
+            topology = await self._topologymgr.snapshot()
+            if not len(topology.ring.drop_nodes({state.node_id})):
+                raise DrainError("Cannot drain without another node on the ring.")
+
+            state = await self._transition_to(
+                state,
+                MemberPhase.DRAINING,
+                with_seeds=self._drain_seeds(state, topology.registry)
+            )
+            await self._publish_state(state)
+            logger.info(
+                "Drain requested for node '%s'; writes are refused from now on",
+                state.node_id,
+            )
+            self._drain_task = _background_task(
+                self._perform_drain(state), name="node-drain"
+            )
+
         raise NotImplementedError("Leave operation is not implemented yet.")
 
     def _generate_tokens(self) -> tuple[str, ...]:
@@ -273,6 +317,21 @@ class NodeLifecycle:
         ready = await self._transition_to(state, MemberPhase.READY)
         await self._start_client()
         await self._publish_state(ready)
+
+    async def _perform_drain(self, state: NodeState) -> None:
+        assert state.phase == MemberPhase.DRAINING
+
+        try:
+            await self._ae_reconciler.sync_out()
+            await self._stop_client()
+            idle = await self._transition_to(state, MemberPhase.IDLE)
+            await self._publish_state(idle)
+            await self._ae_reconciler.stop()
+        except Exception as exc:
+            logger.exception(
+                "Drain failed for node=%s; node remains DRAINING. Reason: %s",
+                state.node_id, exc
+            )
 
     async def _run_transfers(self, member: Member) -> tuple[list[str], list[str]]:
         """Run the join transfers, re-planning them on every ring change until they settle.
@@ -373,7 +432,7 @@ class NodeLifecycle:
                 node["seeds"] = seeds
                 state = NodeState.from_document(document)
 
-        async with self._join_lock:
+        async with self._membership_lock:
             await self._perform_join(state)
 
     async def _startup_ready(
@@ -391,6 +450,21 @@ class NodeLifecycle:
 
     async def _startup_draining(self) -> None:
         await self._start_peer()
+        state = await self._load_state()
+        await self._peer_pool.start()
+
+        if state.seeds and not await self._sync_full(state):
+            logger.error(
+                "Cannot resume drain before membership sync for '%s'", state.node_id
+            )
+            return
+
+        await self._gossiper.start()
+        await self._publish_state(state)
+        await self._start_client()
+
+        async with self._membership_lock:
+            await self._perform_drain(state)
 
     async def _startup_failed(self) -> None:
         await self._start_peer()
@@ -505,3 +579,15 @@ class NodeLifecycle:
                 self._state_file,
             )
             return NodeState.from_document(document)
+
+
+def _background_task(
+    coro: Coroutine[Any, Any, None], *, name: str
+) -> asyncio.Task[None]:
+    """Run a membership operation outside the request that triggered it.
+
+    A join or drain starts long-lived loops (gossip, anti-entropy, listeners)
+    that would otherwise inherit the request's context, trace span included,
+    and keep that trace growing for the life of the node.
+    """
+    return asyncio.create_task(coro, name=name, context=contextvars.Context())
